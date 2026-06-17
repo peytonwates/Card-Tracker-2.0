@@ -1,185 +1,257 @@
 from __future__ import annotations
 
-import uuid
-from datetime import date
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 import streamlit as st
 
-from core.business import load_data, add_inventory_row, refresh_database_cache
-from core.cleaning import now_iso, age_bucket, money_fmt, to_money
-from core.config import PRODUCT_TYPE_OPTIONS, CARD_TYPE_OPTIONS, INVENTORY_TYPE_OPTIONS, CONDITION_OPTIONS, STATUS_ACTIVE, INVENTORY_COLUMNS
-from core.market import fetch_market_prices, price_for_inventory_row
+from core.business import load_data, refresh_database_cache
+from core.cleaning import money_fmt, clean_text
+from core.ebay import (
+    ebay_is_configured,
+    get_access_token,
+    fetch_orders,
+    normalize_orders_to_rows,
+    upsert_ebay_order_rows,
+    apply_matched_orders_to_inventory,
+    fetch_order_earnings_summary,
+    sync_listings,
+)
 
-st.set_page_config(page_title="Inventory", layout="wide")
-st.title("Inventory")
 
-if st.button("🔄 Refresh database", use_container_width=False):
-    refresh_database_cache()
-    st.rerun()
+st.set_page_config(page_title="eBay Store", layout="wide")
+st.title("eBay Store")
+
+st.caption(
+    "This page syncs eBay orders into Google Sheets. "
+    "Inventory is updated only when the eBay line item SKU equals your inventory_id."
+)
 
 data = load_data()
 inv = data.inventory
-active = inv[inv["inventory_status"].isin([STATUS_ACTIVE, "GRADING", "LISTED"])] if not inv.empty else inv
+orders_df = data.ebay_orders
+listings_df = data.ebay_listings
 
-tab_overview, tab_add, tab_bulk, tab_table = st.tabs(["Overview", "Add Single", "Bulk Add", "Inventory Table"])
 
-with tab_overview:
-    st.subheader("Inventory Summary")
-    if inv.empty:
-        st.info("No inventory yet.")
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Active items", f"{len(active):,}")
-        c2.metric("Active cost", money_fmt(active["total_cost"].sum()))
-        c3.metric("Active market", money_fmt(active["market_value"].sum()))
-        c4.metric("Sold items", f"{len(inv[inv['inventory_status'].eq('SOLD')]):,}")
+if not ebay_is_configured():
+    st.warning(
+        "eBay is not configured yet. Add ebay_client_id, ebay_client_secret, "
+        "and ebay_refresh_token to Streamlit secrets."
+    )
 
-        c1, c2 = st.columns(2)
-        with c1:
-            by_set = active.groupby("set_name", dropna=False).agg(items=("inventory_id", "count"), cost=("total_cost", "sum"), market=("market_value", "sum")).reset_index().sort_values("market", ascending=False)
-            st.markdown("#### By set")
-            st.dataframe(by_set.head(50).style.format({"cost": "${:,.2f}", "market": "${:,.2f}"}), use_container_width=True, hide_index=True)
-        with c2:
-            tmp = active.copy()
-            tmp["purchase_dt"] = pd.to_datetime(tmp["purchase_date"], errors="coerce")
-            tmp["age_days"] = (pd.Timestamp(date.today()) - tmp["purchase_dt"]).dt.days
-            tmp["age_bucket"] = tmp["age_days"].apply(age_bucket)
-            by_age = tmp.groupby("age_bucket").agg(items=("inventory_id", "count"), cost=("total_cost", "sum"), market=("market_value", "sum")).reset_index()
-            st.markdown("#### By age")
-            st.dataframe(by_age.style.format({"cost": "${:,.2f}", "market": "${:,.2f}"}), use_container_width=True, hide_index=True)
+    with st.expander("Required eBay secrets", expanded=True):
+        st.code(
+            '''
+ebay_environment = "production"
+ebay_client_id = "..."
+ebay_client_secret = "..."
+ebay_refresh_token = "..."
+ebay_marketplace_id = "EBAY_US"
+ebay_scopes = "https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly https://api.ebay.com/oauth/api_scope/sell.inventory.readonly https://api.ebay.com/oauth/api_scope/sell.finances.earnings.read"
+'''
+        )
 
-with tab_add:
-    st.subheader("Add One Item")
-    with st.form("add_single_inventory", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            product_type = st.selectbox("Product type", PRODUCT_TYPE_OPTIONS)
-            inventory_type = st.selectbox("Inventory type", INVENTORY_TYPE_OPTIONS)
-            card_type = st.selectbox("Card type", CARD_TYPE_OPTIONS)
-        with c2:
-            brand = st.text_input("Brand / league", value="Pokemon TCG")
-            set_name = st.text_input("Set")
-            year = st.text_input("Year")
-        with c3:
-            card_name = st.text_input("Card / item name")
-            card_number = st.text_input("Card #")
-            variant = st.text_input("Variant")
-        with c4:
-            card_subtype = st.text_input("Subtype")
-            condition = st.selectbox("Condition", CONDITION_OPTIONS, index=0)
-            reference_link = st.text_input("Reference link")
+else:
+    c1, c2, c3 = st.columns(3)
 
-        c5, c6, c7, c8 = st.columns(4)
-        with c5:
-            purchase_date = st.date_input("Purchase date", value=date.today())
-            purchased_from = st.text_input("Purchased from")
-        with c6:
-            purchase_price = st.number_input("Purchase price", min_value=0.0, step=1.0, format="%.2f")
-            shipping = st.number_input("Shipping", min_value=0.0, step=0.5, format="%.2f")
-        with c7:
-            tax = st.number_input("Tax", min_value=0.0, step=0.5, format="%.2f")
-            sticker_price = st.number_input("Sticker price", min_value=0.0, step=1.0, format="%.2f")
-        with c8:
-            grading_company = st.text_input("Grading company")
-            grade = st.text_input("Grade")
+    with c1:
+        if st.button("Test eBay token", use_container_width=True):
+            try:
+                tok = get_access_token()
+                st.success(f"Token OK. Starts with: {tok[:12]}...")
+            except Exception as exc:
+                st.error(str(exc))
 
-        notes = st.text_area("Notes")
-        pull_market = st.checkbox("Pull market value now from reference link", value=False)
-        submitted = st.form_submit_button("Add item", type="primary")
+    with c2:
+        if st.button("Sync eBay listings", use_container_width=True):
+            try:
+                count = sync_listings()
+                st.success(f"Synced {count:,} listing/inventory records from eBay.")
+                refresh_database_cache()
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 
-    if submitted:
-        if not card_name and not reference_link:
-            st.error("Add at least a card/item name or a reference link.")
-        else:
-            row = {
-                "inventory_id": str(uuid.uuid4())[:8],
-                "inventory_type": inventory_type,
-                "product_type": product_type,
-                "inventory_status": STATUS_ACTIVE,
-                "card_type": card_type,
-                "brand_or_league": brand,
-                "set_name": set_name,
-                "year": year,
-                "card_name": card_name,
-                "card_number": card_number,
-                "variant": variant,
-                "card_subtype": card_subtype,
-                "grading_company": grading_company,
-                "grade": grade,
-                "reference_link": reference_link,
-                "purchase_date": str(purchase_date),
-                "purchased_from": purchased_from,
-                "purchase_price": purchase_price,
-                "shipping": shipping,
-                "tax": tax,
-                "sticker_price": sticker_price,
-                "condition": condition,
-                "notes": notes,
-                "created_at": now_iso(),
-            }
-            if pull_market and reference_link:
-                prices = fetch_market_prices(reference_link)
-                market = price_for_inventory_row(pd.Series(row), prices)
-                row["market_price"] = market
-                row["market_value"] = market
-                row["market_price_debug"] = prices.get("debug", "")
-                row["image_url"] = prices.get("image_url", "")
-                row["market_price_updated_at"] = now_iso()
-            add_inventory_row(row)
-            st.success("Inventory item added.")
-            refresh_database_cache()
-
-with tab_bulk:
-    st.subheader("Bulk Add Inventory")
-    st.caption("Upload CSV/XLSX. If you include a Quantity column, one row will be created per quantity.")
-    template = pd.DataFrame([{c: "" for c in [
-        "inventory_type", "product_type", "card_type", "brand_or_league", "set_name", "year", "card_name", "card_number", "variant", "card_subtype", "reference_link", "purchase_date", "purchased_from", "purchase_price", "shipping", "tax", "condition", "notes", "Quantity"
-    ]}])
-    st.download_button("Download bulk template", template.to_csv(index=False), file_name="inventory_upload_template.csv", mime="text/csv")
-    upload = st.file_uploader("Upload inventory CSV/XLSX", type=["csv", "xlsx", "xls"])
-    if upload:
-        raw = pd.read_csv(upload) if upload.name.lower().endswith(".csv") else pd.read_excel(upload)
-        st.write("Preview")
-        st.dataframe(raw.head(50), use_container_width=True, hide_index=True)
-        if st.button("Add uploaded rows", type="primary"):
-            count = 0
-            for _, r in raw.iterrows():
-                qty = int(to_money(r.get("Quantity", 1)) or 1)
-                for _ in range(max(qty, 1)):
-                    row = {c: r.get(c, "") for c in INVENTORY_COLUMNS}
-                    row["inventory_id"] = str(uuid.uuid4())[:8]
-                    row["inventory_status"] = STATUS_ACTIVE
-                    row["created_at"] = now_iso()
-                    add_inventory_row(row)
-                    count += 1
-            st.success(f"Added {count:,} inventory rows.")
+    with c3:
+        if st.button("Refresh database", use_container_width=True):
             refresh_database_cache()
             st.rerun()
 
-with tab_table:
-    st.subheader("Inventory Table")
-    if inv.empty:
-        st.info("No inventory yet.")
+    st.markdown("---")
+
+    st.subheader("Sync eBay orders")
+
+    today = datetime.now(timezone.utc).date()
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+
+    with col1:
+        start_date = st.date_input("Start date", value=today - timedelta(days=30))
+
+    with col2:
+        end_date = st.date_input("End date", value=today)
+
+    with col3:
+        update_inventory = st.checkbox(
+            "Mark matched inventory as SOLD after sync",
+            value=True,
+        )
+
+    if st.button("Sync orders", type="primary"):
+        try:
+            start_dt = datetime.combine(
+                start_date,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            end_dt = datetime.combine(
+                end_date,
+                datetime.max.time(),
+                tzinfo=timezone.utc,
+            )
+
+            orders = fetch_orders(start_dt, end_dt)
+
+            inv_ids = (
+                set(inv["inventory_id"].astype(str).str.strip())
+                if not inv.empty and "inventory_id" in inv.columns
+                else set()
+            )
+
+            rows = normalize_orders_to_rows(orders, inv_ids)
+            inserted = upsert_ebay_order_rows(rows)
+
+            changed = (
+                apply_matched_orders_to_inventory(rows, inv)
+                if update_inventory
+                else 0
+            )
+
+            st.success(
+                f"Fetched {len(orders):,} order(s), "
+                f"added {inserted:,} new line item row(s), "
+                f"updated {changed:,} inventory row(s)."
+            )
+
+            refresh_database_cache()
+            st.rerun()
+
+        except Exception as exc:
+            st.error(str(exc))
+
+    st.subheader("Financial summary from eBay")
+    st.caption(
+        "This uses eBay Finances order earnings summary when your developer app "
+        "has access to that scope."
+    )
+
+    if st.button("Pull eBay earnings summary for selected dates"):
+        try:
+            summary = fetch_order_earnings_summary(
+                datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ),
+                datetime.combine(
+                    end_date,
+                    datetime.max.time(),
+                    tzinfo=timezone.utc,
+                ),
+            )
+            st.json(summary)
+        except Exception as exc:
+            st.error(str(exc))
+
+
+st.markdown("---")
+
+m1, m2, m3, m4 = st.columns(4)
+
+if orders_df.empty:
+    m1.metric("eBay orders imported", "0")
+    m2.metric("eBay gross", "$0.00")
+    m3.metric("eBay net", "$0.00")
+    m4.metric("Unmatched lines", "0")
+else:
+    m1.metric("eBay lines imported", f"{len(orders_df):,}")
+
+    gross = orders_df["sold_price"].sum() if "sold_price" in orders_df.columns else 0
+    net = orders_df["net_proceeds"].sum() if "net_proceeds" in orders_df.columns else 0
+
+    m2.metric("eBay gross", money_fmt(gross))
+    m3.metric("eBay net", money_fmt(net))
+
+    if "matched_to_inventory" in orders_df.columns:
+        unmatched = orders_df[
+            ~orders_df["matched_to_inventory"]
+            .astype(str)
+            .str.upper()
+            .isin(["YES", "TRUE", "1"])
+        ]
     else:
-        f1, f2, f3, f4 = st.columns(4)
-        with f1:
-            statuses = st.multiselect("Status", sorted(inv["inventory_status"].dropna().unique().tolist()), default=[])
-        with f2:
-            card_types = st.multiselect("Card type", sorted(inv["card_type"].dropna().unique().tolist()), default=[])
-        with f3:
-            product_types = st.multiselect("Product type", sorted(inv["product_type"].dropna().unique().tolist()), default=[])
-        with f4:
-            search = st.text_input("Search")
-        view = inv.copy()
-        if statuses:
-            view = view[view["inventory_status"].isin(statuses)]
-        if card_types:
-            view = view[view["card_type"].isin(card_types)]
-        if product_types:
-            view = view[view["product_type"].isin(product_types)]
-        if search.strip():
-            q = search.lower().strip()
-            view = view[view.apply(lambda r: q in str(r.get("card_name", "")).lower() or q in str(r.get("set_name", "")).lower() or q in str(r.get("card_number", "")).lower(), axis=1)]
-        cols = ["inventory_id", "inventory_status", "product_type", "card_type", "set_name", "card_name", "card_number", "variant", "purchase_date", "total_cost", "market_value", "sticker_price", "sold_date", "sold_price", "profit"]
-        st.caption(f"{len(view):,} item(s) shown")
-        st.dataframe(view[[c for c in cols if c in view.columns]], use_container_width=True, hide_index=True)
+        unmatched = orders_df
+
+    m4.metric("Unmatched lines", f"{len(unmatched):,}")
+
+
+st.subheader("Imported eBay order lines")
+
+if orders_df.empty:
+    st.info("No eBay orders imported yet.")
+else:
+    view = orders_df.copy()
+
+    if "sold_date" in view.columns:
+        view = view.sort_values("sold_date", ascending=False)
+
+    cols = [
+        "sold_date",
+        "ebay_order_id",
+        "ebay_line_item_id",
+        "sku",
+        "inventory_id",
+        "title",
+        "sold_price",
+        "shipping_charged",
+        "fees_total",
+        "net_proceeds",
+        "matched_to_inventory",
+        "sync_status",
+    ]
+
+    show_cols = [c for c in cols if c in view.columns]
+
+    st.dataframe(
+        view[show_cols],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+st.subheader("eBay listings / inventory items")
+
+if listings_df.empty:
+    st.info("No eBay listing records synced yet.")
+else:
+    view = listings_df.copy()
+
+    cols = [
+        "sku",
+        "inventory_id",
+        "title",
+        "listing_status",
+        "price",
+        "quantity",
+        "offer_id",
+        "listing_id",
+        "last_synced_at",
+    ]
+
+    show_cols = [c for c in cols if c in view.columns]
+
+    st.dataframe(
+        view[show_cols],
+        use_container_width=True,
+        hide_index=True,
+    )
