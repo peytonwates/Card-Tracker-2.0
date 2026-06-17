@@ -1,0 +1,10 @@
+streamlit>=1.37
+pandas>=2.2
+numpy>=1.26
+gspread>=6.0
+google-auth>=2.29
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.1
+altair>=5.3
+openpyxl>=3.1
