@@ -125,6 +125,13 @@ def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _ensure_money_col(out: pd.DataFrame, col: str) -> pd.DataFrame:
+    if col not in out.columns:
+        out[col] = 0.0
+    out[col] = out[col].apply(to_money).astype(float)
+    return out
+
+
 def normalize_status(x: str) -> str:
     s = clean_text(x).upper()
     return s if s else "ACTIVE"
@@ -154,13 +161,57 @@ def clean_inventory(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     out = ensure_columns(df, columns)
     out = coerce_numeric(out)
 
+    # -----------------------------------------------------
+    # Backward compatibility after inventory schema cleanup
+    # -----------------------------------------------------
+    # The old app used market_price.
+    # The cleaned sheet keeps market_value.
+    # Some app logic still expects market_price internally, so create it
+    # without requiring the Google Sheet to have that column.
+    if "market_value" not in out.columns:
+        out["market_value"] = 0.0
+
+    out = _ensure_money_col(out, "market_value")
+
+    if "market_price" not in out.columns:
+        out["market_price"] = out["market_value"]
+
+    out = _ensure_money_col(out, "market_price")
+
+    # Make sure core money columns exist and are numeric even if a schema changes.
+    for c in [
+        "purchase_price",
+        "shipping",
+        "tax",
+        "total_price",
+        "grading_fee",
+        "total_cost",
+        "sticker_price",
+        "list_price",
+        "sold_price",
+        "fees",
+        "shipping_charged",
+        "fees_total",
+        "net_proceeds",
+        "profit",
+    ]:
+        out = _ensure_money_col(out, c)
+
     out["inventory_id"] = out["inventory_id"].astype(str).str.strip()
     out = out[out["inventory_id"].ne("")].copy()
 
     out["inventory_status"] = out["inventory_status"].apply(normalize_status)
     out["card_type"] = out["card_type"].apply(normalize_card_type)
 
-    for c in ["purchase_date", "sold_date", "list_date", "market_price_updated_at", "created_at"]:
+    for c in [
+        "purchase_date",
+        "sold_date",
+        "list_date",
+        "market_price_updated_at",
+        "created_at",
+        "updated_at",
+        "ebay_last_sync_at",
+    ]:
         if c in out.columns:
             out[f"__{c}_dt"] = pd.to_datetime(out[c], errors="coerce")
 
@@ -181,6 +232,12 @@ def clean_inventory(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         out["market_price"],
     )
 
+    # If fees_total is blank/zero but fees or shipping_charged exists, calculate it.
+    out["fees_total"] = out["fees_total"].where(
+        out["fees_total"] > 0,
+        out["fees"] + out["shipping_charged"],
+    )
+
     out["net_proceeds"] = out["net_proceeds"].where(
         out["net_proceeds"] > 0,
         out["sold_price"] - out["fees_total"],
@@ -190,6 +247,21 @@ def clean_inventory(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         out["profit"].abs() > 0,
         out["net_proceeds"] - out["total_cost"],
     )
+
+    # Product-specific cleanup
+    if "product_type" in out.columns:
+        product_lower = out["product_type"].astype(str).str.lower().str.strip()
+
+        out.loc[product_lower.eq("sealed"), "condition"] = "Sealed"
+        out.loc[product_lower.eq("graded card"), "condition"] = "Graded"
+
+        for col in ["variant", "card_subtype", "card_number", "grading_company", "grade"]:
+            if col in out.columns:
+                out.loc[product_lower.eq("sealed"), col] = ""
+
+        if "sealed_product_type" in out.columns:
+            out.loc[product_lower.eq("graded card"), "sealed_product_type"] = ""
+            out.loc[product_lower.eq("card"), "sealed_product_type"] = ""
 
     return out
 
