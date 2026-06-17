@@ -177,7 +177,11 @@ def _extract_trading_errors(xml_text: str) -> list[str]:
     return errors
 
 
-def get_active_listings(access_token: str, entries_per_page: int = 100, max_pages: int = 5) -> tuple[pd.DataFrame, dict]:
+def get_active_listings(
+    access_token: str,
+    entries_per_page: int = 100,
+    max_pages: int = 5,
+) -> tuple[pd.DataFrame, dict]:
     all_rows = []
     audit = {
         "pages_requested": 0,
@@ -236,7 +240,16 @@ def get_active_listings(access_token: str, entries_per_page: int = 100, max_page
         if active_list is None:
             break
 
-        total_pages = int(to_money(_xml_text(active_list, "e:PaginationResult/e:TotalNumberOfPages", "1")) or 1)
+        total_pages = int(
+            to_money(
+                _xml_text(
+                    active_list,
+                    "e:PaginationResult/e:TotalNumberOfPages",
+                    "1",
+                )
+            )
+            or 1
+        )
 
         item_nodes = active_list.findall(".//e:ItemArray/e:Item", EBAY_XML_NS)
 
@@ -331,8 +344,8 @@ def flatten_orders(order_payload):
         order_status = order.get("orderFulfillmentStatus")
         payment_status = order.get("orderPaymentStatus")
 
-        pricing_summary = order.get("pricingSummary", {})
-        total = pricing_summary.get("total", {})
+        pricing_summary = order.get("pricingSummary", {}) or {}
+        total = pricing_summary.get("total", {}) or {}
         total_value = total.get("value")
         total_currency = total.get("currency")
 
@@ -449,6 +462,33 @@ def _find_inventory_match_by_ebay_id(inv: pd.DataFrame, ebay_item_id: str) -> pd
     return inv[mask].copy()
 
 
+def _score_inventory_match(row: pd.Series, listing_title: str) -> int:
+    title = clean_text(listing_title).lower()
+    if not title:
+        return 0
+
+    s = 0
+
+    card_name = clean_text(row.get("card_name")).lower()
+    set_name = clean_text(row.get("set_name")).lower()
+    card_number = clean_text(row.get("card_number")).lower()
+    variant = clean_text(row.get("variant")).lower()
+    grade = clean_text(row.get("grade")).lower()
+
+    if card_name and card_name in title:
+        s += 50
+    if set_name and set_name in title:
+        s += 30
+    if card_number and re.search(rf"(^|\D){re.escape(card_number)}($|\D)", title):
+        s += 25
+    if variant and variant in title:
+        s += 10
+    if grade and grade in title:
+        s += 10
+
+    return s
+
+
 def _suggest_inventory_matches(inv: pd.DataFrame, listing_title: str, max_rows: int = 25) -> pd.DataFrame:
     if inv.empty:
         return inv.copy()
@@ -460,37 +500,65 @@ def _suggest_inventory_matches(inv: pd.DataFrame, listing_title: str, max_rows: 
     if ready.empty:
         return ready
 
-    title = clean_text(listing_title).lower()
+    ready["__match_score"] = ready.apply(
+        lambda r: _score_inventory_match(r, listing_title),
+        axis=1,
+    )
 
-    if not title:
-        return ready.head(max_rows)
-
-    def score(row: pd.Series) -> int:
-        s = 0
-
-        card_name = clean_text(row.get("card_name")).lower()
-        set_name = clean_text(row.get("set_name")).lower()
-        card_number = clean_text(row.get("card_number")).lower()
-        variant = clean_text(row.get("variant")).lower()
-        grade = clean_text(row.get("grade")).lower()
-
-        if card_name and card_name in title:
-            s += 50
-        if set_name and set_name in title:
-            s += 30
-        if card_number and re.search(rf"(^|\D){re.escape(card_number)}($|\D)", title):
-            s += 25
-        if variant and variant in title:
-            s += 10
-        if grade and grade in title:
-            s += 10
-
-        return s
-
-    ready["__match_score"] = ready.apply(score, axis=1)
     ready = ready.sort_values(["__match_score", "market_value"], ascending=[False, False])
 
     return ready.head(max_rows).drop(columns=["__match_score"], errors="ignore")
+
+
+def _inventory_option_map(inv: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
+    if inv.empty:
+        return [""], {"": ""}
+
+    ready = inv[
+        inv["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE, STATUS_LISTED])
+    ].copy()
+
+    ready = ready.sort_values(["market_value", "card_name"], ascending=[False, True])
+
+    options = [""]
+    mapping = {"": ""}
+
+    for _, row in ready.iterrows():
+        label = _inventory_label(row)
+        inv_id = clean_text(row.get("inventory_id"))
+
+        if label and inv_id:
+            options.append(label)
+            mapping[label] = inv_id
+
+    return options, mapping
+
+
+def _best_inventory_label_for_listing(inv: pd.DataFrame, listing_title: str) -> tuple[str, str, int]:
+    if inv.empty:
+        return "", "", 0
+
+    ready = inv[
+        inv["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE, STATUS_LISTED])
+    ].copy()
+
+    if ready.empty:
+        return "", "", 0
+
+    ready["__match_score"] = ready.apply(
+        lambda r: _score_inventory_match(r, listing_title),
+        axis=1,
+    )
+
+    ready = ready.sort_values(["__match_score", "market_value"], ascending=[False, False])
+
+    best = ready.iloc[0]
+    score = int(best.get("__match_score", 0) or 0)
+
+    if score <= 0:
+        return "", "", 0
+
+    return _inventory_label(best), clean_text(best.get("inventory_id")), score
 
 
 def _display_listing_cols() -> list[str]:
@@ -566,6 +634,7 @@ needed_inv_cols = [
     "total_cost",
     "market_value",
     "sticker_price",
+    "reference_link",
     "ebay_item_id",
     "ebay_listing_id",
     "ebay_listing_url",
@@ -609,7 +678,7 @@ with top2:
 
 with top3:
     st.info(
-        "Workflow: pull active listings → assign unassigned listings to inventory → sync sold orders.",
+        "Workflow: pull active listings → review bulk assignments → sync sold orders.",
         icon="ℹ️",
     )
 
@@ -670,7 +739,11 @@ with tab_active:
     with c3:
         st.write("")
         st.write("")
-        pull_active = st.button("Pull Active eBay Listings", type="primary", use_container_width=True)
+        pull_active = st.button(
+            "Pull Active eBay Listings",
+            type="primary",
+            use_container_width=True,
+        )
 
     if pull_active:
         access_token = get_access_token_or_stop(ebay_config)
@@ -746,135 +819,201 @@ with tab_assign:
         if unassigned.empty:
             st.success("All pulled active listings are already assigned to inventory.")
         else:
-            unassigned["label"] = unassigned.apply(
-                lambda r: f"{r.get('ebay_item_id')} — {money_fmt(r.get('current_price'))} — {r.get('title')}",
-                axis=1,
-            )
+            inventory_options, inventory_label_to_id = _inventory_option_map(inv)
 
-            selected_listing_label = st.selectbox(
-                "Unassigned eBay listing",
-                unassigned["label"].tolist(),
-            )
+            rows = []
 
-            selected_listing = unassigned[
-                unassigned["label"].eq(selected_listing_label)
-            ].iloc[0]
+            for _, listing in unassigned.iterrows():
+                best_label, best_inv_id, score = _best_inventory_label_for_listing(
+                    inv,
+                    clean_text(listing.get("title")),
+                )
 
-            st.markdown("### Listing selected")
-
-            l1, l2 = st.columns([1, 3])
-
-            with l1:
-                image_url = clean_text(selected_listing.get("image_url"))
-                if image_url:
-                    st.image(image_url, width=160)
-                st.metric("Current price", money_fmt(selected_listing.get("current_price")))
-                st.write(f"Item ID: `{selected_listing.get('ebay_item_id')}`")
-                st.write(f"Status: `{selected_listing.get('listing_status')}`")
-
-            with l2:
-                st.write(f"**{selected_listing.get('title')}**")
-                url = clean_text(selected_listing.get("listing_url"))
-                if url:
-                    st.link_button("Open eBay listing", url)
-                st.write(
+                rows.append(
                     {
-                        "listing_start_date": selected_listing.get("listing_start_date"),
-                        "listing_end_date": selected_listing.get("listing_end_date"),
-                        "quantity_available": selected_listing.get("quantity_available"),
-                        "quantity_sold": selected_listing.get("quantity_sold"),
-                        "listing_type": selected_listing.get("listing_type"),
+                        "assign": bool(best_inv_id),
+                        "ebay_item_id": clean_text(listing.get("ebay_item_id")),
+                        "title": clean_text(listing.get("title")),
+                        "current_price": to_money(listing.get("current_price")),
+                        "listing_status": clean_text(listing.get("listing_status")),
+                        "listing_start_date": clean_text(listing.get("listing_start_date")),
+                        "listing_url": clean_text(listing.get("listing_url")),
+                        "match_score": score,
+                        "selected_inventory": best_label,
                     }
                 )
 
-            st.markdown("### Pick matching inventory item")
+            assign_df = pd.DataFrame(rows)
 
-            suggested = _suggest_inventory_matches(inv, clean_text(selected_listing.get("title")), max_rows=50)
+            matched_count = int(assign_df["selected_inventory"].astype(str).str.strip().ne("").sum())
 
-            search = st.text_input("Filter inventory suggestions", placeholder="Search name, set, number, ID...")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Unassigned listings", f"{len(assign_df):,}")
+            m2.metric("Auto-matched", f"{matched_count:,}")
+            m3.metric("Needs manual pick", f"{len(assign_df) - matched_count:,}")
 
-            if search.strip() and not suggested.empty:
-                q = search.lower().strip()
+            st.info(
+                "Review the table. If the suggested inventory item is right, leave Assign checked. "
+                "If one is wrong, change the selected inventory item or uncheck Assign.",
+                icon="ℹ️",
+            )
 
-                def _match(row: pd.Series) -> bool:
-                    fields = [
-                        row.get("inventory_id", ""),
-                        row.get("set_name", ""),
-                        row.get("card_name", ""),
-                        row.get("card_number", ""),
-                        row.get("variant", ""),
-                        row.get("grade", ""),
-                        row.get("reference_link", ""),
-                    ]
-                    return q in " ".join(str(x).lower() for x in fields)
+            edited_assignments = st.data_editor(
+                assign_df,
+                use_container_width=True,
+                hide_index=True,
+                height=650,
+                column_config={
+                    "assign": st.column_config.CheckboxColumn(
+                        "Assign",
+                        help="Checked rows will be linked to inventory when you click Apply.",
+                    ),
+                    "ebay_item_id": st.column_config.TextColumn(
+                        "eBay Item ID",
+                        disabled=True,
+                    ),
+                    "title": st.column_config.TextColumn(
+                        "eBay Title",
+                        disabled=True,
+                        width="large",
+                    ),
+                    "current_price": st.column_config.NumberColumn(
+                        "List Price",
+                        format="$%.2f",
+                        disabled=True,
+                    ),
+                    "listing_status": st.column_config.TextColumn(
+                        "Status",
+                        disabled=True,
+                    ),
+                    "listing_start_date": st.column_config.TextColumn(
+                        "List Date",
+                        disabled=True,
+                    ),
+                    "listing_url": st.column_config.LinkColumn(
+                        "Listing URL",
+                        disabled=True,
+                    ),
+                    "match_score": st.column_config.NumberColumn(
+                        "Match Score",
+                        disabled=True,
+                    ),
+                    "selected_inventory": st.column_config.SelectboxColumn(
+                        "Selected Inventory Item",
+                        options=inventory_options,
+                        required=False,
+                        width="large",
+                    ),
+                },
+                disabled=[
+                    "ebay_item_id",
+                    "title",
+                    "current_price",
+                    "listing_status",
+                    "listing_start_date",
+                    "listing_url",
+                    "match_score",
+                ],
+            )
 
-                suggested = suggested[suggested.apply(_match, axis=1)].copy()
+            st.markdown("---")
 
-            if suggested.empty:
-                st.warning("No suggested inventory rows found. Try changing the search.")
-            else:
-                suggested["label"] = suggested.apply(_inventory_label, axis=1)
+            apply_col, _ = st.columns([1, 3])
 
-                selected_inventory_label = st.selectbox(
-                    "Inventory item",
-                    suggested["label"].tolist(),
-                )
-
-                selected_inventory = suggested[
-                    suggested["label"].eq(selected_inventory_label)
-                ].iloc[0]
-
-                preview_cols = [
-                    "inventory_id",
-                    "inventory_status",
-                    "inventory_type",
-                    "product_type",
-                    "set_name",
-                    "card_name",
-                    "card_number",
-                    "variant",
-                    "grade",
-                    "total_cost",
-                    "market_value",
-                    "sticker_price",
-                ]
-
-                st.dataframe(
-                    selected_inventory[[c for c in preview_cols if c in selected_inventory.index]].to_frame().T,
+            with apply_col:
+                apply_assignments = st.button(
+                    "Apply checked assignments",
+                    type="primary",
                     use_container_width=True,
-                    hide_index=True,
                 )
 
-                if st.button("Assign this eBay listing to selected inventory", type="primary"):
-                    inv_id = clean_text(selected_inventory.get("inventory_id"))
-                    item_id = clean_text(selected_listing.get("ebay_item_id"))
-                    listing_price = to_money(selected_listing.get("current_price"))
+            if apply_assignments:
+                to_apply = edited_assignments[
+                    edited_assignments["assign"].eq(True)
+                    & edited_assignments["selected_inventory"].astype(str).str.strip().ne("")
+                ].copy()
 
-                    updates = {
+                if to_apply.empty:
+                    st.warning("No checked rows with selected inventory items to assign.")
+                    st.stop()
+
+                to_apply["inventory_id"] = to_apply["selected_inventory"].map(inventory_label_to_id)
+                to_apply["inventory_id"] = to_apply["inventory_id"].fillna("").astype(str).str.strip()
+
+                missing_inventory = to_apply[to_apply["inventory_id"].eq("")]
+                if not missing_inventory.empty:
+                    st.error("One or more selected inventory values could not be mapped to an inventory_id.")
+                    st.dataframe(missing_inventory, use_container_width=True, hide_index=True)
+                    st.stop()
+
+                duplicate_inventory = (
+                    to_apply["inventory_id"]
+                    .value_counts()
+                    .reset_index()
+                )
+                duplicate_inventory.columns = ["inventory_id", "count"]
+                duplicate_inventory = duplicate_inventory[duplicate_inventory["count"] > 1]
+
+                if not duplicate_inventory.empty:
+                    st.error(
+                        "The same inventory item is selected for more than one eBay listing. "
+                        "Fix those rows before applying."
+                    )
+                    st.dataframe(duplicate_inventory, use_container_width=True, hide_index=True)
+                    st.stop()
+
+                updates_by_inventory_id = {}
+
+                listings_lookup = unassigned.copy()
+                listings_lookup["ebay_item_id"] = listings_lookup["ebay_item_id"].astype(str).str.strip()
+                listings_lookup = listings_lookup.drop_duplicates(subset=["ebay_item_id"], keep="last")
+                listings_lookup = listings_lookup.set_index("ebay_item_id", drop=False)
+
+                for _, row in to_apply.iterrows():
+                    inv_id = clean_text(row.get("inventory_id"))
+                    item_id = clean_text(row.get("ebay_item_id"))
+
+                    if not inv_id or not item_id:
+                        continue
+
+                    if item_id in listings_lookup.index:
+                        listing = listings_lookup.loc[item_id]
+                    else:
+                        listing = pd.Series(dtype=object)
+
+                    listing_price = to_money(row.get("current_price"))
+
+                    updates_by_inventory_id[inv_id] = {
                         "inventory_status": STATUS_LISTED,
-                        "transaction_type": clean_text(selected_listing.get("listing_type")) or "eBay Listing",
+                        "transaction_type": clean_text(listing.get("listing_type")) or "eBay Listing",
                         "platform": "eBay",
                         "sale_channel": "Online",
-                        "list_date": clean_text(selected_listing.get("listing_start_date")) or str(date.today()),
+                        "list_date": clean_text(row.get("listing_start_date")) or str(date.today()),
                         "list_price": round(listing_price, 2),
                         "ebay_item_id": item_id,
-                        "ebay_listing_id": clean_text(selected_listing.get("ebay_listing_id")) or item_id,
-                        "ebay_listing_url": clean_text(selected_listing.get("listing_url")),
-                        "ebay_listing_status": clean_text(selected_listing.get("listing_status")) or "Active",
+                        "ebay_listing_id": clean_text(listing.get("ebay_listing_id")) or item_id,
+                        "ebay_listing_url": clean_text(row.get("listing_url")),
+                        "ebay_listing_status": clean_text(row.get("listing_status")) or "Active",
                         "ebay_last_sync_at": now_iso(),
                     }
 
-                    update_rows_by_key(
-                        get_ws_name("inventory_worksheet", "inventory"),
-                        INVENTORY_COLUMNS,
-                        "inventory_id",
-                        {inv_id: updates},
-                    )
+                if not updates_by_inventory_id:
+                    st.warning("No valid assignments found.")
+                    st.stop()
 
-                    refresh_database_cache()
+                update_rows_by_key(
+                    get_ws_name("inventory_worksheet", "inventory"),
+                    INVENTORY_COLUMNS,
+                    "inventory_id",
+                    updates_by_inventory_id,
+                )
 
-                    st.success(f"Assigned eBay listing {item_id} to inventory {inv_id}.")
-                    st.rerun()
+                refresh_database_cache()
+
+                st.session_state.pop("ebay_active_listings_df", None)
+
+                st.success(f"Assigned {len(updates_by_inventory_id):,} eBay listing(s) to inventory.")
+                st.rerun()
 
         st.markdown("---")
         st.markdown("### Already assigned listings")
