@@ -462,29 +462,6 @@ def _find_inventory_match_by_ebay_id(inv: pd.DataFrame, ebay_item_id: str) -> pd
     return inv[mask].copy()
 
 
-def _inventory_ready_for_ebay_assignment(inv: pd.DataFrame) -> pd.DataFrame:
-    if inv.empty:
-        return pd.DataFrame()
-
-    ready = inv[
-        inv["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE, STATUS_LISTED])
-    ].copy()
-
-    if ready.empty:
-        return ready
-
-    for col in ["ebay_item_id", "ebay_listing_id"]:
-        if col not in ready.columns:
-            ready[col] = ""
-
-    already_linked = (
-        ready["ebay_item_id"].astype(str).str.strip().ne("")
-        | ready["ebay_listing_id"].astype(str).str.strip().ne("")
-    )
-
-    return ready[~already_linked].copy()
-
-
 def _score_inventory_match(row: pd.Series, listing_title: str) -> int:
     title = clean_text(listing_title).lower()
     if not title:
@@ -512,11 +489,34 @@ def _score_inventory_match(row: pd.Series, listing_title: str) -> int:
     return s
 
 
-def _inventory_option_map(inv: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
-    ready = _inventory_ready_for_ebay_assignment(inv)
+def _suggest_inventory_matches(inv: pd.DataFrame, listing_title: str, max_rows: int = 25) -> pd.DataFrame:
+    if inv.empty:
+        return inv.copy()
+
+    ready = inv[
+        inv["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE, STATUS_LISTED])
+    ].copy()
 
     if ready.empty:
+        return ready
+
+    ready["__match_score"] = ready.apply(
+        lambda r: _score_inventory_match(r, listing_title),
+        axis=1,
+    )
+
+    ready = ready.sort_values(["__match_score", "market_value"], ascending=[False, False])
+
+    return ready.head(max_rows).drop(columns=["__match_score"], errors="ignore")
+
+
+def _inventory_option_map(inv: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
+    if inv.empty:
         return [""], {"": ""}
+
+    ready = inv[
+        inv["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE, STATUS_LISTED])
+    ].copy()
 
     ready = ready.sort_values(["market_value", "card_name"], ascending=[False, True])
 
@@ -534,20 +534,13 @@ def _inventory_option_map(inv: pd.DataFrame) -> tuple[list[str], dict[str, str]]
     return options, mapping
 
 
-def _best_inventory_label_for_listing(
-    inv: pd.DataFrame,
-    listing_title: str,
-    exclude_inventory_ids: set[str] | None = None,
-) -> tuple[str, str, int]:
-    ready = _inventory_ready_for_ebay_assignment(inv)
-
-    if ready.empty:
+def _best_inventory_label_for_listing(inv: pd.DataFrame, listing_title: str) -> tuple[str, str, int]:
+    if inv.empty:
         return "", "", 0
 
-    exclude_inventory_ids = exclude_inventory_ids or set()
-
-    ready["inventory_id"] = ready["inventory_id"].astype(str).str.strip()
-    ready = ready[~ready["inventory_id"].isin(exclude_inventory_ids)].copy()
+    ready = inv[
+        inv["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE, STATUS_LISTED])
+    ].copy()
 
     if ready.empty:
         return "", "", 0
@@ -557,10 +550,7 @@ def _best_inventory_label_for_listing(
         axis=1,
     )
 
-    ready = ready.sort_values(
-        ["__match_score", "market_value"],
-        ascending=[False, False],
-    )
+    ready = ready.sort_values(["__match_score", "market_value"], ascending=[False, False])
 
     best = ready.iloc[0]
     score = int(best.get("__match_score", 0) or 0)
@@ -832,17 +822,12 @@ with tab_assign:
             inventory_options, inventory_label_to_id = _inventory_option_map(inv)
 
             rows = []
-            auto_reserved_inventory_ids = set()
 
             for _, listing in unassigned.iterrows():
                 best_label, best_inv_id, score = _best_inventory_label_for_listing(
                     inv,
                     clean_text(listing.get("title")),
-                    exclude_inventory_ids=auto_reserved_inventory_ids,
                 )
-
-                if best_inv_id:
-                    auto_reserved_inventory_ids.add(best_inv_id)
 
                 rows.append(
                     {
@@ -868,8 +853,8 @@ with tab_assign:
             m3.metric("Needs manual pick", f"{len(assign_df) - matched_count:,}")
 
             st.info(
-                "Review the table. The draft will not auto-suggest the same inventory item twice. "
-                "If you manually choose the same inventory item twice, the app will show exactly which rows need fixing.",
+                "Review the table. If the suggested inventory item is right, leave Assign checked. "
+                "If one is wrong, change the selected inventory item or uncheck Assign.",
                 icon="ℹ️",
             )
 
@@ -970,39 +955,11 @@ with tab_assign:
                 duplicate_inventory = duplicate_inventory[duplicate_inventory["count"] > 1]
 
                 if not duplicate_inventory.empty:
-                    duplicate_ids = duplicate_inventory["inventory_id"].astype(str).tolist()
-
-                    duplicate_detail = to_apply[
-                        to_apply["inventory_id"].astype(str).isin(duplicate_ids)
-                    ].copy()
-
-                    duplicate_detail = duplicate_detail[
-                        [
-                            "inventory_id",
-                            "ebay_item_id",
-                            "title",
-                            "current_price",
-                            "selected_inventory",
-                        ]
-                    ].sort_values(["inventory_id", "title"])
-
                     st.error(
                         "The same inventory item is selected for more than one eBay listing. "
-                        "The rows below are the duplicates."
+                        "Fix those rows before applying."
                     )
-
-                    st.dataframe(
-                        duplicate_detail,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "current_price": st.column_config.NumberColumn(
-                                "List Price",
-                                format="$%.2f",
-                            ),
-                        },
-                    )
-
+                    st.dataframe(duplicate_inventory, use_container_width=True, hide_index=True)
                     st.stop()
 
                 updates_by_inventory_id = {}
