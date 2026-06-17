@@ -27,18 +27,131 @@ st.caption(
 # eBay auth / config
 # =========================================================
 
-def get_ebay_secrets():
+def _safe_secret_get(source, key, default=None):
     try:
-        ebay = st.secrets["ebay"]
-        return {
-            "environment": ebay.get("environment", "production"),
-            "marketplace_id": ebay.get("marketplace_id", "EBAY_US"),
-            "client_id": ebay["client_id"],
-            "client_secret": ebay["client_secret"],
-            "ru_name": ebay["ru_name"],
-            "scopes": ebay["scopes"],
-            "refresh_token": ebay["refresh_token"],
+        if hasattr(source, "get"):
+            return source.get(key, default)
+    except Exception:
+        pass
+
+    try:
+        return source[key]
+    except Exception:
+        return default
+
+
+def _first_secret_value(source, keys: list[str], default: str = "") -> str:
+    for key in keys:
+        value = _safe_secret_get(source, key, None)
+
+        if value is None:
+            continue
+
+        if isinstance(value, (list, tuple)):
+            value = " ".join(str(v).strip() for v in value if str(v).strip())
+        else:
+            value = str(value).strip()
+
+        if value:
+            return value
+
+    return default
+
+
+def get_ebay_secrets():
+    """
+    Supports either of these Streamlit secrets formats:
+
+    [ebay]
+    client_id = "..."
+    client_secret = "..."
+    ru_name = "..."
+    scopes = "..."
+    refresh_token = "..."
+
+    OR top-level secrets like:
+    EBAY_CLIENT_ID = "..."
+    EBAY_CLIENT_SECRET = "..."
+    EBAY_RU_NAME = "..."
+    EBAY_SCOPES = "..."
+    EBAY_REFRESH_TOKEN = "..."
+    """
+    try:
+        ebay_section = _safe_secret_get(st.secrets, "ebay", None)
+
+        if ebay_section is not None:
+            source = ebay_section
+            source_label = "[ebay]"
+            client_id_keys = ["client_id", "CLIENT_ID", "app_id", "APP_ID", "ebay_client_id", "EBAY_CLIENT_ID", "EBAY_APP_ID"]
+            client_secret_keys = ["client_secret", "CLIENT_SECRET", "cert_id", "CERT_ID", "ebay_client_secret", "EBAY_CLIENT_SECRET", "EBAY_CERT_ID"]
+            ru_name_keys = ["ru_name", "RU_NAME", "runame", "RUNAME", "redirect_uri_name", "EBAY_RU_NAME", "EBAY_RUNAME"]
+            scopes_keys = ["scopes", "scope", "SCOPES", "SCOPE", "EBAY_SCOPES", "EBAY_SCOPE"]
+            refresh_token_keys = ["refresh_token", "REFRESH_TOKEN", "EBAY_REFRESH_TOKEN", "ebay_refresh_token"]
+            environment_keys = ["environment", "ENVIRONMENT", "EBAY_ENVIRONMENT"]
+            marketplace_keys = ["marketplace_id", "MARKETPLACE_ID", "EBAY_MARKETPLACE_ID"]
+        else:
+            source = st.secrets
+            source_label = "top-level secrets"
+            client_id_keys = ["EBAY_CLIENT_ID", "ebay_client_id", "EBAY_APP_ID", "ebay_app_id", "app_id", "APP_ID", "client_id"]
+            client_secret_keys = ["EBAY_CLIENT_SECRET", "ebay_client_secret", "EBAY_CERT_ID", "ebay_cert_id", "cert_id", "CERT_ID", "client_secret"]
+            ru_name_keys = ["EBAY_RU_NAME", "EBAY_RUNAME", "ebay_ru_name", "ebay_runame", "ru_name", "runame", "RUNAME"]
+            scopes_keys = ["EBAY_SCOPES", "EBAY_SCOPE", "ebay_scopes", "ebay_scope", "scopes", "scope"]
+            refresh_token_keys = ["EBAY_REFRESH_TOKEN", "ebay_refresh_token", "refresh_token"]
+            environment_keys = ["EBAY_ENVIRONMENT", "ebay_environment", "environment"]
+            marketplace_keys = ["EBAY_MARKETPLACE_ID", "ebay_marketplace_id", "marketplace_id"]
+
+        config = {
+            "source_label": source_label,
+            "environment": _first_secret_value(source, environment_keys, default="production"),
+            "marketplace_id": _first_secret_value(source, marketplace_keys, default="EBAY_US"),
+            "client_id": _first_secret_value(source, client_id_keys),
+            "client_secret": _first_secret_value(source, client_secret_keys),
+            "ru_name": _first_secret_value(source, ru_name_keys),
+            "scopes": _first_secret_value(source, scopes_keys),
+            "refresh_token": _first_secret_value(source, refresh_token_keys),
         }
+
+        missing = [
+            field
+            for field in ["client_id", "client_secret", "ru_name", "scopes", "refresh_token"]
+            if not clean_text(config.get(field))
+        ]
+
+        if missing:
+            st.error(f"Could not load required eBay secret fields: {', '.join(missing)}")
+
+            with st.expander("eBay secrets debug - key names only", expanded=True):
+                st.write(f"Secrets source checked: `{source_label}`")
+
+                try:
+                    if ebay_section is not None:
+                        st.write("Keys found under `[ebay]`:")
+                        st.code("\n".join(list(ebay_section.keys())))
+                    else:
+                        st.write("No `[ebay]` section found. Top-level keys found:")
+                        st.code("\n".join(list(st.secrets.keys())))
+                except Exception as exc:
+                    st.write(f"Could not list secret keys: {exc}")
+
+                st.write("Expected format:")
+                st.code(
+                    """
+[ebay]
+environment = "production"
+marketplace_id = "EBAY_US"
+client_id = "..."
+client_secret = "..."
+ru_name = "..."
+scopes = "..."
+refresh_token = "..."
+""".strip(),
+                    language="toml",
+                )
+
+            return None
+
+        return config
+
     except Exception as e:
         st.error("Could not load eBay secrets from Streamlit secrets.")
         st.exception(e)
@@ -612,20 +725,6 @@ ebay_config = get_ebay_secrets()
 if not ebay_config:
     st.stop()
 
-required_fields = [
-    "client_id",
-    "client_secret",
-    "ru_name",
-    "scopes",
-    "refresh_token",
-]
-
-missing = [field for field in required_fields if not ebay_config.get(field)]
-
-if missing:
-    st.error(f"Missing required eBay secret fields: {', '.join(missing)}")
-    st.stop()
-
 data = load_data()
 inv = _safe_df(data.inventory)
 
@@ -695,6 +794,7 @@ with top3:
 with st.expander("eBay config check", expanded=False):
     st.write(
         {
+            "secrets_source": ebay_config.get("source_label", "unknown"),
             "environment": ebay_config["environment"],
             "marketplace_id": ebay_config["marketplace_id"],
             "client_id_prefix": ebay_config["client_id"][:12] + "...",
