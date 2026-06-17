@@ -1,257 +1,93 @@
-from __future__ import annotations
+import secrets
+from urllib.parse import urlencode
 
-from datetime import datetime, timedelta, timezone
-
-import pandas as pd
 import streamlit as st
 
-from core.business import load_data, refresh_database_cache
-from core.cleaning import money_fmt, clean_text
-from core.ebay import (
-    ebay_is_configured,
-    get_access_token,
-    fetch_orders,
-    normalize_orders_to_rows,
-    upsert_ebay_order_rows,
-    apply_matched_orders_to_inventory,
-    fetch_order_earnings_summary,
-    sync_listings,
-)
+
+st.set_page_config(page_title="eBay Store", page_icon="🛒", layout="wide")
+
+st.title("🛒 eBay Store Sync")
+st.caption("Step 1: Connect to eBay and confirm OAuth redirect works.")
 
 
-st.set_page_config(page_title="eBay Store", layout="wide")
-st.title("eBay Store")
-
-st.caption(
-    "This page syncs eBay orders into Google Sheets. "
-    "Inventory is updated only when the eBay line item SKU equals your inventory_id."
-)
-
-data = load_data()
-inv = data.inventory
-orders_df = data.ebay_orders
-listings_df = data.ebay_listings
-
-
-if not ebay_is_configured():
-    st.warning(
-        "eBay is not configured yet. Add ebay_client_id, ebay_client_secret, "
-        "and ebay_refresh_token to Streamlit secrets."
-    )
-
-    with st.expander("Required eBay secrets", expanded=True):
-        st.code(
-            '''
-ebay_environment = "production"
-ebay_client_id = "..."
-ebay_client_secret = "..."
-ebay_refresh_token = "..."
-ebay_marketplace_id = "EBAY_US"
-ebay_scopes = "https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly https://api.ebay.com/oauth/api_scope/sell.inventory.readonly https://api.ebay.com/oauth/api_scope/sell.finances.earnings.read"
-'''
-        )
-
-else:
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        if st.button("Test eBay token", use_container_width=True):
-            try:
-                tok = get_access_token()
-                st.success(f"Token OK. Starts with: {tok[:12]}...")
-            except Exception as exc:
-                st.error(str(exc))
-
-    with c2:
-        if st.button("Sync eBay listings", use_container_width=True):
-            try:
-                count = sync_listings()
-                st.success(f"Synced {count:,} listing/inventory records from eBay.")
-                refresh_database_cache()
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-
-    with c3:
-        if st.button("Refresh database", use_container_width=True):
-            refresh_database_cache()
-            st.rerun()
-
-    st.markdown("---")
-
-    st.subheader("Sync eBay orders")
-
-    today = datetime.now(timezone.utc).date()
-
-    col1, col2, col3 = st.columns([1, 1, 2])
-
-    with col1:
-        start_date = st.date_input("Start date", value=today - timedelta(days=30))
-
-    with col2:
-        end_date = st.date_input("End date", value=today)
-
-    with col3:
-        update_inventory = st.checkbox(
-            "Mark matched inventory as SOLD after sync",
-            value=True,
-        )
-
-    if st.button("Sync orders", type="primary"):
-        try:
-            start_dt = datetime.combine(
-                start_date,
-                datetime.min.time(),
-                tzinfo=timezone.utc,
-            )
-            end_dt = datetime.combine(
-                end_date,
-                datetime.max.time(),
-                tzinfo=timezone.utc,
-            )
-
-            orders = fetch_orders(start_dt, end_dt)
-
-            inv_ids = (
-                set(inv["inventory_id"].astype(str).str.strip())
-                if not inv.empty and "inventory_id" in inv.columns
-                else set()
-            )
-
-            rows = normalize_orders_to_rows(orders, inv_ids)
-            inserted = upsert_ebay_order_rows(rows)
-
-            changed = (
-                apply_matched_orders_to_inventory(rows, inv)
-                if update_inventory
-                else 0
-            )
-
-            st.success(
-                f"Fetched {len(orders):,} order(s), "
-                f"added {inserted:,} new line item row(s), "
-                f"updated {changed:,} inventory row(s)."
-            )
-
-            refresh_database_cache()
-            st.rerun()
-
-        except Exception as exc:
-            st.error(str(exc))
-
-    st.subheader("Financial summary from eBay")
-    st.caption(
-        "This uses eBay Finances order earnings summary when your developer app "
-        "has access to that scope."
-    )
-
-    if st.button("Pull eBay earnings summary for selected dates"):
-        try:
-            summary = fetch_order_earnings_summary(
-                datetime.combine(
-                    start_date,
-                    datetime.min.time(),
-                    tzinfo=timezone.utc,
-                ),
-                datetime.combine(
-                    end_date,
-                    datetime.max.time(),
-                    tzinfo=timezone.utc,
-                ),
-            )
-            st.json(summary)
-        except Exception as exc:
-            st.error(str(exc))
+def get_ebay_secrets():
+    try:
+        ebay = st.secrets["ebay"]
+        return {
+            "environment": ebay.get("environment", "production"),
+            "marketplace_id": ebay.get("marketplace_id", "EBAY_US"),
+            "client_id": ebay["client_id"],
+            "client_secret": ebay["client_secret"],
+            "ru_name": ebay["ru_name"],
+            "scopes": ebay["scopes"],
+        }
+    except Exception as e:
+        st.error("Could not load eBay secrets from Streamlit secrets.")
+        st.exception(e)
+        return None
 
 
-st.markdown("---")
+ebay_config = get_ebay_secrets()
 
-m1, m2, m3, m4 = st.columns(4)
-
-if orders_df.empty:
-    m1.metric("eBay orders imported", "0")
-    m2.metric("eBay gross", "$0.00")
-    m3.metric("eBay net", "$0.00")
-    m4.metric("Unmatched lines", "0")
-else:
-    m1.metric("eBay lines imported", f"{len(orders_df):,}")
-
-    gross = orders_df["sold_price"].sum() if "sold_price" in orders_df.columns else 0
-    net = orders_df["net_proceeds"].sum() if "net_proceeds" in orders_df.columns else 0
-
-    m2.metric("eBay gross", money_fmt(gross))
-    m3.metric("eBay net", money_fmt(net))
-
-    if "matched_to_inventory" in orders_df.columns:
-        unmatched = orders_df[
-            ~orders_df["matched_to_inventory"]
-            .astype(str)
-            .str.upper()
-            .isin(["YES", "TRUE", "1"])
-        ]
-    else:
-        unmatched = orders_df
-
-    m4.metric("Unmatched lines", f"{len(unmatched):,}")
+if not ebay_config:
+    st.stop()
 
 
-st.subheader("Imported eBay order lines")
+st.subheader("1. Secret Check")
 
-if orders_df.empty:
-    st.info("No eBay orders imported yet.")
-else:
-    view = orders_df.copy()
+required_fields = ["client_id", "client_secret", "ru_name", "scopes"]
+missing = [field for field in required_fields if not ebay_config.get(field)]
 
-    if "sold_date" in view.columns:
-        view = view.sort_values("sold_date", ascending=False)
+if missing:
+    st.error(f"Missing required eBay secret fields: {', '.join(missing)}")
+    st.stop()
 
-    cols = [
-        "sold_date",
-        "ebay_order_id",
-        "ebay_line_item_id",
-        "sku",
-        "inventory_id",
-        "title",
-        "sold_price",
-        "shipping_charged",
-        "fees_total",
-        "net_proceeds",
-        "matched_to_inventory",
-        "sync_status",
-    ]
+st.success("eBay secrets loaded successfully.")
 
-    show_cols = [c for c in cols if c in view.columns]
-
-    st.dataframe(
-        view[show_cols],
-        use_container_width=True,
-        hide_index=True,
+with st.expander("Show non-secret config"):
+    st.write(
+        {
+            "environment": ebay_config["environment"],
+            "marketplace_id": ebay_config["marketplace_id"],
+            "client_id_prefix": ebay_config["client_id"][:12] + "...",
+            "ru_name": ebay_config["ru_name"],
+            "scopes": ebay_config["scopes"],
+        }
     )
 
 
-st.subheader("eBay listings / inventory items")
+st.subheader("2. eBay OAuth Test")
 
-if listings_df.empty:
-    st.info("No eBay listing records synced yet.")
-else:
-    view = listings_df.copy()
+query_params = st.query_params
 
-    cols = [
-        "sku",
-        "inventory_id",
-        "title",
-        "listing_status",
-        "price",
-        "quantity",
-        "offer_id",
-        "listing_id",
-        "last_synced_at",
-    ]
+if "code" in query_params:
+    st.success("✅ eBay returned an authorization code. This part is working.")
+    st.info("Do not paste the authorization code here. It is temporary and we will exchange it in the next step.")
+    st.write("Next, tell me: **I see the green authorization code success message.**")
+    st.stop()
 
-    show_cols = [c for c in cols if c in view.columns]
+if "error" in query_params:
+    st.error("eBay returned an error.")
+    st.write(dict(query_params))
+    st.stop()
 
-    st.dataframe(
-        view[show_cols],
-        use_container_width=True,
-        hide_index=True,
-    )
+
+if st.button("Generate eBay Sign-In Link"):
+    state_value = secrets.token_urlsafe(16)
+
+    auth_base_url = "https://auth.ebay.com/oauth2/authorize"
+
+    params = {
+        "client_id": ebay_config["client_id"],
+        "redirect_uri": ebay_config["ru_name"],
+        "response_type": "code",
+        "scope": ebay_config["scopes"],
+        "state": state_value,
+    }
+
+    auth_url = f"{auth_base_url}?{urlencode(params)}"
+
+    st.success("Sign-in link generated.")
+    st.link_button("Connect eBay Account", auth_url)
+
+    st.caption("After approving access on eBay, you should be redirected back to this Streamlit page.")
