@@ -512,22 +512,6 @@ def _score_inventory_match(row: pd.Series, listing_title: str) -> int:
     return s
 
 
-def _suggest_inventory_matches(inv: pd.DataFrame, listing_title: str, max_rows: int = 25) -> pd.DataFrame:
-    ready = _inventory_ready_for_ebay_assignment(inv)
-
-    if ready.empty:
-        return ready
-
-    ready["__match_score"] = ready.apply(
-        lambda r: _score_inventory_match(r, listing_title),
-        axis=1,
-    )
-
-    ready = ready.sort_values(["__match_score", "market_value"], ascending=[False, False])
-
-    return ready.head(max_rows).drop(columns=["__match_score"], errors="ignore")
-
-
 def _inventory_option_map(inv: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
     ready = _inventory_ready_for_ebay_assignment(inv)
 
