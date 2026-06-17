@@ -101,7 +101,6 @@ def _display_inventory_cols() -> list[str]:
         "market_value",
         "sticker_price",
         "condition",
-        "notes",
     ]
 
 
@@ -346,7 +345,6 @@ with tab_record:
                         row.get("card_number", ""),
                         row.get("variant", ""),
                         row.get("grade", ""),
-                        row.get("notes", ""),
                     ]
                     return q in " ".join(str(x).lower() for x in fields)
 
@@ -674,7 +672,6 @@ with tab_inventory:
                         row.get("card_number", ""),
                         row.get("variant", ""),
                         row.get("grade", ""),
-                        row.get("notes", ""),
                     ]
                     return q in " ".join(str(x).lower() for x in fields)
 

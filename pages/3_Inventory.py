@@ -78,8 +78,15 @@ def _inventory_display_cols() -> list[str]:
         "profit",
         "sale_channel",
         "show_name",
+        "ebay_item_id",
+        "ebay_listing_id",
+        "ebay_listing_status",
+        "ebay_order_id",
+        "ebay_line_item_id",
+        "ebay_transaction_id",
+        "ebay_payout_id",
+        "ebay_last_sync_at",
         "reference_link",
-        "notes",
     ]
 
 
@@ -105,7 +112,6 @@ def _make_inventory_row(
     tax: float,
     sticker_price: float,
     condition: str,
-    notes: str,
     sealed_product_type: str = "",
     image_url: str = "",
 ) -> dict:
@@ -141,7 +147,6 @@ def _make_inventory_row(
             "total_cost": total_price,
             "sticker_price": round(to_money(sticker_price), 2),
             "condition": condition,
-            "notes": notes,
             "created_at": now_iso(),
         }
     )
@@ -396,8 +401,6 @@ with tab_add:
             condition = st.selectbox("Condition", CONDITION_OPTIONS, index=0)
 
         image_url = st.text_input("Image URL")
-        notes = st.text_area("Notes")
-
         submitted = st.form_submit_button("Add item", type="primary")
 
     if submitted:
@@ -425,7 +428,6 @@ with tab_add:
                 tax=tax,
                 sticker_price=sticker_price,
                 condition=condition,
-                notes=notes,
                 sealed_product_type=sealed_product_type,
                 image_url=image_url,
             )
@@ -468,7 +470,6 @@ with tab_bulk:
         "tax",
         "sticker_price",
         "condition",
-        "notes",
         "image_url",
         "Quantity",
     ]
@@ -550,7 +551,6 @@ with tab_bulk:
                 col_tax = _bulk_col(raw, "tax", "Tax")
                 col_sticker = _bulk_col(raw, "sticker_price", "Sticker Price")
                 col_condition = _bulk_col(raw, "condition", "Condition")
-                col_notes = _bulk_col(raw, "notes", "Notes")
                 col_image = _bulk_col(raw, "image_url", "Image URL")
                 col_qty = _bulk_col(raw, "Quantity", "quantity", "Qty", default="")
 
@@ -579,7 +579,6 @@ with tab_bulk:
                             tax=to_money(r.get(col_tax, 0)),
                             sticker_price=to_money(r.get(col_sticker, 0)),
                             condition=clean_text(r.get(col_condition, "")) or default_condition,
-                            notes=clean_text(r.get(col_notes, "")),
                             sealed_product_type=clean_text(r.get(col_sealed_type, "")),
                             image_url=clean_text(r.get(col_image, "")),
                         )
@@ -632,7 +631,7 @@ with tab_table:
             )
 
         with f4:
-            search = st.text_input("Search card, set, number, variant")
+            search = st.text_input("Search card, set, number, variant, ID, eBay ID")
 
         view = inv.copy()
 
@@ -657,6 +656,10 @@ with tab_table:
                     r.get("card_subtype", ""),
                     r.get("inventory_id", ""),
                     r.get("reference_link", ""),
+                    r.get("ebay_item_id", ""),
+                    r.get("ebay_listing_id", ""),
+                    r.get("ebay_order_id", ""),
+                    r.get("ebay_line_item_id", ""),
                 ]
                 return q in " ".join([str(x).lower() for x in fields])
 
