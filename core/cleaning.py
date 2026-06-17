@@ -1,277 +1,169 @@
 from __future__ import annotations
 
-import json
 import re
-import time
-from pathlib import Path
-from typing import Iterable
-
+from datetime import datetime, timezone
 import pandas as pd
-import streamlit as st
-import gspread
-from gspread.exceptions import APIError, WorksheetNotFound, SpreadsheetNotFound
-from google.oauth2.service_account import Credentials
+import numpy as np
+
+from .config import HEADER_ALIASES, NUMERIC_COLUMNS
 
 
-def _secret(*names: str, default=None):
-    for name in names:
-        if name in st.secrets:
-            return st.secrets[name]
-    return default
+def now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def extract_spreadsheet_id(value: str) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", raw)
-    if m:
-        return m.group(1)
-    raw = raw.replace("https://docs.google.com/spreadsheets/d/", "")
-    raw = raw.split("/edit")[0].split("?")[0].split("#")[0]
-    return raw.strip()
-
-
-def _normalize_sa_info(info: dict) -> dict:
-    info = dict(info)
-    if isinstance(info.get("private_key"), str):
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
-    return info
-
-
-def _is_retryable_gspread_error(exc: Exception) -> bool:
+def clean_text(x) -> str:
     try:
-        if isinstance(exc, APIError):
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            return status in {429, 500, 502, 503, 504}
-    except Exception:
-        pass
-    msg = str(exc)
-    return any(x in msg for x in ["429", "500", "502", "503", "504", "Quota exceeded", "RESOURCE_EXHAUSTED"])
-
-
-def with_backoff(fn, tries: int = 6, base_sleep: float = 0.75):
-    last = None
-    for i in range(tries):
-        try:
-            return fn()
-        except Exception as exc:
-            last = exc
-            if _is_retryable_gspread_error(exc):
-                time.sleep(min(base_sleep * (2 ** i), 16))
-                continue
-            raise
-    raise last
-
-
-def service_account_email() -> str:
-    try:
-        if "gcp_service_account" not in st.secrets:
+        if x is None or pd.isna(x):
             return ""
-        sa = st.secrets["gcp_service_account"]
-        if isinstance(sa, str):
-            return str(json.loads(sa).get("client_email", "")).strip()
-        return str(sa.get("client_email", "")).strip()
     except Exception:
-        return ""
+        if x is None:
+            return ""
+    return str(x).strip()
 
 
-def stop_with_sheets_error(message: str, exc: Exception | None = None):
-    st.error(message)
-    with st.expander("Google Sheets troubleshooting", expanded=True):
-        st.write("1. Share the Google Sheet with the service account as Editor.")
-        st.write("2. Make sure `spreadsheet_id` is only the Sheet ID or a valid Google Sheets URL.")
-        st.write("3. Make sure the worksheet tab names match your secrets.")
-        email = service_account_email()
-        if email:
-            st.write("Service account email:")
-            st.code(email)
-        if exc is not None:
-            st.write("Error detail:")
-            st.code(str(exc)[:2000])
-    st.stop()
+def norm_header(s: str) -> str:
+    s = str(s or "").strip().lower()
+    s = re.sub(r"__dup\d+$", "", s)
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return re.sub(r"_+", "_", s).strip("_")
 
 
-@st.cache_resource
-def get_gspread_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-
-    if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
-        try:
-            sa = st.secrets["gcp_service_account"]
-            info = _normalize_sa_info({k: sa[k] for k in sa.keys()})
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
-            return gspread.authorize(creds)
-        except Exception as exc:
-            stop_with_sheets_error("Could not load Google service account from Streamlit secrets.", exc)
-
-    if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
-        try:
-            info = _normalize_sa_info(json.loads(st.secrets["gcp_service_account"]))
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
-            return gspread.authorize(creds)
-        except Exception as exc:
-            stop_with_sheets_error("Could not parse Google service account JSON from Streamlit secrets.", exc)
-
-    if "service_account_json_path" in st.secrets:
-        try:
-            p = Path(st.secrets["service_account_json_path"])
-            if not p.is_absolute():
-                p = Path.cwd() / p
-            info = _normalize_sa_info(json.loads(p.read_text(encoding="utf-8")))
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
-            return gspread.authorize(creds)
-        except Exception as exc:
-            stop_with_sheets_error("Could not load local service account JSON.", exc)
-
-    stop_with_sheets_error('Missing Google credentials. Add `gcp_service_account` or `service_account_json_path`.')
+def canonical_header(h: str) -> str:
+    hn = norm_header(h)
+    for internal, aliases in HEADER_ALIASES.items():
+        if hn == norm_header(internal):
+            return internal
+        for alias in aliases:
+            if hn == norm_header(alias):
+                return internal
+    return hn
 
 
-@st.cache_resource
-def get_spreadsheet():
-    spreadsheet_id = extract_spreadsheet_id(_secret("spreadsheet_id", "GOOGLE_SHEET_ID", "SPREADSHEET_ID", default=""))
-    if not spreadsheet_id:
-        stop_with_sheets_error('Missing `spreadsheet_id` in Streamlit secrets.')
-    client = get_gspread_client()
+def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    out = df.copy()
+    new_cols = []
+    seen = {}
+    for c in out.columns:
+        cc = canonical_header(c)
+        seen[cc] = seen.get(cc, 0) + 1
+        new_cols.append(cc if seen[cc] == 1 else f"{cc}__dup{seen[cc]}")
+    out.columns = new_cols
+
+    base_cols = []
+    for c in out.columns:
+        b = re.sub(r"__dup\d+$", "", c)
+        if b not in base_cols:
+            base_cols.append(b)
+    merged = pd.DataFrame(index=out.index)
+    for b in base_cols:
+        candidates = [c for c in out.columns if c == b or c.startswith(f"{b}__dup")]
+        if len(candidates) == 1:
+            merged[b] = out[candidates[0]]
+        else:
+            s = out[candidates[0]].copy()
+            for c in candidates[1:]:
+                blank = s.astype(str).str.strip().eq("") | s.isna()
+                s = s.where(~blank, out[c])
+            merged[b] = s
+    return merged
+
+
+def to_money(x) -> float:
     try:
-        return with_backoff(lambda: client.open_by_key(spreadsheet_id))
-    except SpreadsheetNotFound as exc:
-        stop_with_sheets_error("Google Sheet not found or service account lacks access.", exc)
-    except Exception as exc:
-        stop_with_sheets_error("Unexpected error opening Google Sheet.", exc)
+        if x is None:
+            return 0.0
+        if isinstance(x, (int, float, np.number)) and not pd.isna(x):
+            return float(x)
+        s = str(x).strip()
+        if not s or s.lower() in {"nan", "none", "null"}:
+            return 0.0
+        neg = s.startswith("(") and s.endswith(")")
+        s = s.replace(",", "")
+        s = re.sub(r"[^0-9.\-]", "", s)
+        if s in {"", ".", "-", "-."}:
+            return 0.0
+        val = float(s)
+        return -abs(val) if neg else val
+    except Exception:
+        return 0.0
 
 
-def get_ws_name(secret_name: str, default: str) -> str:
-    return str(_secret(secret_name, default=default) or default).strip()
+def ensure_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = normalize_headers(df) if df is not None else pd.DataFrame()
+    for c in columns:
+        if c not in out.columns:
+            out[c] = ""
+    return out[columns].copy()
 
 
-def get_or_create_ws(ws_name: str, headers: list[str] | None = None, rows: int = 1000, cols: int = 30):
-    sh = get_spreadsheet()
-    try:
-        ws = with_backoff(lambda: sh.worksheet(ws_name))
-    except WorksheetNotFound:
-        ws = with_backoff(lambda: sh.add_worksheet(title=ws_name, rows=rows, cols=max(cols, len(headers or []) + 5)))
-        if headers:
-            with_backoff(lambda: ws.update(values=[headers], range_name="1:1", value_input_option="USER_ENTERED"))
-        return ws
-    if headers:
-        ensure_headers(ws, headers)
-    return ws
-
-
-def _dedupe_headers(headers: Iterable[str]) -> list[str]:
-    counts = {}
-    out = []
-    for i, h in enumerate(headers, start=1):
-        base = str(h or "").strip() or f"unnamed__col{i}"
-        counts[base] = counts.get(base, 0) + 1
-        out.append(base if counts[base] == 1 else f"{base}__dup{counts[base]}")
+def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        base = re.sub(r"__dup\d+$", "", c)
+        if base in NUMERIC_COLUMNS:
+            out[c] = out[c].apply(to_money).astype(float)
     return out
 
 
-def _strip_dup_suffix(h: str) -> str:
-    return re.sub(r"__dup\d+$", "", str(h or "").strip())
+def normalize_status(x: str) -> str:
+    s = clean_text(x).upper()
+    return s if s else "ACTIVE"
 
 
-def ensure_headers(ws, needed_headers: list[str]) -> list[str]:
-    existing = with_backoff(lambda: ws.row_values(1))
-    if not existing:
-        with_backoff(lambda: ws.update(values=[needed_headers], range_name="1:1", value_input_option="USER_ENTERED"))
-        return needed_headers
-    existing_clean = [str(x or "").strip() for x in existing]
-    existing_base = {_strip_dup_suffix(x) for x in existing_clean}
-    additions = [h for h in needed_headers if h not in existing_base]
-    if additions:
-        new_headers = existing_clean + additions
-        with_backoff(lambda: ws.update(values=[new_headers], range_name="1:1", value_input_option="USER_ENTERED"))
-        return new_headers
-    return existing_clean
+def normalize_card_type(x: str) -> str:
+    s = clean_text(x).lower()
+    if "sport" in s or s in {"football", "basketball", "baseball", "hockey", "soccer", "ufc", "golf"}:
+        return "Sports"
+    if "pok" in s:
+        return "Pokemon"
+    return clean_text(x) or "Pokemon"
 
 
-@st.cache_data(ttl=45, show_spinner=False)
-def read_sheet(ws_name: str, headers: tuple[str, ...] | None = None) -> pd.DataFrame:
-    ws = get_or_create_ws(ws_name, list(headers) if headers else None)
-    values = with_backoff(lambda: ws.get_all_values())
-    if not values or not values[0]:
-        return pd.DataFrame(columns=list(headers or []))
-    raw_header = [str(x or "").strip() for x in values[0]]
-    header = _dedupe_headers(raw_header)
-    width = len(header)
-    rows = []
-    for r in values[1:]:
-        r = list(r)
-        if len(r) < width:
-            r = r + [""] * (width - len(r))
-        elif len(r) > width:
-            r = r[:width]
-        if any(str(x).strip() for x in r):
-            rows.append(r)
-    df = pd.DataFrame(rows, columns=header)
-    if headers:
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-    return df
+def clean_inventory(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = ensure_columns(df, columns)
+    out = coerce_numeric(out)
+    out["inventory_id"] = out["inventory_id"].astype(str).str.strip()
+    out = out[out["inventory_id"].ne("")].copy()
+    out["inventory_status"] = out["inventory_status"].apply(normalize_status)
+    out["card_type"] = out["card_type"].apply(normalize_card_type)
+    for c in ["purchase_date", "sold_date", "list_date", "market_price_updated_at", "created_at"]:
+        if c in out.columns:
+            out[f"__{c}_dt"] = pd.to_datetime(out[c], errors="coerce")
+    out["total_price"] = out["total_price"].where(out["total_price"] > 0, out["purchase_price"] + out["shipping"] + out["tax"])
+    out["grading_fee"] = out["grading_fee"].fillna(0).astype(float)
+    out["total_cost"] = out["total_cost"].where(out["total_cost"] > 0, out["total_price"] + out["grading_fee"])
+    out["market_value"] = out["market_value"].where(out["market_value"] > 0, out["market_price"])
+    out["net_proceeds"] = out["net_proceeds"].where(out["net_proceeds"] > 0, out["sold_price"] - out["fees_total"])
+    out["profit"] = out["profit"].where(out["profit"].abs() > 0, out["net_proceeds"] - out["total_cost"])
+    return out
 
 
-def clear_read_cache():
-    read_sheet.clear()
+def clean_generic(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = ensure_columns(df, columns)
+    out = coerce_numeric(out)
+    return out
 
 
-def append_rows(ws_name: str, headers: list[str], rows: list[dict]):
-    if not rows:
-        return
-    ws = get_or_create_ws(ws_name, headers)
-    sheet_headers = ensure_headers(ws, headers)
-    values = []
-    for row in rows:
-        values.append([row.get(_strip_dup_suffix(h), row.get(h, "")) for h in sheet_headers])
-    with_backoff(lambda: ws.append_rows(values, value_input_option="USER_ENTERED"))
-    clear_read_cache()
+def age_bucket(days: float) -> str:
+    try:
+        d = float(days)
+    except Exception:
+        return "Unknown"
+    if d < 0:
+        return "Future"
+    if d <= 30:
+        return "0-30 days"
+    if d <= 60:
+        return "31-60 days"
+    if d <= 90:
+        return "61-90 days"
+    if d <= 180:
+        return "91-180 days"
+    return "181+ days"
 
 
-def update_rows_by_key(ws_name: str, headers: list[str], key_col: str, updates_by_key: dict[str, dict]):
-    if not updates_by_key:
-        return 0
-    ws = get_or_create_ws(ws_name, headers)
-    ensure_headers(ws, headers)
-    values = with_backoff(lambda: ws.get_all_values())
-    if not values:
-        return 0
-    header = [str(x or "").strip() for x in values[0]]
-    if key_col not in header:
-        header.append(key_col)
-        with_backoff(lambda: ws.update(values=[header], range_name="1:1", value_input_option="USER_ENTERED"))
-        values = with_backoff(lambda: ws.get_all_values())
-        header = [str(x or "").strip() for x in values[0]]
-    key_idx = header.index(key_col)
-    changed = 0
-    for row_num, row in enumerate(values[1:], start=2):
-        row = list(row)
-        if len(row) < len(header):
-            row += [""] * (len(header) - len(row))
-        key = str(row[key_idx] if key_idx < len(row) else "").strip()
-        if key not in updates_by_key:
-            continue
-        for col, val in updates_by_key[key].items():
-            if col not in header:
-                header.append(col)
-                row.append("")
-            idx = header.index(col)
-            while len(row) < len(header):
-                row.append("")
-            row[idx] = val
-        last_col = gspread.utils.rowcol_to_a1(1, len(header)).rstrip("1")
-        with_backoff(lambda rn=row_num, rw=row: ws.update(values=[rw], range_name=f"A{rn}:{last_col}{rn}", value_input_option="USER_ENTERED"))
-        changed += 1
-    if changed:
-        clear_read_cache()
-    return changed
-
-
-def overwrite_sheet(ws_name: str, headers: list[str], df: pd.DataFrame):
-    ws = get_or_create_ws(ws_name, headers)
-    rows = [headers] + df.reindex(columns=headers).fillna("").astype(str).values.tolist()
-    with_backoff(lambda: ws.clear())
-    with_backoff(lambda: ws.update(values=rows, range_name="A1", value_input_option="USER_ENTERED"))
-    clear_read_cache()
+def money_fmt(x) -> str:
+    return f"${to_money(x):,.2f}"
