@@ -19,7 +19,7 @@ st.set_page_config(page_title="eBay Store", page_icon="🛒", layout="wide")
 
 st.title("🛒 eBay Store Sync")
 st.caption(
-    "Pull active eBay listings, assign them to inventory, then sync sold eBay orders back to inventory."
+    "Pull active eBay listings, assign them to inventory, then sync sold eBay orders and fees back to inventory."
 )
 
 
@@ -188,11 +188,62 @@ def get_access_token_or_stop(ebay_config):
 
 
 # =========================================================
+# Generic helpers
+# =========================================================
+
+def _as_bool(x) -> bool:
+    if isinstance(x, bool):
+        return x
+
+    try:
+        if pd.isna(x):
+            return False
+    except Exception:
+        pass
+
+    s = str(x).strip().lower()
+
+    return s in {"true", "t", "yes", "y", "1"}
+
+
+def _bool_count(series: pd.Series) -> int:
+    if series is None:
+        return 0
+
+    return int(series.apply(_as_bool).sum())
+
+
+def _amount_value(obj) -> float:
+    if obj is None:
+        return 0.0
+
+    if isinstance(obj, dict):
+        return to_money(obj.get("value"))
+
+    return to_money(obj)
+
+
+def _safe_df(df: pd.DataFrame | None) -> pd.DataFrame:
+    return pd.DataFrame() if df is None else df.copy()
+
+
+def _ensure_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+
+    for col in cols:
+        if col not in out.columns:
+            out[col] = ""
+
+    return out
+
+
+# =========================================================
 # XML helpers for Trading API
 # =========================================================
 
 EBAY_XML_NS = {"e": "urn:ebay:apis:eBLBaseComponents"}
 TRADING_API_ENDPOINT = "https://api.ebay.com/ws/api.dll"
+FINANCES_API_ENDPOINT = "https://apiz.ebay.com/sell/finances/v1/transaction"
 
 
 def _xml_text(node, path: str, default: str = "") -> str:
@@ -272,6 +323,10 @@ def _extract_trading_errors(xml_text: str) -> list[str]:
 
     return errors
 
+
+# =========================================================
+# eBay active listing pull
+# =========================================================
 
 def get_active_listings(
     access_token: str,
@@ -442,22 +497,41 @@ def flatten_orders(order_payload):
 
         pricing_summary = order.get("pricingSummary", {}) or {}
         total = pricing_summary.get("total", {}) or {}
-        total_value = total.get("value")
+        total_value = to_money(total.get("value"))
         total_currency = total.get("currency")
 
         delivery_cost = pricing_summary.get("deliveryCost", {}) or {}
-        order_shipping_value = to_money(delivery_cost.get("value"))
+        shipping_value = to_money(delivery_cost.get("value"))
 
         line_items = order.get("lineItems", []) or []
         line_count = max(len(line_items), 1)
-        shipping_per_line = round(order_shipping_value / line_count, 2) if order_shipping_value else 0.0
 
+        line_item_values = []
         for item in line_items:
             line_cost = item.get("lineItemCost", {}) or {}
+            line_item_values.append(to_money(line_cost.get("value")))
+
+        line_item_sum = sum(line_item_values)
+
+        for idx, item in enumerate(line_items):
+            line_cost = item.get("lineItemCost", {}) or {}
+            line_item_value = to_money(line_cost.get("value"))
 
             legacy_item_id = clean_text(item.get("legacyItemId"))
             item_id = clean_text(item.get("itemId"))
             ebay_item_id = legacy_item_id or item_id
+
+            if line_count == 1:
+                allocated_order_total = total_value
+                allocated_shipping = shipping_value
+            else:
+                if line_item_sum > 0:
+                    ratio = line_item_value / line_item_sum
+                    allocated_order_total = round(total_value * ratio, 2)
+                    allocated_shipping = round(shipping_value * ratio, 2)
+                else:
+                    allocated_order_total = round(total_value / line_count, 2) if total_value else line_item_value
+                    allocated_shipping = round(shipping_value / line_count, 2) if shipping_value else 0.0
 
             rows.append(
                 {
@@ -473,11 +547,13 @@ def flatten_orders(order_payload):
                     "sku": item.get("sku"),
                     "title": item.get("title"),
                     "quantity": item.get("quantity"),
-                    "sold_price": to_money(line_cost.get("value")),
-                    "shipping_charged": shipping_per_line,
+                    "item_price": line_item_value,
+                    "shipping_charged": allocated_shipping,
+                    "sold_price": allocated_order_total,
                     "line_item_currency": line_cost.get("currency"),
-                    "order_total_value": to_money(total_value),
+                    "order_total_value": total_value,
                     "order_total_currency": total_currency,
+                    "order_line_count": line_count,
                 }
             )
 
@@ -485,44 +561,212 @@ def flatten_orders(order_payload):
 
 
 # =========================================================
-# Inventory matching / sync helpers
+# Finances API helpers
 # =========================================================
 
-def _safe_df(df: pd.DataFrame | None) -> pd.DataFrame:
-    return pd.DataFrame() if df is None else df.copy()
+def get_finance_transactions_for_order(access_token: str, marketplace_id: str, order_id: str):
+    order_id = clean_text(order_id)
+
+    if not order_id:
+        return 0, {"transactions": []}, {}
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "X-EBAY-C-MARKETPLACE-ID": marketplace_id or "EBAY_US",
+    }
+
+    params = {
+        "filter": f"orderId:{{{order_id}}}",
+        "limit": "1000",
+        "offset": "0",
+    }
+
+    response = requests.get(
+        FINANCES_API_ENDPOINT,
+        headers=headers,
+        params=params,
+        timeout=30,
+    )
+
+    if response.status_code == 204:
+        return 204, {"transactions": []}, params
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw_response": response.text, "transactions": []}
+
+    return response.status_code, payload, params
 
 
-def _ensure_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = df.copy()
+def _choose_sale_transaction(finance_payload: dict, order_id: str) -> dict:
+    transactions = finance_payload.get("transactions", []) or []
+    order_id = clean_text(order_id)
 
-    for col in cols:
-        if col not in out.columns:
-            out[col] = ""
+    sale_transactions = [
+        t for t in transactions
+        if clean_text(t.get("transactionType")).upper() == "SALE"
+        and clean_text(t.get("orderId")) == order_id
+    ]
 
-    return out
+    if sale_transactions:
+        return sale_transactions[0]
 
+    sale_transactions = [
+        t for t in transactions
+        if clean_text(t.get("transactionType")).upper() == "SALE"
+    ]
 
-def _as_bool(x) -> bool:
-    if isinstance(x, bool):
-        return x
+    if sale_transactions:
+        return sale_transactions[0]
 
-    if pd.isna(x):
-        return False
-
-    s = str(x).strip().lower()
-
-    if s in {"true", "t", "yes", "y", "1"}:
-        return True
-
-    return False
+    return transactions[0] if transactions else {}
 
 
-def _bool_count(series: pd.Series) -> int:
-    if series is None:
-        return 0
+def _line_finance_basis_from_transaction(sale_tx: dict, line_item_id: str) -> tuple[float, float]:
+    line_item_id = clean_text(line_item_id)
+    line_items = sale_tx.get("orderLineItems", []) or []
 
-    return int(series.apply(_as_bool).sum())
+    if not line_items:
+        return 0.0, 0.0
 
+    target = None
+
+    for li in line_items:
+        if clean_text(li.get("lineItemId")) == line_item_id:
+            target = li
+            break
+
+    if target is None and len(line_items) == 1:
+        target = line_items[0]
+
+    if target is None:
+        return 0.0, 0.0
+
+    basis = _amount_value(target.get("feeBasisAmount"))
+
+    line_fee = 0.0
+
+    for fee in target.get("marketplaceFees", []) or []:
+        line_fee += _amount_value(fee.get("amount"))
+
+    for donation in target.get("donations", []) or []:
+        line_fee += _amount_value(donation.get("amount"))
+
+    return basis, line_fee
+
+
+def _finance_values_for_order_line(order_row: pd.Series, finance_payload: dict) -> dict:
+    order_id = clean_text(order_row.get("ebay_order_id"))
+    line_item_id = clean_text(order_row.get("ebay_line_item_id"))
+
+    sale_tx = _choose_sale_transaction(finance_payload, order_id)
+
+    if not sale_tx:
+        fallback_sold_price = to_money(order_row.get("sold_price"))
+        return {
+            "finance_found": False,
+            "finance_status": "No Finances SALE transaction found yet",
+            "finance_transaction_id": "",
+            "finance_payout_id": "",
+            "finance_gross": fallback_sold_price,
+            "finance_net": fallback_sold_price,
+            "finance_fees": 0.0,
+            "finance_fee_source": "fallback_order_no_finance",
+        }
+
+    order_total_from_fulfillment = to_money(order_row.get("order_total_value"))
+    row_sold_price_from_fulfillment = to_money(order_row.get("sold_price"))
+    line_count = int(to_money(order_row.get("order_line_count")) or 1)
+
+    sale_amount_net = abs(_amount_value(sale_tx.get("amount")))
+    sale_total_fee_basis = _amount_value(sale_tx.get("totalFeeBasisAmount"))
+    sale_total_fee_amount = _amount_value(sale_tx.get("totalFeeAmount"))
+
+    order_gross = order_total_from_fulfillment or sale_total_fee_basis or row_sold_price_from_fulfillment
+    order_net = sale_amount_net
+
+    if order_gross > 0 and order_net > 0:
+        order_total_deductions = round(order_gross - order_net, 2)
+    elif sale_total_fee_amount > 0:
+        order_total_deductions = round(sale_total_fee_amount, 2)
+    else:
+        order_total_deductions = 0.0
+
+    if line_count <= 1:
+        line_gross = order_gross
+        line_fees = order_total_deductions
+        line_net = round(line_gross - line_fees, 2)
+    else:
+        line_basis, line_fee_direct = _line_finance_basis_from_transaction(sale_tx, line_item_id)
+        line_gross = row_sold_price_from_fulfillment or line_basis
+
+        if order_gross > 0 and line_gross > 0:
+            ratio = line_gross / order_gross
+            line_fees = round(order_total_deductions * ratio, 2)
+        elif line_fee_direct > 0:
+            line_fees = round(line_fee_direct, 2)
+        else:
+            line_fees = 0.0
+
+        line_net = round(line_gross - line_fees, 2)
+
+    if line_net < 0 and sale_amount_net > 0:
+        line_net = sale_amount_net
+
+    return {
+        "finance_found": True,
+        "finance_status": "Finances API matched",
+        "finance_transaction_id": clean_text(sale_tx.get("transactionId")),
+        "finance_payout_id": clean_text(sale_tx.get("payoutId")),
+        "finance_gross": round(line_gross, 2),
+        "finance_net": round(line_net, 2),
+        "finance_fees": round(max(line_fees, 0.0), 2),
+        "finance_fee_source": "sold_price_minus_finance_net",
+    }
+
+
+def build_finance_map_for_orders(access_token: str, marketplace_id: str, orders_df: pd.DataFrame) -> tuple[dict, dict]:
+    finance_by_order_id = {}
+    audit = {}
+
+    if orders_df.empty or "ebay_order_id" not in orders_df.columns:
+        return finance_by_order_id, audit
+
+    order_ids = (
+        orders_df["ebay_order_id"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .drop_duplicates()
+        .tolist()
+    )
+
+    for order_id in order_ids:
+        status, payload, params = get_finance_transactions_for_order(
+            access_token=access_token,
+            marketplace_id=marketplace_id,
+            order_id=order_id,
+        )
+
+        audit[order_id] = {
+            "status_code": status,
+            "params": params,
+            "transaction_count": len(payload.get("transactions", []) or []),
+            "payload": payload,
+        }
+
+        finance_by_order_id[order_id] = payload
+
+    return finance_by_order_id, audit
+
+
+# =========================================================
+# Inventory matching / sync helpers
+# =========================================================
 
 def _inventory_label(row: pd.Series) -> str:
     inv_id = clean_text(row.get("inventory_id"))
@@ -697,43 +941,61 @@ def _best_inventory_label_for_listing(
     return _inventory_label(best), clean_text(best.get("inventory_id")), score
 
 
-def _build_order_sync_df(inv: pd.DataFrame, orders_df: pd.DataFrame) -> pd.DataFrame:
+def _build_order_sync_df(inv: pd.DataFrame, orders_df: pd.DataFrame, finance_by_order_id: dict | None = None) -> pd.DataFrame:
     if orders_df.empty:
         return pd.DataFrame()
 
+    finance_by_order_id = finance_by_order_id or {}
     matched_rows = []
 
     for _, order_row in orders_df.iterrows():
         ebay_item_id = clean_text(order_row.get("ebay_item_id"))
+        order_id = clean_text(order_row.get("ebay_order_id"))
         match_df = _find_inventory_match_by_ebay_id(inv, ebay_item_id)
+
+        finance_payload = finance_by_order_id.get(order_id, {"transactions": []})
+        finance_values = _finance_values_for_order_line(order_row, finance_payload)
 
         if match_df.empty:
             matched_rows.append(
                 {
                     **order_row.to_dict(),
+                    **finance_values,
                     "matched": False,
                     "already_sold": False,
                     "inventory_id": "",
                     "inventory_status": "",
                     "total_cost": 0.0,
+                    "sync_sold_price": finance_values["finance_gross"],
+                    "sync_fees": finance_values["finance_fees"],
+                    "sync_net_proceeds": finance_values["finance_net"],
+                    "sync_profit": 0.0,
                 }
             )
         else:
             inv_match = match_df.iloc[0]
             status = clean_text(inv_match.get("inventory_status")).upper()
             existing_order_id = clean_text(inv_match.get("ebay_order_id"))
-            order_id = clean_text(order_row.get("ebay_order_id"))
 
             already_sold = bool(status == STATUS_SOLD or (bool(existing_order_id) and existing_order_id == order_id))
+
+            total_cost = to_money(inv_match.get("total_cost"))
+            sync_net = to_money(finance_values["finance_net"])
+            sync_profit = round(sync_net - total_cost, 2)
 
             matched_rows.append(
                 {
                     **order_row.to_dict(),
+                    **finance_values,
                     "matched": True,
                     "already_sold": already_sold,
                     "inventory_id": clean_text(inv_match.get("inventory_id")),
                     "inventory_status": status,
-                    "total_cost": to_money(inv_match.get("total_cost")),
+                    "total_cost": total_cost,
+                    "sync_sold_price": finance_values["finance_gross"],
+                    "sync_fees": finance_values["finance_fees"],
+                    "sync_net_proceeds": finance_values["finance_net"],
+                    "sync_profit": sync_profit,
                 }
             )
 
@@ -766,15 +1028,12 @@ def _sync_ebay_sales_to_inventory(sync_df: pd.DataFrame) -> tuple[int, pd.DataFr
 
     for _, row in ready_to_mark.iterrows():
         inv_id = clean_text(row.get("inventory_id"))
-        sold_price = to_money(row.get("sold_price"))
-        shipping_charged = to_money(row.get("shipping_charged"))
+
+        sold_price = round(to_money(row.get("sync_sold_price")), 2)
+        fees = round(to_money(row.get("sync_fees")), 2)
+        fees_total = fees
+        net = round(to_money(row.get("sync_net_proceeds")), 2)
         total_cost = to_money(row.get("total_cost"))
-
-        fees = 0.0
-        fees_total = 0.0
-
-        gross_collected = round(sold_price + shipping_charged, 2)
-        net = round(gross_collected - fees_total, 2)
         profit = round(net - total_cost, 2)
 
         if not inv_id:
@@ -785,19 +1044,21 @@ def _sync_ebay_sales_to_inventory(sync_df: pd.DataFrame) -> tuple[int, pd.DataFr
             "transaction_type": "eBay Order",
             "platform": "eBay",
             "sold_date": clean_text(row.get("sold_date")) or str(date.today()),
-            "sold_price": round(sold_price, 2),
-            "fees": round(fees, 2),
-            "shipping_charged": round(shipping_charged, 2),
-            "fees_total": round(fees_total, 2),
+            "sold_price": sold_price,
+            "fees": fees,
+            "shipping_charged": round(to_money(row.get("shipping_charged")), 2),
+            "fees_total": fees_total,
             "net_proceeds": net,
             "profit": profit,
             "sale_channel": "eBay",
-            "sale_notes": "Synced from eBay order pull. Fees/label cost not reconciled yet.",
+            "sale_notes": f"Synced from eBay. Fee source: {clean_text(row.get('finance_fee_source')) or 'unknown'}",
             "ebay_order_id": clean_text(row.get("ebay_order_id")),
             "ebay_line_item_id": clean_text(row.get("ebay_line_item_id")),
             "ebay_item_id": clean_text(row.get("ebay_item_id")),
             "ebay_listing_id": clean_text(row.get("ebay_item_id")),
             "ebay_listing_status": "Sold",
+            "ebay_transaction_id": clean_text(row.get("finance_transaction_id")),
+            "ebay_payout_id": clean_text(row.get("finance_payout_id")),
             "ebay_last_sync_at": now_iso(),
             "sold_transaction_id": clean_text(row.get("ebay_line_item_id"))
             or clean_text(row.get("ebay_order_id"))
@@ -819,7 +1080,7 @@ def _sync_ebay_sales_to_inventory(sync_df: pd.DataFrame) -> tuple[int, pd.DataFr
     return len(updates_by_inventory_id), ready_to_mark
 
 
-def _pull_orders_and_build_sync_df(access_token: str, inv: pd.DataFrame, days_back: int, limit: int):
+def _pull_orders_and_build_sync_df(access_token: str, marketplace_id: str, inv: pd.DataFrame, days_back: int, limit: int):
     order_status, order_payload, used_params = get_recent_orders(
         access_token=access_token,
         days_back=int(days_back),
@@ -827,12 +1088,19 @@ def _pull_orders_and_build_sync_df(access_token: str, inv: pd.DataFrame, days_ba
     )
 
     if order_status != 200:
-        return order_status, order_payload, used_params, pd.DataFrame(), pd.DataFrame()
+        return order_status, order_payload, used_params, pd.DataFrame(), pd.DataFrame(), {}, {}
 
     orders_df = flatten_orders(order_payload)
-    sync_df = _build_order_sync_df(inv, orders_df)
 
-    return order_status, order_payload, used_params, orders_df, sync_df
+    finance_by_order_id, finance_audit = build_finance_map_for_orders(
+        access_token=access_token,
+        marketplace_id=marketplace_id,
+        orders_df=orders_df,
+    )
+
+    sync_df = _build_order_sync_df(inv, orders_df, finance_by_order_id)
+
+    return order_status, order_payload, used_params, orders_df, sync_df, finance_by_order_id, finance_audit
 
 
 def _display_listing_cols() -> list[str]:
@@ -854,6 +1122,8 @@ def _display_order_cols() -> list[str]:
     return [
         "matched",
         "already_sold",
+        "finance_found",
+        "finance_status",
         "inventory_id",
         "inventory_status",
         "ebay_order_id",
@@ -862,8 +1132,12 @@ def _display_order_cols() -> list[str]:
         "sold_date",
         "title",
         "quantity",
-        "sold_price",
+        "item_price",
         "shipping_charged",
+        "sync_sold_price",
+        "sync_fees",
+        "sync_net_proceeds",
+        "sync_profit",
         "order_status",
         "payment_status",
     ]
@@ -936,6 +1210,7 @@ with top2:
             "ebay_orders_payload",
             "ebay_orders_filter",
             "ebay_order_sync_df",
+            "ebay_finance_audit",
         ]:
             st.session_state.pop(key, None)
         st.success("Cleared eBay page cache.")
@@ -945,16 +1220,17 @@ with top3:
 
 with top4:
     st.info(
-        "Workflow: pull active listings → review assignments → sync sold eBay orders.",
+        "Workflow: pull active listings → review assignments → sync sold eBay orders with fees.",
         icon="ℹ️",
     )
 
 if sync_now:
     access_token = get_access_token_or_stop(ebay_config)
 
-    with st.spinner("Pulling recent eBay orders and syncing matched sales..."):
-        order_status, order_payload, used_params, orders_df, sync_df = _pull_orders_and_build_sync_df(
+    with st.spinner("Pulling recent eBay orders, finance transactions, and syncing matched sales..."):
+        order_status, order_payload, used_params, orders_df, sync_df, finance_by_order_id, finance_audit = _pull_orders_and_build_sync_df(
             access_token=access_token,
+            marketplace_id=ebay_config.get("marketplace_id", "EBAY_US"),
             inv=inv,
             days_back=30,
             limit=100,
@@ -964,6 +1240,7 @@ if sync_now:
     st.session_state["ebay_orders_filter"] = used_params
     st.session_state["ebay_orders_df"] = orders_df
     st.session_state["ebay_order_sync_df"] = sync_df
+    st.session_state["ebay_finance_audit"] = finance_audit
 
     if order_status != 200:
         st.error(f"Order pull failed. Status code: {order_status}")
@@ -974,7 +1251,7 @@ if sync_now:
     refresh_database_cache()
 
     if changed:
-        st.success(f"Synced {changed:,} eBay sale(s) and marked inventory SOLD.")
+        st.success(f"Synced {changed:,} eBay sale(s), fees, net proceeds, and profit.")
     else:
         st.info("No new matched eBay sales needed updating. Check Sold Order Sync for unmatched order lines.")
 
@@ -1415,7 +1692,7 @@ with tab_orders:
     st.subheader("Sold eBay Order Sync")
 
     st.caption(
-        "This pulls recent sold orders, matches them to assigned inventory, and marks matched unsold items SOLD."
+        "This pulls recent sold orders, pulls eBay Finances transactions, and marks matched unsold items SOLD."
     )
 
     c1, c2, c3, c4 = st.columns([1, 1, 1.5, 1.5])
@@ -1441,19 +1718,20 @@ with tab_orders:
     with c3:
         st.write("")
         st.write("")
-        pull_orders = st.button("Pull Recent eBay Orders", use_container_width=True)
+        pull_orders = st.button("Pull Recent eBay Orders + Fees", use_container_width=True)
 
     with c4:
         st.write("")
         st.write("")
-        pull_and_sync = st.button("Pull + Sync Sold Orders", type="primary", use_container_width=True)
+        pull_and_sync = st.button("Pull + Sync Sold Orders + Fees", type="primary", use_container_width=True)
 
     if pull_orders or pull_and_sync:
         access_token = get_access_token_or_stop(ebay_config)
 
-        with st.spinner("Pulling recent eBay orders..."):
-            order_status, order_payload, used_params, df_orders, sync_df = _pull_orders_and_build_sync_df(
+        with st.spinner("Pulling recent eBay orders and finance transactions..."):
+            order_status, order_payload, used_params, df_orders, sync_df, finance_by_order_id, finance_audit = _pull_orders_and_build_sync_df(
                 access_token=access_token,
+                marketplace_id=ebay_config.get("marketplace_id", "EBAY_US"),
                 inv=inv,
                 days_back=int(days_back),
                 limit=int(order_limit),
@@ -1461,6 +1739,7 @@ with tab_orders:
 
         st.session_state["ebay_orders_payload"] = order_payload
         st.session_state["ebay_orders_filter"] = used_params
+        st.session_state["ebay_finance_audit"] = finance_audit
 
         if order_status != 200:
             st.error(f"Order pull failed. Status code: {order_status}")
@@ -1480,7 +1759,7 @@ with tab_orders:
             refresh_database_cache()
 
             if changed:
-                st.success(f"Synced {changed:,} eBay sale(s) and marked inventory SOLD.")
+                st.success(f"Synced {changed:,} eBay sale(s), fees, net proceeds, and profit.")
             else:
                 st.info("No new matched eBay sales needed updating.")
 
@@ -1490,20 +1769,21 @@ with tab_orders:
     sync_df = st.session_state.get("ebay_order_sync_df", pd.DataFrame()).copy()
 
     if orders_df.empty:
-        st.info("No eBay orders pulled yet. Click Pull Recent eBay Orders or Pull + Sync Sold Orders.")
+        st.info("No eBay orders pulled yet. Click Pull Recent eBay Orders + Fees or Pull + Sync Sold Orders + Fees.")
     else:
         if sync_df.empty:
-            sync_df = _build_order_sync_df(inv, orders_df)
+            sync_df = _build_order_sync_df(inv, orders_df, {})
 
         if not sync_df.empty:
             sync_df["matched"] = sync_df["matched"].apply(_as_bool)
             sync_df["already_sold"] = sync_df["already_sold"].apply(_as_bool)
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Order line items", f"{len(sync_df):,}")
-        m2.metric("Matched to inventory", f"{_bool_count(sync_df['matched']):,}")
+        m2.metric("Matched", f"{_bool_count(sync_df['matched']):,}")
         m3.metric("Unmatched", f"{int((~sync_df['matched']).sum()):,}")
-        m4.metric("Already sold", f"{_bool_count(sync_df['already_sold']):,}")
+        m4.metric("Finance found", f"{_bool_count(sync_df['finance_found']):,}" if "finance_found" in sync_df.columns else "0")
+        m5.metric("Already sold", f"{_bool_count(sync_df['already_sold']):,}")
 
         cols = [c for c in _display_order_cols() if c in sync_df.columns]
 
@@ -1516,8 +1796,13 @@ with tab_orders:
             column_config={
                 "matched": st.column_config.CheckboxColumn("Matched"),
                 "already_sold": st.column_config.CheckboxColumn("Already Sold"),
-                "sold_price": st.column_config.NumberColumn("Sold Price", format="$%.2f"),
+                "finance_found": st.column_config.CheckboxColumn("Finance Found"),
+                "item_price": st.column_config.NumberColumn("Item Price", format="$%.2f"),
                 "shipping_charged": st.column_config.NumberColumn("Shipping Charged", format="$%.2f"),
+                "sync_sold_price": st.column_config.NumberColumn("Sold Price to Write", format="$%.2f"),
+                "sync_fees": st.column_config.NumberColumn("Fees to Write", format="$%.2f"),
+                "sync_net_proceeds": st.column_config.NumberColumn("Net Proceeds to Write", format="$%.2f"),
+                "sync_profit": st.column_config.NumberColumn("Profit to Write", format="$%.2f"),
             },
         )
 
@@ -1528,20 +1813,28 @@ with tab_orders:
                 st.warning(
                     "These sold items could not be matched to inventory. Check that the eBay listing was assigned to inventory."
                 )
+
+                show_cols = [
+                    "ebay_order_id",
+                    "ebay_line_item_id",
+                    "ebay_item_id",
+                    "sold_date",
+                    "title",
+                    "sync_sold_price",
+                    "sync_fees",
+                    "sync_net_proceeds",
+                    "finance_status",
+                ]
+
                 st.dataframe(
-                    unmatched[
-                        [
-                            "ebay_order_id",
-                            "ebay_line_item_id",
-                            "ebay_item_id",
-                            "sold_date",
-                            "title",
-                            "sold_price",
-                            "shipping_charged",
-                        ]
-                    ],
+                    unmatched[[c for c in show_cols if c in unmatched.columns]],
                     use_container_width=True,
                     hide_index=True,
+                    column_config={
+                        "sync_sold_price": st.column_config.NumberColumn("Sold Price", format="$%.2f"),
+                        "sync_fees": st.column_config.NumberColumn("Fees", format="$%.2f"),
+                        "sync_net_proceeds": st.column_config.NumberColumn("Net", format="$%.2f"),
+                    },
                 )
 
         ready_to_mark = sync_df[
@@ -1554,46 +1847,46 @@ with tab_orders:
         if ready_to_mark.empty:
             st.info("No matched unsold order lines are ready to mark SOLD.")
         else:
-            preview = ready_to_mark.copy()
-            preview["estimated_gross_collected"] = preview["sold_price"].apply(to_money) + preview["shipping_charged"].apply(to_money)
-            preview["estimated_profit_before_fees"] = preview["estimated_gross_collected"] - preview["total_cost"].apply(to_money)
-
             st.caption(
-                "This will mark matched inventory SOLD. eBay fees/label cost are still left at $0 until we add Finances reconciliation."
+                "This will write sold price, fees, net proceeds, and profit to inventory. "
+                "Sold price is total buyer-paid order amount allocated to the item."
             )
 
+            preview_cols = [
+                "inventory_id",
+                "ebay_order_id",
+                "ebay_line_item_id",
+                "ebay_item_id",
+                "sold_date",
+                "title",
+                "sync_sold_price",
+                "sync_fees",
+                "sync_net_proceeds",
+                "total_cost",
+                "sync_profit",
+                "finance_status",
+            ]
+
             st.dataframe(
-                preview[
-                    [
-                        "inventory_id",
-                        "ebay_order_id",
-                        "ebay_line_item_id",
-                        "ebay_item_id",
-                        "sold_date",
-                        "title",
-                        "sold_price",
-                        "shipping_charged",
-                        "total_cost",
-                        "estimated_profit_before_fees",
-                    ]
-                ],
+                ready_to_mark[[c for c in preview_cols if c in ready_to_mark.columns]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "sold_price": st.column_config.NumberColumn("Sold Price", format="$%.2f"),
-                    "shipping_charged": st.column_config.NumberColumn("Shipping Charged", format="$%.2f"),
+                    "sync_sold_price": st.column_config.NumberColumn("Sold Price", format="$%.2f"),
+                    "sync_fees": st.column_config.NumberColumn("Fees", format="$%.2f"),
+                    "sync_net_proceeds": st.column_config.NumberColumn("Net Proceeds", format="$%.2f"),
                     "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f"),
-                    "estimated_profit_before_fees": st.column_config.NumberColumn("Est Profit Before Fees", format="$%.2f"),
+                    "sync_profit": st.column_config.NumberColumn("Profit", format="$%.2f"),
                 },
             )
 
             confirm = st.checkbox(
-                "I understand fees/label cost are not reconciled yet. Mark these matched eBay order lines SOLD.",
+                "I reviewed the rows above. Mark these matched eBay order lines SOLD and write fees/net/profit.",
                 value=False,
             )
 
             if st.button(
-                "Sync selected matched eBay sales",
+                "Sync selected matched eBay sales + fees",
                 type="primary",
                 disabled=not confirm,
             ):
@@ -1601,7 +1894,7 @@ with tab_orders:
                 refresh_database_cache()
 
                 if changed:
-                    st.success(f"Synced {changed:,} eBay sale(s) and marked inventory SOLD.")
+                    st.success(f"Synced {changed:,} eBay sale(s), fees, net proceeds, and profit.")
                 else:
                     st.info("No new matched eBay sales needed updating.")
 
@@ -1673,6 +1966,29 @@ with tab_audit:
             file_name="ebay_order_sync.csv",
             mime="text/csv",
         )
+
+    st.markdown("### eBay Finances audit")
+    finance_audit = st.session_state.get("ebay_finance_audit", {})
+
+    if not finance_audit:
+        st.info("No finance audit data cached yet.")
+    else:
+        summary_rows = []
+
+        for order_id, details in finance_audit.items():
+            summary_rows.append(
+                {
+                    "ebay_order_id": order_id,
+                    "status_code": details.get("status_code"),
+                    "transaction_count": details.get("transaction_count"),
+                    "filter": (details.get("params") or {}).get("filter", ""),
+                }
+            )
+
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        with st.expander("Raw Finances API responses", expanded=False):
+            st.json(finance_audit)
 
     st.markdown("### Recent orders raw JSON")
     order_payload = st.session_state.get("ebay_orders_payload", {})
