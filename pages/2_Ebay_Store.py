@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from core.business import load_data, refresh_database_cache, mark_inventory_sold
+from core.business import load_data, refresh_database_cache
 from core.cleaning import clean_text, to_money, money_fmt, now_iso
 from core.config import INVENTORY_COLUMNS, STATUS_ACTIVE, STATUS_LISTED, STATUS_SOLD
 from core.sheets import get_ws_name, update_rows_by_key
@@ -459,8 +459,6 @@ def flatten_orders(order_payload):
             item_id = clean_text(item.get("itemId"))
             ebay_item_id = legacy_item_id or item_id
 
-            line_shipping = shipping_per_line
-
             rows.append(
                 {
                     "ebay_order_id": order_id,
@@ -476,7 +474,7 @@ def flatten_orders(order_payload):
                     "title": item.get("title"),
                     "quantity": item.get("quantity"),
                     "sold_price": to_money(line_cost.get("value")),
-                    "shipping_charged": line_shipping,
+                    "shipping_charged": shipping_per_line,
                     "line_item_currency": line_cost.get("currency"),
                     "order_total_value": to_money(total_value),
                     "order_total_currency": total_currency,
@@ -502,6 +500,28 @@ def _ensure_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
             out[col] = ""
 
     return out
+
+
+def _as_bool(x) -> bool:
+    if isinstance(x, bool):
+        return x
+
+    if pd.isna(x):
+        return False
+
+    s = str(x).strip().lower()
+
+    if s in {"true", "t", "yes", "y", "1"}:
+        return True
+
+    return False
+
+
+def _bool_count(series: pd.Series) -> int:
+    if series is None:
+        return 0
+
+    return int(series.apply(_as_bool).sum())
 
 
 def _inventory_label(row: pd.Series) -> str:
@@ -704,7 +724,7 @@ def _build_order_sync_df(inv: pd.DataFrame, orders_df: pd.DataFrame) -> pd.DataF
             existing_order_id = clean_text(inv_match.get("ebay_order_id"))
             order_id = clean_text(order_row.get("ebay_order_id"))
 
-            already_sold = status == STATUS_SOLD or (existing_order_id and existing_order_id == order_id)
+            already_sold = bool(status == STATUS_SOLD or (bool(existing_order_id) and existing_order_id == order_id))
 
             matched_rows.append(
                 {
@@ -717,22 +737,32 @@ def _build_order_sync_df(inv: pd.DataFrame, orders_df: pd.DataFrame) -> pd.DataF
                 }
             )
 
-    return pd.DataFrame(matched_rows)
+    out = pd.DataFrame(matched_rows)
+
+    if not out.empty:
+        out["matched"] = out["matched"].apply(_as_bool)
+        out["already_sold"] = out["already_sold"].apply(_as_bool)
+
+    return out
 
 
 def _sync_ebay_sales_to_inventory(sync_df: pd.DataFrame) -> tuple[int, pd.DataFrame]:
     if sync_df.empty:
         return 0, pd.DataFrame()
 
-    ready_to_mark = sync_df[
-        sync_df["matched"].eq(True)
-        & sync_df["already_sold"].eq(False)
+    working = sync_df.copy()
+    working["matched"] = working["matched"].apply(_as_bool)
+    working["already_sold"] = working["already_sold"].apply(_as_bool)
+
+    ready_to_mark = working[
+        working["matched"].eq(True)
+        & working["already_sold"].eq(False)
     ].copy()
 
     if ready_to_mark.empty:
         return 0, ready_to_mark
 
-    changed = 0
+    updates_by_inventory_id = {}
 
     for _, row in ready_to_mark.iterrows():
         inv_id = clean_text(row.get("inventory_id"))
@@ -750,7 +780,7 @@ def _sync_ebay_sales_to_inventory(sync_df: pd.DataFrame) -> tuple[int, pd.DataFr
         if not inv_id:
             continue
 
-        updates = {
+        updates_by_inventory_id[inv_id] = {
             "inventory_status": STATUS_SOLD,
             "transaction_type": "eBay Order",
             "platform": "eBay",
@@ -776,9 +806,17 @@ def _sync_ebay_sales_to_inventory(sync_df: pd.DataFrame) -> tuple[int, pd.DataFr
             "sold_updated_at": now_iso(),
         }
 
-        changed += mark_inventory_sold(inv_id, updates)
+    if not updates_by_inventory_id:
+        return 0, ready_to_mark
 
-    return changed, ready_to_mark
+    update_rows_by_key(
+        get_ws_name("inventory_worksheet", "inventory"),
+        INVENTORY_COLUMNS,
+        "inventory_id",
+        updates_by_inventory_id,
+    )
+
+    return len(updates_by_inventory_id), ready_to_mark
 
 
 def _pull_orders_and_build_sync_df(access_token: str, inv: pd.DataFrame, days_back: int, limit: int):
@@ -859,6 +897,7 @@ needed_inv_cols = [
     "market_value",
     "sticker_price",
     "reference_link",
+    "list_price",
     "ebay_item_id",
     "ebay_listing_id",
     "ebay_listing_url",
@@ -937,7 +976,7 @@ if sync_now:
     if changed:
         st.success(f"Synced {changed:,} eBay sale(s) and marked inventory SOLD.")
     else:
-        st.info("No new matched eBay sales needed updating.")
+        st.info("No new matched eBay sales needed updating. Check Sold Order Sync for unmatched order lines.")
 
     st.rerun()
 
@@ -1035,7 +1074,7 @@ with tab_active:
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Active listings pulled", f"{len(listings_df):,}")
-        m2.metric("Assigned", f"{listings_df['assigned'].sum():,}")
+        m2.metric("Assigned", f"{_bool_count(listings_df['assigned']):,}")
         m3.metric("Needs assignment", f"{unassigned_count:,}")
         m4.metric("Active list value", money_fmt(listings_df["current_price"].apply(to_money).sum()))
 
@@ -1071,20 +1110,20 @@ with tab_active:
                     "They may have sold or ended. Click Sync eBay sales now to check orders and mark sold."
                 )
 
+                show_cols = [
+                    "inventory_id",
+                    "inventory_status",
+                    "card_name",
+                    "card_number",
+                    "set_name",
+                    "list_price",
+                    "ebay_item_id",
+                    "ebay_listing_status",
+                    "ebay_listing_url",
+                ]
+
                 st.dataframe(
-                    missing_from_active[
-                        [
-                            "inventory_id",
-                            "inventory_status",
-                            "card_name",
-                            "card_number",
-                            "set_name",
-                            "list_price",
-                            "ebay_item_id",
-                            "ebay_listing_status",
-                            "ebay_listing_url",
-                        ]
-                    ],
+                    missing_from_active[[c for c in show_cols if c in missing_from_active.columns]],
                     use_container_width=True,
                     hide_index=True,
                     column_config={
@@ -1456,11 +1495,15 @@ with tab_orders:
         if sync_df.empty:
             sync_df = _build_order_sync_df(inv, orders_df)
 
+        if not sync_df.empty:
+            sync_df["matched"] = sync_df["matched"].apply(_as_bool)
+            sync_df["already_sold"] = sync_df["already_sold"].apply(_as_bool)
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Order line items", f"{len(sync_df):,}")
-        m2.metric("Matched to inventory", f"{int(sync_df['matched'].sum()):,}")
+        m2.metric("Matched to inventory", f"{_bool_count(sync_df['matched']):,}")
         m3.metric("Unmatched", f"{int((~sync_df['matched']).sum()):,}")
-        m4.metric("Already sold", f"{int(sync_df['already_sold'].sum()):,}")
+        m4.metric("Already sold", f"{_bool_count(sync_df['already_sold']):,}")
 
         cols = [c for c in _display_order_cols() if c in sync_df.columns]
 
