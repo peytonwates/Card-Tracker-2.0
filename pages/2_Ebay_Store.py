@@ -2412,7 +2412,3 @@ with tab_audit:
     if order_payload:
         with st.expander("Raw Fulfillment API order response", expanded=False):
             st.json(order_payload)
-
-
-
-# notes for me
