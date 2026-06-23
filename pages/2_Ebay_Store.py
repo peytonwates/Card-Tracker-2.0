@@ -2,6 +2,7 @@
 from __future__ import annotations
 # new version
 import base64
+import math
 import re
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
@@ -239,14 +240,16 @@ def _safe_money_round(x) -> float:
 # =========================================================
 
 DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS = {
+    # Fixed assumptions requested for active listing estimates.
+    # Do not use eBay's pulled shipping charge for this table.
     "fee_rate_pct": 13.25,
-    "fixed_order_fee": 0.40,
-    "promoted_listing_pct": 0.0,
-    "estimated_buyer_tax_pct": 0.0,
-    "standard_envelope_label_cost": 1.32,
-    "ground_advantage_label_cost": 5.30,
-    "other_label_cost": 5.30,
-    "extra_per_order_cost": 0.00,
+    "estimated_buyer_tax_pct": 9.00,
+    "standard_envelope_shipping": 1.32,
+    "ground_advantage_shipping": 5.30,
+    "ground_advantage_threshold": 20.00,  # Over this amount uses Ground Advantage. $20.00 and under uses Standard Envelope.
+    "low_fixed_order_fee": 0.30,          # Below $10.
+    "high_fixed_order_fee": 0.40,         # $10 and up.
+    "fixed_fee_threshold": 10.00,
 }
 
 
@@ -254,145 +257,241 @@ def _pct_to_rate(x) -> float:
     return max(to_money(x), 0.0) / 100.0
 
 
-def _extract_primary_shipping_details(item) -> dict:
-    """Pull the first domestic shipping option eBay returns for an active listing."""
-    shipping_type = _xml_text(item, "e:ShippingDetails/e:ShippingType")
-    shipping_profile_name = _xml_text(item, "e:SellerProfiles/e:SellerShippingProfile/e:ShippingProfileName")
+def _round_money(x) -> float:
+    return round(to_money(x), 2)
 
-    primary = {}
-    options = item.findall("e:ShippingDetails/e:ShippingServiceOptions", EBAY_XML_NS)
 
-    for opt in options:
-        service = clean_text(_xml_text(opt, "e:ShippingService"))
-        service_cost = _xml_money(opt, "e:ShippingServiceCost")
-        free_shipping = _as_bool(_xml_text(opt, "e:FreeShipping"))
-        priority = int(to_money(_xml_text(opt, "e:ShippingServicePriority", "999")) or 999)
+def _ceil_money(x) -> float:
+    """Round up to the next penny so target prices do not come in a penny short."""
+    x = max(to_money(x), 0.0)
+    return round(math.ceil((x - 1e-9) * 100) / 100, 2)
 
-        candidate = {
-            "shipping_type": shipping_type,
-            "shipping_profile_name": shipping_profile_name,
-            "shipping_service": service,
-            "buyer_shipping_charged": 0.0 if free_shipping else round(service_cost, 2),
-            "free_shipping": free_shipping,
-            "shipping_service_priority": priority,
-        }
 
-        if not primary or candidate["shipping_service_priority"] < primary.get("shipping_service_priority", 999):
-            primary = candidate
+def _listing_shipping_option_for_price(list_price: float, assumptions: dict) -> tuple[str, float]:
+    """
+    Use the requested simple rule:
+    - List price over $20.00 = USPS Ground Advantage at $5.30
+    - List price $20.00 and under = eBay Standard Envelope at $1.32
+    """
+    list_price = _round_money(list_price)
+    threshold = _round_money(assumptions.get("ground_advantage_threshold", 20.00))
 
-    if primary:
-        return primary
+    if list_price > threshold:
+        return "USPS Ground Advantage", _round_money(assumptions.get("ground_advantage_shipping", 5.30))
+
+    return "eBay Standard Envelope", _round_money(assumptions.get("standard_envelope_shipping", 1.32))
+
+
+def _listing_fixed_order_fee_for_price(list_price: float, assumptions: dict) -> float:
+    """
+    Use the requested simple rule:
+    - Below $10.00 = $0.30 fixed eBay order fee
+    - $10.00 and up = $0.40 fixed eBay order fee
+
+    This treats exactly $10.00 as the higher fee because only prices below $10 use $0.30.
+    """
+    list_price = _round_money(list_price)
+    threshold = _round_money(assumptions.get("fixed_fee_threshold", 10.00))
+
+    if list_price < threshold:
+        return _round_money(assumptions.get("low_fixed_order_fee", 0.30))
+
+    return _round_money(assumptions.get("high_fixed_order_fee", 0.40))
+
+
+def _estimate_listing_at_price(list_price: float, total_cost: float, assumptions: dict) -> dict:
+    """
+    Estimate the active listing result if it sold today.
+
+    Buyer pays list price + assumed shipping.
+    Sales tax is estimated at 9% of list price + assumed shipping.
+    eBay variable fee is 13.25% of list price + assumed shipping + estimated tax.
+    Net proceeds subtract eBay fees and the assumed label cost.
+    """
+    list_price = _round_money(list_price)
+    total_cost = _round_money(total_cost)
+
+    fee_rate = _pct_to_rate(assumptions.get("fee_rate_pct", 13.25))
+    tax_rate = _pct_to_rate(assumptions.get("estimated_buyer_tax_pct", 9.00))
+
+    shipping_option, assumed_shipping = _listing_shipping_option_for_price(list_price, assumptions)
+    fixed_order_fee = _listing_fixed_order_fee_for_price(list_price, assumptions)
+    estimated_label_cost = assumed_shipping
+
+    buyer_subtotal = _round_money(list_price + assumed_shipping)
+    estimated_tax = _round_money(buyer_subtotal * tax_rate)
+    fee_basis = _round_money(buyer_subtotal + estimated_tax)
+    estimated_variable_fee = _round_money(fee_basis * fee_rate)
+    estimated_ebay_fees = _round_money(estimated_variable_fee + fixed_order_fee)
+
+    estimated_net = _round_money(
+        buyer_subtotal
+        - estimated_ebay_fees
+        - estimated_label_cost
+    )
+    estimated_profit = _round_money(estimated_net - total_cost)
 
     return {
-        "shipping_type": shipping_type,
-        "shipping_profile_name": shipping_profile_name,
-        "shipping_service": "",
-        "buyer_shipping_charged": 0.0,
-        "free_shipping": False,
-        "shipping_service_priority": "",
+        "shipping_option": shipping_option,
+        "assumed_shipping_charged": assumed_shipping,
+        "estimated_buyer_total_before_tax": buyer_subtotal,
+        "estimated_tax_for_fee_basis": estimated_tax,
+        "estimated_fee_basis": fee_basis,
+        "estimated_variable_fee": estimated_variable_fee,
+        "estimated_fixed_order_fee": fixed_order_fee,
+        "estimated_ebay_fees": estimated_ebay_fees,
+        "estimated_label_cost": estimated_label_cost,
+        "estimated_net_proceeds": estimated_net,
+        "estimated_profit_loss": estimated_profit,
     }
 
 
-def _shipping_option_bucket(shipping_service: str, shipping_type: str = "", shipping_profile_name: str = "") -> str:
-    raw = " ".join(
-        [
-            clean_text(shipping_service),
-            clean_text(shipping_type),
-            clean_text(shipping_profile_name),
-        ]
-    ).lower()
-    compact = re.sub(r"[^a-z0-9]", "", raw)
+def _price_tier_bounds_for_estimator(assumptions: dict) -> list[dict]:
+    """
+    Price tiers are piecewise because both shipping type and fixed eBay fee change by list price.
+    All bounds are list prices, not buyer totals.
+    """
+    fixed_fee_threshold = _round_money(assumptions.get("fixed_fee_threshold", 10.00))
+    ga_threshold = _round_money(assumptions.get("ground_advantage_threshold", 20.00))
 
-    if "standardenvelope" in compact or "ebaystandard" in compact:
-        return "eBay Standard Envelope"
+    return [
+        {
+            "min_price": 0.00,
+            "max_price": max(fixed_fee_threshold - 0.01, 0.00),
+            "shipping": _round_money(assumptions.get("standard_envelope_shipping", 1.32)),
+            "fixed_fee": _round_money(assumptions.get("low_fixed_order_fee", 0.30)),
+        },
+        {
+            "min_price": fixed_fee_threshold,
+            "max_price": ga_threshold,
+            "shipping": _round_money(assumptions.get("standard_envelope_shipping", 1.32)),
+            "fixed_fee": _round_money(assumptions.get("high_fixed_order_fee", 0.40)),
+        },
+        {
+            "min_price": ga_threshold + 0.01,
+            "max_price": float("inf"),
+            "shipping": _round_money(assumptions.get("ground_advantage_shipping", 5.30)),
+            "fixed_fee": _round_money(assumptions.get("high_fixed_order_fee", 0.40)),
+        },
+    ]
 
-    if "groundadvantage" in compact:
-        return "USPS Ground Advantage"
 
-    if "firstclass" in compact or "uspsparcel" in compact or "priority" in compact:
-        return "USPS Ground Advantage"
+def _required_listing_price_for_target_net(desired_net: float, assumptions: dict) -> float:
+    """
+    Return the lowest list price that reaches the desired net proceeds.
 
-    if raw.strip():
-        return "Other / Unknown"
+    Because shipping changes over $20 and the fixed fee changes at $10, this tests the valid
+    price tiers and then nudges by pennies so Streamlit shows a price that actually clears the target.
+    """
+    desired_net = _round_money(desired_net)
 
-    return "Missing from eBay pull"
+    if desired_net <= 0:
+        return 0.00
 
+    fee_rate = _pct_to_rate(assumptions.get("fee_rate_pct", 13.25))
+    tax_rate = _pct_to_rate(assumptions.get("estimated_buyer_tax_pct", 9.00))
+    fee_multiplier = fee_rate * (1 + tax_rate)
 
-def _estimated_label_cost_for_shipping_option(shipping_option: str, assumptions: dict) -> float:
-    option = clean_text(shipping_option).lower()
+    denominator = 1 - fee_multiplier
 
-    if "standard envelope" in option:
-        return round(to_money(assumptions.get("standard_envelope_label_cost")), 2)
+    if denominator <= 0:
+        return 0.00
 
-    if "ground advantage" in option:
-        return round(to_money(assumptions.get("ground_advantage_label_cost")), 2)
+    candidates: list[float] = []
 
-    return round(to_money(assumptions.get("other_label_cost")), 2)
+    for tier in _price_tier_bounds_for_estimator(assumptions):
+        ship = tier["shipping"]
+        fixed_fee = tier["fixed_fee"]
+        min_price = tier["min_price"]
+        max_price = tier["max_price"]
+
+        # net = price + ship - ship - fee_multiplier * (price + ship) - fixed_fee
+        # net = price * (1 - fee_multiplier) - (fee_multiplier * ship) - fixed_fee
+        raw_price = (desired_net + (fee_multiplier * ship) + fixed_fee) / denominator
+        candidate = max(_ceil_money(raw_price), min_price)
+
+        if candidate <= max_price:
+            candidates.append(candidate)
+
+        # Also test tier starts because the cheapest valid price may be the first penny in a new tier.
+        if min_price <= max_price:
+            candidates.append(_round_money(min_price))
+
+    # Hard boundaries matter because the formulas change at $10.00 and over $20.00.
+    candidates.extend([0.00, 9.99, 10.00, 20.00, 20.01])
+
+    valid: list[float] = []
+
+    for candidate in sorted(set(_round_money(c) for c in candidates if c >= 0)):
+        price = candidate
+
+        # Nudge up by pennies to handle rounding of tax and fees.
+        for _ in range(25):
+            estimate = _estimate_listing_at_price(price, total_cost=0.0, assumptions=assumptions)
+
+            if to_money(estimate.get("estimated_net_proceeds")) >= desired_net - 0.001:
+                valid.append(_round_money(price))
+                break
+
+            price = _round_money(price + 0.01)
+
+    if valid:
+        return min(valid)
+
+    # Fallback for unusually high costs. The top tier is linear, so its analytical candidate
+    # should always be close. Nudge upward until it clears the target.
+    high_tier = _price_tier_bounds_for_estimator(assumptions)[-1]
+    raw_price = (
+        desired_net
+        + (fee_multiplier * high_tier["shipping"])
+        + high_tier["fixed_fee"]
+    ) / denominator
+
+    price = max(_ceil_money(raw_price), high_tier["min_price"])
+
+    for _ in range(1000):
+        estimate = _estimate_listing_at_price(price, total_cost=0.0, assumptions=assumptions)
+
+        if to_money(estimate.get("estimated_net_proceeds")) >= desired_net - 0.001:
+            return _round_money(price)
+
+        price = _round_money(price + 0.01)
+
+    return _round_money(price)
 
 
 def _estimate_listing_math(
     list_price: float,
-    buyer_shipping_charged: float,
     total_cost: float,
-    shipping_option: str,
     assumptions: dict,
     target_profit_pct: float = 0.0,
 ) -> dict:
     """
-    Estimate eBay net proceeds and solve the list price needed for a target ROI.
+    Estimate current active listing math and solve target list price.
 
-    The target_profit_pct value is treated as ROI on total_cost:
-    0.05 means cost + 5% of cost in profit.
+    target_profit_pct is ROI on total_cost:
+    - 0.00 = break even
+    - 0.05 = cost + 5% profit
+    - 0.10 = cost + 10% profit
     """
-    list_price = round(to_money(list_price), 2)
-    buyer_shipping_charged = round(to_money(buyer_shipping_charged), 2)
-    total_cost = round(to_money(total_cost), 2)
+    list_price = _round_money(list_price)
+    total_cost = _round_money(total_cost)
+    target_profit_pct = max(to_money(target_profit_pct), 0.0)
 
-    fee_rate = _pct_to_rate(assumptions.get("fee_rate_pct"))
-    ad_rate = _pct_to_rate(assumptions.get("promoted_listing_pct"))
-    buyer_tax_rate = _pct_to_rate(assumptions.get("estimated_buyer_tax_pct"))
-    fixed_order_fee = round(to_money(assumptions.get("fixed_order_fee")), 2)
-    extra_per_order_cost = round(to_money(assumptions.get("extra_per_order_cost")), 2)
-    label_cost = _estimated_label_cost_for_shipping_option(shipping_option, assumptions)
+    current = _estimate_listing_at_price(
+        list_price=list_price,
+        total_cost=total_cost,
+        assumptions=assumptions,
+    )
 
-    buyer_subtotal = round(list_price + buyer_shipping_charged, 2)
-    estimated_tax = round(buyer_subtotal * buyer_tax_rate, 2)
-    fee_basis = round(buyer_subtotal + estimated_tax, 2)
-    estimated_variable_fee = round(fee_basis * fee_rate, 2)
-    estimated_ad_fee = round(list_price * ad_rate, 2)
-    estimated_total_fees = round(estimated_variable_fee + fixed_order_fee + estimated_ad_fee, 2)
-    estimated_net = round(buyer_subtotal - estimated_total_fees - label_cost - extra_per_order_cost, 2)
-    estimated_profit = round(estimated_net - total_cost, 2)
-
-    target_profit = round(total_cost * max(to_money(target_profit_pct), 0.0), 2)
-    desired_net = round(total_cost + target_profit, 2)
-
-    # net = price + shipping - fee_rate * ((price + shipping) * (1 + tax_rate)) - ad_rate * price - fixed - label - extra
-    denominator = 1 - (fee_rate * (1 + buyer_tax_rate)) - ad_rate
-    shipping_net_after_fee = buyer_shipping_charged * (1 - (fee_rate * (1 + buyer_tax_rate)))
-
-    if denominator <= 0:
-        required_price = 0.0
-    else:
-        required_price = (
-            desired_net
-            + fixed_order_fee
-            + label_cost
-            + extra_per_order_cost
-            - shipping_net_after_fee
-        ) / denominator
-
-    required_price = round(max(required_price, 0.0), 2)
+    desired_net = _round_money(total_cost * (1 + target_profit_pct))
+    required_price = _required_listing_price_for_target_net(
+        desired_net=desired_net,
+        assumptions=assumptions,
+    )
 
     return {
-        "estimated_buyer_total_before_tax": buyer_subtotal,
-        "estimated_tax_for_fee_basis": estimated_tax,
-        "estimated_fee_basis": fee_basis,
-        "estimated_ebay_fees": estimated_total_fees,
-        "estimated_label_cost": label_cost,
-        "estimated_extra_cost": extra_per_order_cost,
-        "estimated_net_proceeds": estimated_net,
-        "estimated_profit_loss": estimated_profit,
+        **current,
         "required_price": required_price,
     }
 
@@ -412,44 +511,30 @@ def _build_assigned_listing_estimate_df(assigned: pd.DataFrame, inv: pd.DataFram
         else:
             inv_match = match_df.iloc[0]
 
-        shipping_service = clean_text(listing.get("shipping_service"))
-        shipping_type = clean_text(listing.get("shipping_type"))
-        shipping_profile_name = clean_text(listing.get("shipping_profile_name"))
-        shipping_option = _shipping_option_bucket(shipping_service, shipping_type, shipping_profile_name)
-
         list_price = to_money(listing.get("current_price"))
-        buyer_shipping_charged = to_money(listing.get("buyer_shipping_charged"))
         total_cost = to_money(inv_match.get("total_cost"))
 
         current_math = _estimate_listing_math(
             list_price=list_price,
-            buyer_shipping_charged=buyer_shipping_charged,
             total_cost=total_cost,
-            shipping_option=shipping_option,
             assumptions=assumptions,
             target_profit_pct=0.0,
         )
         breakeven_math = _estimate_listing_math(
             list_price=list_price,
-            buyer_shipping_charged=buyer_shipping_charged,
             total_cost=total_cost,
-            shipping_option=shipping_option,
             assumptions=assumptions,
             target_profit_pct=0.0,
         )
         five_pct_math = _estimate_listing_math(
             list_price=list_price,
-            buyer_shipping_charged=buyer_shipping_charged,
             total_cost=total_cost,
-            shipping_option=shipping_option,
             assumptions=assumptions,
             target_profit_pct=0.05,
         )
         ten_pct_math = _estimate_listing_math(
             list_price=list_price,
-            buyer_shipping_charged=buyer_shipping_charged,
             total_cost=total_cost,
-            shipping_option=shipping_option,
             assumptions=assumptions,
             target_profit_pct=0.10,
         )
@@ -467,10 +552,7 @@ def _build_assigned_listing_estimate_df(assigned: pd.DataFrame, inv: pd.DataFram
                 "title": clean_text(listing.get("title")),
                 "listing_status": clean_text(listing.get("listing_status")),
                 "current_price": round(list_price, 2),
-                "shipping_option": shipping_option,
-                "shipping_service": shipping_service,
-                "buyer_shipping_charged": round(buyer_shipping_charged, 2),
-                "free_shipping": _as_bool(listing.get("free_shipping")),
+                "shipping_option": current_math["shipping_option"],
                 "estimated_label_cost": current_math["estimated_label_cost"],
                 "estimated_ebay_fees": current_math["estimated_ebay_fees"],
                 "estimated_net_proceeds": current_math["estimated_net_proceeds"],
@@ -508,7 +590,6 @@ def _assigned_listing_estimate_cols() -> list[str]:
         "listing_status",
         "current_price",
         "shipping_option",
-        "buyer_shipping_charged",
         "estimated_label_cost",
         "estimated_ebay_fees",
         "estimated_net_proceeds",
@@ -524,15 +605,15 @@ def _assigned_listing_estimate_cols() -> list[str]:
     ]
 
 
-def _style_loss_rows(row: pd.Series) -> list[str]:
+def _style_loss_rows(row: pd.Series, max_loss_amount: float = 1.0) -> list[str]:
     profit = to_money(row.get("estimated_profit_loss"))
 
     if profit >= 0:
         return ["" for _ in row.index]
 
-    cost = max(to_money(row.get("total_cost")), 1.0)
-    loss_ratio = min(abs(profit) / cost, 1.0)
-    alpha = round(0.18 + (0.55 * loss_ratio), 3)
+    max_loss_amount = max(to_money(max_loss_amount), 1.0)
+    loss_ratio = min(abs(profit) / max_loss_amount, 1.0)
+    alpha = round(0.15 + (0.70 * loss_ratio), 3)
 
     return [f"background-color: rgba(255, 0, 0, {alpha}); color: #111111;" for _ in row.index]
 
@@ -1519,7 +1600,6 @@ def _display_listing_cols() -> list[str]:
         "listing_status",
         "current_price",
         "shipping_service",
-        "buyer_shipping_charged",
         "free_shipping",
         "quantity_available",
         "quantity_sold",
@@ -1977,103 +2057,20 @@ with tab_assign:
         if assigned.empty:
             st.info("No assigned listings from the pulled active list.")
         else:
-            with st.expander("Listing profit estimator assumptions", expanded=False):
-                st.caption("These are estimates for active listings. eBay's actual order sync still uses the Finances API after a sale.")
+            estimator_assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
 
-                a1, a2, a3, a4 = st.columns(4)
-
-                with a1:
-                    fee_rate_pct = st.number_input(
-                        "eBay variable fee %",
-                        min_value=0.0,
-                        max_value=30.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["fee_rate_pct"]),
-                        step=0.05,
-                        format="%.2f",
-                    )
-
-                with a2:
-                    fixed_order_fee = st.number_input(
-                        "Fixed order fee",
-                        min_value=0.0,
-                        max_value=5.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["fixed_order_fee"]),
-                        step=0.01,
-                        format="%.2f",
-                    )
-
-                with a3:
-                    promoted_listing_pct = st.number_input(
-                        "Promoted/ad fee %",
-                        min_value=0.0,
-                        max_value=30.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["promoted_listing_pct"]),
-                        step=0.25,
-                        format="%.2f",
-                    )
-
-                with a4:
-                    estimated_buyer_tax_pct = st.number_input(
-                        "Buyer tax % for fee basis",
-                        min_value=0.0,
-                        max_value=15.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["estimated_buyer_tax_pct"]),
-                        step=0.25,
-                        format="%.2f",
-                    )
-
-                s1, s2, s3, s4 = st.columns(4)
-
-                with s1:
-                    standard_envelope_label_cost = st.number_input(
-                        "Standard Envelope label",
-                        min_value=0.0,
-                        max_value=10.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["standard_envelope_label_cost"]),
-                        step=0.01,
-                        format="%.2f",
-                    )
-
-                with s2:
-                    ground_advantage_label_cost = st.number_input(
-                        "Ground Advantage label",
-                        min_value=0.0,
-                        max_value=20.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["ground_advantage_label_cost"]),
-                        step=0.01,
-                        format="%.2f",
-                    )
-
-                with s3:
-                    other_label_cost = st.number_input(
-                        "Other/unknown label",
-                        min_value=0.0,
-                        max_value=20.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["other_label_cost"]),
-                        step=0.01,
-                        format="%.2f",
-                    )
-
-                with s4:
-                    extra_per_order_cost = st.number_input(
-                        "Extra packaging/order cost",
-                        min_value=0.0,
-                        max_value=10.0,
-                        value=float(DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS["extra_per_order_cost"]),
-                        step=0.01,
-                        format="%.2f",
-                    )
-
-            estimator_assumptions = {
-                "fee_rate_pct": fee_rate_pct,
-                "fixed_order_fee": fixed_order_fee,
-                "promoted_listing_pct": promoted_listing_pct,
-                "estimated_buyer_tax_pct": estimated_buyer_tax_pct,
-                "standard_envelope_label_cost": standard_envelope_label_cost,
-                "ground_advantage_label_cost": ground_advantage_label_cost,
-                "other_label_cost": other_label_cost,
-                "extra_per_order_cost": extra_per_order_cost,
-            }
+            with st.expander("Active listing estimator rules", expanded=False):
+                st.caption("These fixed rules are used only for the active listing estimate table. Actual sold-order sync still uses eBay order/finance data after a sale.")
+                st.write(
+                    {
+                        "Shipping option": "List price over $20.00 = USPS Ground Advantage; $20.00 and under = eBay Standard Envelope",
+                        "Standard Envelope assumed shipping / label": money_fmt(estimator_assumptions["standard_envelope_shipping"]),
+                        "Ground Advantage assumed shipping / label": money_fmt(estimator_assumptions["ground_advantage_shipping"]),
+                        "Estimated buyer tax": f'{estimator_assumptions["estimated_buyer_tax_pct"]:.2f}%',
+                        "eBay variable fee": f'{estimator_assumptions["fee_rate_pct"]:.2f}% of item + shipping + estimated tax',
+                        "Fixed fee": "Below $10.00 = $0.30; $10.00 and up = $0.40",
+                    }
+                )
 
             assigned_estimates = _build_assigned_listing_estimate_df(
                 assigned=assigned,
@@ -2094,10 +2091,14 @@ with tab_assign:
                 p3.metric("Total estimated P/L", money_fmt(total_estimated_profit))
                 p4.metric("Estimated loss exposure", money_fmt(total_estimated_loss))
 
-                st.caption("Rows shaded red are estimated to lose money at the current list price. Darker red means the loss is larger relative to your total cost.")
+                st.caption("Rows shaded red are estimated to lose money at the current list price. Darker red means the dollar loss is larger versus the other active listings.")
 
                 cols = [c for c in _assigned_listing_estimate_cols() if c in assigned_estimates.columns]
-                styled_assigned_estimates = assigned_estimates[cols].style.apply(_style_loss_rows, axis=1)
+                max_loss_amount = abs(loss_rows["estimated_profit_loss"].apply(to_money).min()) if not loss_rows.empty else 1.0
+                styled_assigned_estimates = assigned_estimates[cols].style.apply(
+                    lambda row: _style_loss_rows(row, max_loss_amount=max_loss_amount),
+                    axis=1,
+                )
 
                 st.dataframe(
                     styled_assigned_estimates,
@@ -2109,7 +2110,6 @@ with tab_assign:
                         "listing_url": st.column_config.LinkColumn("Listing URL"),
                         "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f"),
                         "current_price": st.column_config.NumberColumn("List Price", format="$%.2f"),
-                        "buyer_shipping_charged": st.column_config.NumberColumn("Buyer Shipping", format="$%.2f"),
                         "estimated_label_cost": st.column_config.NumberColumn("Est. Label", format="$%.2f"),
                         "estimated_ebay_fees": st.column_config.NumberColumn("Est. eBay Fees", format="$%.2f"),
                         "estimated_net_proceeds": st.column_config.NumberColumn("Est. Net", format="$%.2f"),
