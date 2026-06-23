@@ -790,7 +790,7 @@ def get_active_listings(
             start_time = _xml_text(item, "e:ListingDetails/e:StartTime")
             end_time = _xml_text(item, "e:ListingDetails/e:EndTime")
             image_url = _xml_text(item, "e:PictureDetails/e:GalleryURL")
-            shipping_details = _extract_primary_shipping_details(item)
+
 
             if ebay_item_id:
                 all_rows.append(
@@ -806,11 +806,6 @@ def get_active_listings(
                         "quantity": quantity,
                         "quantity_sold": quantity_sold,
                         "quantity_available": quantity_available,
-                        "shipping_type": shipping_details.get("shipping_type", ""),
-                        "shipping_profile_name": shipping_details.get("shipping_profile_name", ""),
-                        "shipping_service": shipping_details.get("shipping_service", ""),
-                        "buyer_shipping_charged": shipping_details.get("buyer_shipping_charged", 0.0),
-                        "free_shipping": shipping_details.get("free_shipping", False),
                         "listing_start_date": _parse_ebay_datetime_to_date(start_time),
                         "listing_end_date": _parse_ebay_datetime_to_date(end_time),
                         "listing_url": listing_url,
