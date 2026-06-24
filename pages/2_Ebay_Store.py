@@ -539,6 +539,12 @@ def _build_assigned_listing_estimate_df(assigned: pd.DataFrame, inv: pd.DataFram
             target_profit_pct=0.10,
         )
 
+        estimated_profit_loss = to_money(current_math.get("estimated_profit_loss"))
+        estimated_profit_margin_pct = None
+
+        if total_cost > 0:
+            estimated_profit_margin_pct = round((estimated_profit_loss / total_cost) * 100, 2)
+
         rows.append(
             {
                 "assigned": _as_bool(listing.get("assigned")),
@@ -548,6 +554,7 @@ def _build_assigned_listing_estimate_df(assigned: pd.DataFrame, inv: pd.DataFram
                 "card_number": clean_text(inv_match.get("card_number")),
                 "set_name": clean_text(inv_match.get("set_name")),
                 "total_cost": round(total_cost, 2),
+                "estimated_profit_margin_pct": estimated_profit_margin_pct,
                 "ebay_item_id": ebay_item_id,
                 "title": clean_text(listing.get("title")),
                 "listing_status": clean_text(listing.get("listing_status")),
@@ -594,6 +601,7 @@ def _assigned_listing_estimate_cols() -> list[str]:
         "estimated_ebay_fees",
         "estimated_net_proceeds",
         "estimated_profit_loss",
+        "estimated_profit_margin_pct",
         "break_even_price",
         "price_for_5pct_profit",
         "price_for_10pct_profit",
@@ -2109,6 +2117,7 @@ with tab_assign:
                         "estimated_ebay_fees": st.column_config.NumberColumn("Est. eBay Fees", format="$%.2f"),
                         "estimated_net_proceeds": st.column_config.NumberColumn("Est. Net", format="$%.2f"),
                         "estimated_profit_loss": st.column_config.NumberColumn("Est. Profit/Loss", format="$%.2f"),
+                        "estimated_profit_margin_pct": st.column_config.NumberColumn("Est. Profit Margin %", format="%.2f%%"),
                         "break_even_price": st.column_config.NumberColumn("Break Even Price", format="$%.2f"),
                         "price_for_5pct_profit": st.column_config.NumberColumn("Price for 5% Profit", format="$%.2f"),
                         "price_for_10pct_profit": st.column_config.NumberColumn("Price for 10% Profit", format="$%.2f"),
