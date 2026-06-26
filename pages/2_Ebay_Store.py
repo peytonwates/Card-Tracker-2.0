@@ -231,6 +231,152 @@ def _ensure_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return out
 
 
+def _norm_id(x) -> str:
+    return clean_text(x)
+
+
+def _duplicate_inventory_id_rows(inv: pd.DataFrame) -> pd.DataFrame:
+    """Rows whose inventory_id is blank or duplicated. These cannot be safely updated by key."""
+    if inv.empty or "inventory_id" not in inv.columns:
+        return pd.DataFrame()
+
+    out = inv.copy()
+    out["inventory_id"] = out["inventory_id"].astype(str).str.strip()
+
+    blank = out["inventory_id"].eq("")
+    duplicate = out["inventory_id"].ne("") & out["inventory_id"].duplicated(keep=False)
+
+    return out[blank | duplicate].copy()
+
+
+def _primary_ebay_assignment_key(row: pd.Series) -> str:
+    return clean_text(row.get("ebay_item_id")) or clean_text(row.get("ebay_listing_id"))
+
+
+def _clear_ebay_assignment_update(current_status: str) -> dict:
+    current_status = clean_text(current_status).upper()
+    new_status = STATUS_ACTIVE if current_status == STATUS_LISTED else current_status
+
+    update = {
+        "transaction_type": "",
+        "platform": "",
+        "sale_channel": "",
+        "list_date": "",
+        "list_price": "",
+        "ebay_item_id": "",
+        "ebay_listing_id": "",
+        "ebay_listing_url": "",
+        "ebay_listing_status": "",
+        "ebay_last_sync_at": now_iso(),
+    }
+
+    if new_status:
+        update["inventory_status"] = new_status
+
+    return update
+
+
+def _build_duplicate_ebay_assignment_df(inv: pd.DataFrame) -> pd.DataFrame:
+    """
+    Find cases where one eBay listing ID is attached to more than one inventory row.
+
+    This is conservative:
+    - Keep SOLD rows first, then LISTED rows, then everything else.
+    - Mark extra non-SOLD rows as safe to clear.
+    - Do not auto-clear extra SOLD rows because that could erase a real sale.
+    """
+    if inv.empty:
+        return pd.DataFrame()
+
+    working = _ensure_cols(inv, ["inventory_id", "inventory_status", "ebay_item_id", "ebay_listing_id", "card_name", "card_number", "set_name", "list_price", "ebay_last_sync_at", "list_date"]).copy()
+    working["inventory_id"] = working["inventory_id"].astype(str).str.strip()
+    working["inventory_status"] = working["inventory_status"].astype(str).str.upper().str.strip()
+    working["ebay_assignment_key"] = working.apply(_primary_ebay_assignment_key, axis=1)
+
+    working = working[working["ebay_assignment_key"].ne("")].copy()
+
+    if working.empty:
+        return pd.DataFrame()
+
+    duplicated_keys = working["ebay_assignment_key"].value_counts()
+    duplicated_keys = duplicated_keys[duplicated_keys > 1].index.tolist()
+
+    if not duplicated_keys:
+        return pd.DataFrame()
+
+    dupes = working[working["ebay_assignment_key"].isin(duplicated_keys)].copy()
+    dupes["status_priority"] = dupes["inventory_status"].map({STATUS_SOLD: 0, STATUS_LISTED: 1}).fillna(2).astype(int)
+    dupes["sync_sort"] = pd.to_datetime(dupes["ebay_last_sync_at"], errors="coerce")
+    dupes["list_sort"] = pd.to_datetime(dupes["list_date"], errors="coerce")
+    dupes = dupes.sort_values(
+        ["ebay_assignment_key", "status_priority", "sync_sort", "list_sort", "inventory_id"],
+        ascending=[True, True, True, True, True],
+        na_position="last",
+    ).copy()
+
+    dupes["repair_action"] = "CLEAR"
+    dupes.loc[~dupes.duplicated("ebay_assignment_key", keep="first"), "repair_action"] = "KEEP"
+    dupes.loc[(dupes["repair_action"].eq("CLEAR")) & (dupes["inventory_status"].eq(STATUS_SOLD)), "repair_action"] = "REVIEW_SOLD_DUPLICATE"
+
+    show_cols = [
+        "repair_action",
+        "ebay_assignment_key",
+        "inventory_id",
+        "inventory_status",
+        "card_name",
+        "card_number",
+        "set_name",
+        "list_price",
+        "ebay_item_id",
+        "ebay_listing_id",
+        "ebay_listing_status",
+        "ebay_last_sync_at",
+    ]
+
+    return dupes[[c for c in show_cols if c in dupes.columns]].copy()
+
+
+def _repair_duplicate_ebay_assignments(inv: pd.DataFrame) -> tuple[int, pd.DataFrame, pd.DataFrame]:
+    dupes = _build_duplicate_ebay_assignment_df(inv)
+
+    if dupes.empty:
+        return 0, dupes, pd.DataFrame()
+
+    duplicate_inventory_ids = _duplicate_inventory_id_rows(inv)
+    unsafe_inventory_ids = set(
+        duplicate_inventory_ids.get("inventory_id", pd.Series(dtype=str))
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .tolist()
+    )
+
+    to_clear = dupes[dupes["repair_action"].eq("CLEAR")].copy()
+    if unsafe_inventory_ids:
+        to_clear = to_clear[~to_clear["inventory_id"].astype(str).str.strip().isin(unsafe_inventory_ids)].copy()
+
+    updates_by_inventory_id = {}
+
+    for _, row in to_clear.iterrows():
+        inv_id = clean_text(row.get("inventory_id"))
+        if not inv_id:
+            continue
+
+        updates_by_inventory_id[inv_id] = _clear_ebay_assignment_update(row.get("inventory_status"))
+
+    if updates_by_inventory_id:
+        update_rows_by_key(
+            get_ws_name("inventory_worksheet", "inventory"),
+            INVENTORY_COLUMNS,
+            "inventory_id",
+            updates_by_inventory_id,
+        )
+
+    return len(updates_by_inventory_id), dupes, to_clear
+
+
 def _safe_money_round(x) -> float:
     return round(to_money(x), 2)
 
@@ -1340,16 +1486,22 @@ def _inventory_ready_for_ebay_assignment(inv: pd.DataFrame) -> pd.DataFrame:
     if ready.empty:
         return ready
 
-    for col in ["ebay_item_id", "ebay_listing_id"]:
+    for col in ["inventory_id", "ebay_item_id", "ebay_listing_id"]:
         if col not in ready.columns:
             ready[col] = ""
+
+    ready["inventory_id"] = ready["inventory_id"].astype(str).str.strip()
+
+    # A blank or duplicated inventory_id cannot be safely updated with update_rows_by_key.
+    # Excluding duplicate IDs is what prevents one selection from updating multiple copies.
+    safe_inventory_id = ready["inventory_id"].ne("") & ~ready["inventory_id"].duplicated(keep=False)
 
     already_linked = (
         ready["ebay_item_id"].astype(str).str.strip().ne("")
         | ready["ebay_listing_id"].astype(str).str.strip().ne("")
     )
 
-    return ready[~already_linked].copy()
+    return ready[safe_inventory_id & ~already_linked].copy()
 
 
 def _score_inventory_match(row: pd.Series, listing_title: str) -> int:
@@ -1765,6 +1917,61 @@ with st.expander("eBay config check", expanded=False):
     )
 
 
+duplicate_inventory_id_rows = _duplicate_inventory_id_rows(inv)
+duplicate_ebay_assignments = _build_duplicate_ebay_assignment_df(inv)
+
+if not duplicate_inventory_id_rows.empty:
+    with st.expander("Inventory ID issue detected", expanded=True):
+        st.warning("Some inventory rows have a blank or duplicated inventory_id. The eBay assignment tool will not offer those rows for assignment because updating by inventory_id could update more than one row.")
+        show_cols = [
+            "inventory_id",
+            "inventory_status",
+            "card_name",
+            "card_number",
+            "set_name",
+            "total_cost",
+            "ebay_item_id",
+            "ebay_listing_id",
+        ]
+        st.dataframe(
+            duplicate_inventory_id_rows[[c for c in show_cols if c in duplicate_inventory_id_rows.columns]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f"),
+            },
+        )
+
+if not duplicate_ebay_assignments.empty:
+    with st.expander("Repair duplicate eBay listing assignments", expanded=True):
+        st.warning("One or more eBay listing IDs are attached to multiple inventory rows. Review the rows below, then run the repair to keep one row and clear the duplicate non-SOLD rows.")
+        st.dataframe(
+            duplicate_ebay_assignments,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "list_price": st.column_config.NumberColumn("List Price", format="$%.2f"),
+            },
+        )
+
+        sold_review = duplicate_ebay_assignments[duplicate_ebay_assignments["repair_action"].eq("REVIEW_SOLD_DUPLICATE")].copy()
+        if not sold_review.empty:
+            st.error("At least one duplicate is already SOLD. The automatic repair will not clear SOLD rows. Review those manually before changing sales history.")
+
+        repair_confirmed = st.checkbox("I reviewed this table. Clear duplicate non-SOLD eBay assignments.", value=False)
+
+        if st.button("Repair duplicate eBay assignments", type="primary", disabled=not repair_confirmed):
+            changed, repaired_table, cleared_rows = _repair_duplicate_ebay_assignments(inv)
+            refresh_database_cache()
+
+            if changed:
+                st.success(f"Cleared duplicate eBay fields from {changed:,} inventory row(s).")
+            else:
+                st.info("No duplicate non-SOLD eBay assignments were cleared.")
+
+            st.rerun()
+
+
 tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
     [
         "1. Pull Active Listings",
@@ -2000,6 +2207,73 @@ with tab_assign:
                         use_container_width=True,
                         hide_index=True,
                         column_config={"current_price": st.column_config.NumberColumn("List Price", format="$%.2f")},
+                    )
+                    st.stop()
+
+                duplicate_listing = to_apply["ebay_item_id"].astype(str).str.strip().value_counts().reset_index()
+                duplicate_listing.columns = ["ebay_item_id", "count"]
+                duplicate_listing = duplicate_listing[duplicate_listing["count"] > 1]
+
+                if not duplicate_listing.empty:
+                    duplicate_listing_ids = duplicate_listing["ebay_item_id"].astype(str).tolist()
+                    duplicate_listing_detail = to_apply[to_apply["ebay_item_id"].astype(str).isin(duplicate_listing_ids)].copy()
+                    st.error("The same eBay listing is selected more than once. Fix the duplicate rows below before applying.")
+                    st.dataframe(
+                        duplicate_listing_detail[["ebay_item_id", "title", "inventory_id", "selected_inventory"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.stop()
+
+                # Re-load fresh inventory before writing. This prevents a stale editor from assigning
+                # an inventory row that was already linked/listed in another browser refresh.
+                fresh_data = load_data()
+                fresh_inv = _ensure_cols(_safe_df(fresh_data.inventory), needed_inv_cols)
+                if not fresh_inv.empty:
+                    fresh_inv["inventory_id"] = fresh_inv["inventory_id"].astype(str).str.strip()
+                    fresh_inv["inventory_status"] = fresh_inv["inventory_status"].astype(str).str.upper().str.strip()
+
+                safe_ready_ids = set(_inventory_ready_for_ebay_assignment(fresh_inv)["inventory_id"].astype(str).str.strip().tolist())
+                stale_or_invalid = to_apply[~to_apply["inventory_id"].astype(str).str.strip().isin(safe_ready_ids)].copy()
+
+                already_assigned_listing_rows = []
+                for _, pending_row in to_apply.iterrows():
+                    pending_item_id = clean_text(pending_row.get("ebay_item_id"))
+                    existing_matches = _find_inventory_match_by_ebay_id(fresh_inv, pending_item_id)
+
+                    if not existing_matches.empty:
+                        existing_matches = existing_matches.copy()
+                        existing_matches["pending_inventory_id"] = clean_text(pending_row.get("inventory_id"))
+                        existing_matches["pending_ebay_item_id"] = pending_item_id
+                        already_assigned_listing_rows.append(existing_matches)
+
+                if not stale_or_invalid.empty:
+                    st.error("One or more selected inventory rows are no longer safe to assign. They may already be listed, have a blank/duplicate inventory_id, or have been changed since the page loaded.")
+                    st.dataframe(
+                        stale_or_invalid[["inventory_id", "ebay_item_id", "title", "selected_inventory"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.stop()
+
+                if already_assigned_listing_rows:
+                    already_assigned_listing_df = pd.concat(already_assigned_listing_rows, ignore_index=True)
+                    show_cols = [
+                        "pending_ebay_item_id",
+                        "pending_inventory_id",
+                        "inventory_id",
+                        "inventory_status",
+                        "card_name",
+                        "card_number",
+                        "set_name",
+                        "ebay_item_id",
+                        "ebay_listing_id",
+                    ]
+                    st.error("At least one eBay listing is already assigned to inventory in the latest database. Run the duplicate repair tool above or refresh the page before applying.")
+                    st.dataframe(
+                        already_assigned_listing_df[[c for c in show_cols if c in already_assigned_listing_df.columns]],
+                        use_container_width=True,
+                        hide_index=True,
                     )
                     st.stop()
 
