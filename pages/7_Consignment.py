@@ -153,31 +153,6 @@ FAMILY_VIEW_COLUMNS = [
     "notes",
 ]
 
-NUMERIC_COLUMNS = [
-    "sticker_price",
-    "sold_price",
-    "commission_rate",
-    "commission_amount",
-    "final_payout",
-    "pricecharting_raw",
-    "pricecharting_grade_7",
-    "pricecharting_grade_8",
-    "pricecharting_grade_9",
-    "pricecharting_grade_10",
-    "ebay_sold_avg",
-    "ebay_sold_median",
-    "ebay_sold_low",
-    "ebay_sold_high",
-    "ebay_sold_comp_1_price",
-    "ebay_sold_comp_2_price",
-    "ebay_sold_comp_3_price",
-    "ebay_low_list_price",
-    "ebay_low_list_shipping",
-    "ebay_low_list_total",
-]
-
-MONEY_COLUMNS = [col for col in NUMERIC_COLUMNS if col != "commission_rate"]
-
 EXCLUDED_COMP_WORDS = [
     "proxy",
     "orica",
@@ -232,11 +207,8 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     if value is None:
         return default
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            if math.isnan(value):
-                return default
-        except Exception:
-            pass
+        if math.isnan(value):
+            return default
         return float(value)
     text = str(value).strip()
     if not text:
@@ -246,64 +218,6 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(text)
     except Exception:
         return default
-
-
-def _first_column(data: Any, length: int = 0, default: Any = "") -> pd.Series:
-    """Return a Series even if duplicate Google Sheet headers made pandas return a DataFrame."""
-    if isinstance(data, pd.DataFrame):
-        if data.shape[1] == 0:
-            return pd.Series([default] * length)
-        return data.iloc[:, 0]
-    if isinstance(data, pd.Series):
-        return data
-    return pd.Series([default] * length)
-
-
-def get_series(df: pd.DataFrame, col: str, default: Any = "") -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=object)
-    if col not in df.columns:
-        return pd.Series([default] * len(df), index=df.index)
-    series = _first_column(df[col], length=len(df), default=default)
-    if not series.index.equals(df.index):
-        series = pd.Series(series.to_list(), index=df.index)
-    return series
-
-
-def numeric_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
-    series = get_series(df, col, default="")
-    if series.empty:
-        return pd.Series(dtype=float)
-    cleaned = (
-        series.astype(str)
-        .str.replace("$", "", regex=False)
-        .str.replace(",", "", regex=False)
-        .str.replace("%", "", regex=False)
-        .str.strip()
-    )
-    nums = pd.to_numeric(cleaned, errors="coerce").fillna(default).astype(float)
-    nums.index = series.index
-    return nums
-
-
-def money_sum(df: pd.DataFrame, col: str, mask: Any = None) -> float:
-    if df is None or df.empty or col not in df.columns:
-        return 0.0
-    nums = numeric_series(df, col, default=0.0)
-    if mask is not None:
-        mask_series = pd.Series(mask, index=df.index).fillna(False).astype(bool)
-        nums = nums.loc[mask_series]
-    return float(nums.sum())
-
-
-def normalize_status(value: Any, default: str = "ACTIVE") -> str:
-    text = clean_text(value).upper()
-    return text if text in STATUS_OPTIONS else default
-
-
-def normalize_payout_status(value: Any, default: str = "N/A") -> str:
-    text = clean_text(value).upper()
-    return text if text in PAYOUT_STATUS_OPTIONS else default
 
 
 def money_or_blank(value: Any) -> str:
@@ -471,53 +385,27 @@ def get_or_create_worksheet():
     return ws
 
 
-def normalize_consignment_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize Google Sheet data before display, metrics, editing, or saving.
-
-    Google Sheets often gives Streamlit money columns back as strings. This keeps
-    metric cards, st.data_editor NumberColumns, and payout math from crashing.
-    """
-    if df is None or df.empty:
-        out = pd.DataFrame(columns=CONSIGNMENT_COLUMNS)
-    else:
-        out = df.copy()
-        # Drop accidental duplicate headers from manual sheet edits.
-        out = out.loc[:, ~out.columns.duplicated()]
-
-    for col in CONSIGNMENT_COLUMNS:
-        if col not in out.columns:
-            out[col] = ""
-    out = out[CONSIGNMENT_COLUMNS].copy()
-
-    for col in NUMERIC_COLUMNS:
-        if col in out.columns:
-            nums = numeric_series(out, col, default=0.0)
-            # Keep blank-looking money cells blank except commission_rate, which defaults to 10%.
-            original_blank = get_series(out, col, default="").astype(str).str.strip().eq("")
-            out[col] = nums
-            if col != "commission_rate":
-                out.loc[original_blank, col] = pd.NA
-
-    if "commission_rate" in out.columns:
-        rate_blank = get_series(out, "commission_rate", default="").astype(str).str.strip().eq("")
-        out.loc[rate_blank, "commission_rate"] = DEFAULT_COMMISSION_RATE
-
-    return recalc_financials(out)
-
-
 def load_consignment_df() -> pd.DataFrame:
     ws = get_or_create_worksheet()
     records = ws.get_all_records(default_blank="")
     df = pd.DataFrame(records)
-    return normalize_consignment_df(df)
+    for col in CONSIGNMENT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[CONSIGNMENT_COLUMNS]
+    return recalc_financials(df)
 
 
 def write_consignment_df(df: pd.DataFrame) -> None:
     ws = get_or_create_worksheet()
-    out = normalize_consignment_df(df)
-    # Send clean strings to Google Sheets, but do not turn calculated blanks into "nan".
-    out = out.where(pd.notna(out), "")
-    values = [CONSIGNMENT_COLUMNS] + out[CONSIGNMENT_COLUMNS].astype(object).values.tolist()
+    out = df.copy()
+    for col in CONSIGNMENT_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    out = out[CONSIGNMENT_COLUMNS]
+    out = recalc_financials(out)
+    out = out.fillna("").astype(str)
+    values = [CONSIGNMENT_COLUMNS] + out.values.tolist()
     ws.clear()
     ws.update(values, value_input_option="USER_ENTERED")
 
@@ -544,38 +432,28 @@ def append_consignment_rows(rows: List[Dict[str, Any]]) -> None:
 
 
 def recalc_financials(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=CONSIGNMENT_COLUMNS) if df is None else df
-
+    if df.empty:
+        return df
     out = df.copy()
-    out = out.loc[:, ~out.columns.duplicated()]
-    for col in CONSIGNMENT_COLUMNS:
+    for col in ["sticker_price", "sold_price", "commission_rate", "commission_amount", "final_payout"]:
         if col not in out.columns:
             out[col] = ""
-
-    sold_prices = numeric_series(out, "sold_price", default=0.0)
-    rates = numeric_series(out, "commission_rate", default=DEFAULT_COMMISSION_RATE)
-    rates = rates.apply(lambda x: x / 100 if x > 1 else x)
-    rates = rates.fillna(DEFAULT_COMMISSION_RATE)
-
-    statuses = get_series(out, "status", default="ACTIVE").apply(lambda x: normalize_status(x, "ACTIVE"))
-    # Helpful phone behavior: a sold price means SOLD even if you forget to change status.
-    statuses = statuses.mask((sold_prices > 0) & statuses.eq("ACTIVE"), "SOLD")
-
-    commission_amounts = (sold_prices * rates).round(2)
-    final_payouts = (sold_prices - commission_amounts).round(2)
-
-    out["sold_price"] = sold_prices.mask(sold_prices.eq(0), pd.NA)
-    out["commission_rate"] = rates.round(4)
-    out["commission_amount"] = commission_amounts.mask(sold_prices.eq(0), pd.NA)
-    out["final_payout"] = final_payouts.mask(sold_prices.eq(0), pd.NA)
-    out["status"] = statuses
-
-    payout_statuses = get_series(out, "payout_status", default="").apply(lambda x: normalize_payout_status(x, ""))
-    payout_statuses = payout_statuses.mask((statuses.eq("SOLD")) & (payout_statuses.isin(["", "N/A"])), "UNPAID")
-    payout_statuses = payout_statuses.mask((~statuses.eq("SOLD")) & (payout_statuses.eq("")), "N/A")
-    out["payout_status"] = payout_statuses
-
+    for idx, row in out.iterrows():
+        sold_price = safe_float(row.get("sold_price"), 0.0)
+        commission_rate = safe_float(row.get("commission_rate"), DEFAULT_COMMISSION_RATE)
+        if commission_rate > 1:
+            commission_rate = commission_rate / 100
+        commission_amount = sold_price * commission_rate if sold_price else 0.0
+        final_payout = sold_price - commission_amount if sold_price else 0.0
+        out.at[idx, "commission_rate"] = round(commission_rate, 4)
+        out.at[idx, "commission_amount"] = round(commission_amount, 2) if sold_price else ""
+        out.at[idx, "final_payout"] = round(final_payout, 2) if sold_price else ""
+        status = clean_text(row.get("status")) or "ACTIVE"
+        out.at[idx, "status"] = status.upper()
+        payout_status = clean_text(row.get("payout_status")) or ("UNPAID" if status.upper() == "SOLD" else "N/A")
+        if status.upper() == "SOLD" and payout_status == "N/A":
+            payout_status = "UNPAID"
+        out.at[idx, "payout_status"] = payout_status.upper()
     return out
 
 
@@ -1123,21 +1001,16 @@ def make_suggested_sticker(parsed: Dict[str, Any], low_list: Dict[str, Any] | No
 # -----------------------------------------------------------------------------
 
 def render_metric_row(df: pd.DataFrame) -> None:
-    df = normalize_consignment_df(df)
     total = len(df)
-    status_series = get_series(df, "status", default="").astype(str).str.upper()
-    payout_series = get_series(df, "payout_status", default="").astype(str).str.upper()
-
-    active_mask = status_series.eq("ACTIVE")
-    sold_mask = status_series.eq("SOLD")
-    paid_mask = payout_series.eq("PAID")
-    unpaid_mask = sold_mask & ~paid_mask
-
-    active = int(active_mask.sum()) if not df.empty else 0
-    sold = int(sold_mask.sum()) if not df.empty else 0
-    sold_total = money_sum(df, "sold_price", sold_mask)
-    unpaid = money_sum(df, "final_payout", unpaid_mask)
-    paid = money_sum(df, "final_payout", paid_mask)
+    active = int((df["status"].astype(str).str.upper() == "ACTIVE").sum()) if not df.empty else 0
+    sold = int((df["status"].astype(str).str.upper() == "SOLD").sum()) if not df.empty else 0
+    sold_total = df.loc[df["status"].astype(str).str.upper() == "SOLD", "sold_price"].map(safe_float).sum() if not df.empty else 0
+    unpaid = df.loc[
+        (df["status"].astype(str).str.upper() == "SOLD")
+        & (df["payout_status"].astype(str).str.upper() != "PAID"),
+        "final_payout",
+    ].map(safe_float).sum() if not df.empty else 0
+    paid = df.loc[df["payout_status"].astype(str).str.upper() == "PAID", "final_payout"].map(safe_float).sum() if not df.empty else 0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total cards", f"{total:,}")
@@ -1543,28 +1416,17 @@ with inventory_tab:
         st.rerun()
 
     if save_changes:
-        base = normalize_consignment_df(df.copy())
-        edited_clean = edited.copy()
-        if "consignment_id" in edited_clean.columns:
-            edited_clean["consignment_id"] = edited_clean["consignment_id"].astype(str)
-            # Avoid pandas duplicate-index crashes if a duplicate ID sneaks into the sheet.
-            edited_clean = edited_clean.drop_duplicates(subset=["consignment_id"], keep="last")
-
-        edited_by_id = {
-            str(row.get("consignment_id")): row.to_dict()
-            for _, row in edited_clean.iterrows()
-            if clean_text(row.get("consignment_id"))
-        }
+        base = df.copy()
+        edited_by_id = edited.set_index("consignment_id", drop=False).to_dict("index") if not edited.empty else {}
         for idx, row in base.iterrows():
             cid = str(row.get("consignment_id"))
             if cid in edited_by_id:
                 for col in visible_cols:
                     if col in ["commission_amount", "final_payout"]:
                         continue
-                    if col in base.columns:
-                        base.at[idx, col] = edited_by_id[cid].get(col, base.at[idx, col])
+                    base.at[idx, col] = edited_by_id[cid].get(col, base.at[idx, col])
                 base.at[idx, "updated_at"] = now_iso()
-        base = normalize_consignment_df(base)
+        base = recalc_financials(base)
         write_consignment_df(base)
         st.success("Saved consignment changes.")
         st.cache_data.clear()
@@ -1654,13 +1516,12 @@ with payout_tab:
             key="payout_editor",
         )
 
-        pay_now_mask = get_series(edited_pay, "pay_now", default=False).astype(bool)
-        total_selected = money_sum(edited_pay, "final_payout", pay_now_mask)
+        total_selected = edited_pay.loc[edited_pay["pay_now"] == True, "final_payout"].map(safe_float).sum()  # noqa: E712
         st.info(f"Selected payout total: **${total_selected:,.2f}**")
         payout_date = st.date_input("Payout date", value=date.today())
         payout_note = st.text_input("Payout note", placeholder="Venmo, cash, check #, etc.")
         if st.button("Mark selected as paid", type="primary", use_container_width=True):
-            selected_ids = get_series(edited_pay.loc[pay_now_mask], "consignment_id", default="").astype(str).tolist()
+            selected_ids = edited_pay.loc[edited_pay["pay_now"] == True, "consignment_id"].astype(str).tolist()  # noqa: E712
             if not selected_ids:
                 st.error("Select at least one card to mark paid.")
             else:
@@ -1759,4 +1620,3 @@ client_secret = "YOUR_EBAY_PROD_CLIENT_SECRET"
         "Sold comps are attempted through eBay Marketplace Insights. If your eBay keyset does not have access, "
         "the app will still save a one-click eBay sold-search URL so you can manually validate comps."
     )
-# this should be updated
