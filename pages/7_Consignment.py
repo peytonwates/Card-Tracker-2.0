@@ -1759,3 +1759,4 @@ client_secret = "YOUR_EBAY_PROD_CLIENT_SECRET"
         "Sold comps are attempted through eBay Marketplace Insights. If your eBay keyset does not have access, "
         "the app will still save a one-click eBay sold-search URL so you can manually validate comps."
     )
+# this should be updated
