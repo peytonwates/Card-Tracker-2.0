@@ -97,6 +97,7 @@ def _normalize_grading(grading: pd.DataFrame) -> pd.DataFrame:
             "submission_date",
             "estimated_return_date",
             "returned_date",
+            "received_grade",
             "inventory_id",
             "reference_link",
             "card_name",
@@ -757,13 +758,147 @@ with t2:
         if open_rows.empty:
             st.info("No open grading rows.")
         else:
-            open_rows["label"] = open_rows.apply(
-                lambda r: f"{r['grading_row_id']} — {r.get('submission_id', '')} — {r.get('inventory_id', '')} — {r.get('card_name', '')} #{r.get('card_number', '')}",
+            open_rows["submission_date_clean"] = open_rows["submission_date"].astype(str).str.strip()
+            open_rows["submission_id_clean"] = open_rows["submission_id"].astype(str).str.strip()
+            open_rows["estimated_return_date_clean"] = open_rows["estimated_return_date"].astype(str).str.strip()
+
+            # Group the return workflow by submission first. This keeps the card dropdown
+            # focused on one actual return instead of mixing every open grading row together.
+            submission_summary = (
+                open_rows.groupby(
+                    ["submission_date_clean", "submission_id_clean", "estimated_return_date_clean"],
+                    dropna=False,
+                )
+                .agg(
+                    open_cards=("grading_row_id", "count"),
+                    grading_cost=("total_grading_cost", "sum"),
+                    purchase_total=("purchase_total", "sum"),
+                )
+                .reset_index()
+                .sort_values(
+                    ["submission_date_clean", "submission_id_clean"],
+                    ascending=[False, False],
+                )
+            )
+
+            submission_summary["submission_filter_label"] = submission_summary.apply(
+                lambda r: (
+                    f"{clean_text(r.get('submission_date_clean')) or 'No submission date'}"
+                    f" — Sub {clean_text(r.get('submission_id_clean')) or 'No submission ID'}"
+                    f" — {int(r.get('open_cards', 0))} open card(s)"
+                    f" — est. {clean_text(r.get('estimated_return_date_clean')) or 'N/A'}"
+                ),
                 axis=1,
             )
 
-            selected = st.selectbox("Select returned card", open_rows["label"].tolist())
-            rec = open_rows[open_rows["label"].eq(selected)].iloc[0]
+            selected_submission_label = st.selectbox(
+                "Filter by submission date / submission",
+                submission_summary["submission_filter_label"].tolist(),
+            )
+
+            selected_submission = submission_summary[
+                submission_summary["submission_filter_label"].eq(selected_submission_label)
+            ].iloc[0]
+
+            selected_submission_date = clean_text(selected_submission.get("submission_date_clean"))
+            selected_submission_id = clean_text(selected_submission.get("submission_id_clean"))
+            selected_est_return = clean_text(selected_submission.get("estimated_return_date_clean"))
+
+            filtered_rows = open_rows[
+                open_rows["submission_date_clean"].eq(selected_submission_date)
+                & open_rows["submission_id_clean"].eq(selected_submission_id)
+                & open_rows["estimated_return_date_clean"].eq(selected_est_return)
+            ].copy()
+
+            filtered_rows = filtered_rows.sort_values(
+                ["card_name", "card_number", "variant", "inventory_id"],
+                ascending=[True, True, True, True],
+                na_position="last",
+            )
+
+            st.caption("Cards in the selected open submission")
+            preview_cols = [
+                "submission_date",
+                "estimated_return_date",
+                "submission_id",
+                "grading_row_id",
+                "inventory_id",
+                "card_name",
+                "card_number",
+                "variant",
+                "purchase_total",
+                "total_grading_cost",
+                "psa9_price",
+                "psa10_price",
+                "status",
+            ]
+            st.dataframe(
+                filtered_rows[[c for c in preview_cols if c in filtered_rows.columns]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "purchase_total": st.column_config.NumberColumn("Purchase Total", format="$%.2f"),
+                    "total_grading_cost": st.column_config.NumberColumn("Grading Cost", format="$%.2f"),
+                    "psa9_price": st.column_config.NumberColumn("PSA 9 Value", format="$%.2f"),
+                    "psa10_price": st.column_config.NumberColumn("PSA 10 Value", format="$%.2f"),
+                },
+            )
+
+            if filtered_rows.empty:
+                st.info("No open cards found for this submission filter.")
+                st.stop()
+
+            filtered_rows["label"] = filtered_rows.apply(
+                lambda r: (
+                    f"{clean_text(r.get('inventory_id'))} — "
+                    f"{clean_text(r.get('card_name'))}"
+                    f" #{clean_text(r.get('card_number'))}"
+                    f" — {clean_text(r.get('variant'))}"
+                    f" — Row {clean_text(r.get('grading_row_id'))}"
+                ),
+                axis=1,
+            )
+
+            selected = st.selectbox("Select returned card from this submission", filtered_rows["label"].tolist())
+            rec = filtered_rows[filtered_rows["label"].eq(selected)].iloc[0]
+
+            card_cost = to_money(rec.get("purchase_total"))
+            existing_grading_cost_preview = (
+                to_money(rec.get("total_grading_cost"))
+                or to_money(rec.get("grading_fee_per_card"))
+                or to_money(rec.get("grading_fee_initial"))
+            )
+
+            with st.expander("Selected card details", expanded=True):
+                detail_cols = [
+                    "grading_row_id",
+                    "inventory_id",
+                    "card_name",
+                    "card_number",
+                    "variant",
+                    "card_subtype",
+                    "purchase_total",
+                    "total_grading_cost",
+                    "psa9_price",
+                    "psa10_price",
+                    "notes",
+                ]
+                detail_df = pd.DataFrame([rec])
+                st.dataframe(
+                    detail_df[[c for c in detail_cols if c in detail_df.columns]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "purchase_total": st.column_config.NumberColumn("Purchase Total", format="$%.2f"),
+                        "total_grading_cost": st.column_config.NumberColumn("Grading Cost", format="$%.2f"),
+                        "psa9_price": st.column_config.NumberColumn("PSA 9 Value", format="$%.2f"),
+                        "psa10_price": st.column_config.NumberColumn("PSA 10 Value", format="$%.2f"),
+                    },
+                )
+                st.caption(
+                    f"Current cost basis before extra return costs: "
+                    f"{money_fmt(card_cost + existing_grading_cost_preview)}"
+                )
 
             col1, col2, col3 = st.columns(3)
 
@@ -771,10 +906,16 @@ with t2:
                 returned_date = st.date_input("Returned date", value=date.today())
 
             with col2:
-                received_grade = st.text_input("Received grade")
+                received_grade = st.text_input("Received grade", key="single_return_received_grade")
 
             with col3:
-                additional_cost = st.number_input("Additional cost", min_value=0.0, step=1.0, format="%.2f")
+                additional_cost = st.number_input(
+                    "Additional cost",
+                    min_value=0.0,
+                    step=1.0,
+                    format="%.2f",
+                    key="single_return_additional_cost",
+                )
 
             if st.button("Mark returned", type="primary"):
                 row_id = clean_text(rec.get("grading_row_id"))
