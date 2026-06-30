@@ -1504,6 +1504,58 @@ def _inventory_ready_for_ebay_assignment(inv: pd.DataFrame) -> pd.DataFrame:
     return ready[safe_inventory_id & ~already_linked].copy()
 
 
+def _inventory_ready_for_sold_order_assignment(inv: pd.DataFrame) -> pd.DataFrame:
+    """
+    Inventory rows that are safe to attach directly to an unmatched sold eBay order line.
+
+    This is intentionally stricter than the active-listing assignment:
+    - only ACTIVE/LISTED rows are offered
+    - inventory_id must be nonblank and unique
+    - the row cannot already be linked to another eBay listing
+    - the row cannot already have sold-order identifiers
+    """
+    if inv.empty:
+        return pd.DataFrame()
+
+    ready = inv.copy()
+
+    for col in [
+        "inventory_id",
+        "inventory_status",
+        "ebay_item_id",
+        "ebay_listing_id",
+        "ebay_order_id",
+        "ebay_line_item_id",
+        "sold_transaction_id",
+    ]:
+        if col not in ready.columns:
+            ready[col] = ""
+
+    ready["inventory_id"] = ready["inventory_id"].astype(str).str.strip()
+    ready["inventory_status"] = ready["inventory_status"].astype(str).str.upper().str.strip()
+
+    ready = ready[ready["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])].copy()
+
+    if ready.empty:
+        return ready
+
+    # A blank or duplicated inventory_id cannot be safely updated with update_rows_by_key.
+    safe_inventory_id = ready["inventory_id"].ne("") & ~ready["inventory_id"].duplicated(keep=False)
+
+    already_linked_to_listing = (
+        ready["ebay_item_id"].astype(str).str.strip().ne("")
+        | ready["ebay_listing_id"].astype(str).str.strip().ne("")
+    )
+
+    already_linked_to_sale = (
+        ready["ebay_order_id"].astype(str).str.strip().ne("")
+        | ready["ebay_line_item_id"].astype(str).str.strip().ne("")
+        | ready["sold_transaction_id"].astype(str).str.strip().ne("")
+    )
+
+    return ready[safe_inventory_id & ~already_linked_to_listing & ~already_linked_to_sale].copy()
+
+
 def _score_inventory_match(row: pd.Series, listing_title: str) -> int:
     title = clean_text(listing_title).lower()
     if not title:
@@ -1533,6 +1585,28 @@ def _score_inventory_match(row: pd.Series, listing_title: str) -> int:
 
 def _inventory_option_map(inv: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
     ready = _inventory_ready_for_ebay_assignment(inv)
+
+    if ready.empty:
+        return [""], {"": ""}
+
+    ready = ready.sort_values(["market_value", "card_name"], ascending=[False, True])
+
+    options = [""]
+    mapping = {"": ""}
+
+    for _, row in ready.iterrows():
+        label = _inventory_label(row)
+        inv_id = clean_text(row.get("inventory_id"))
+
+        if label and inv_id:
+            options.append(label)
+            mapping[label] = inv_id
+
+    return options, mapping
+
+
+def _sold_order_inventory_option_map(inv: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
+    ready = _inventory_ready_for_sold_order_assignment(inv)
 
     if ready.empty:
         return [""], {"": ""}
@@ -1588,6 +1662,96 @@ def _best_inventory_label_for_listing(
         return "", "", 0
 
     return _inventory_label(best), clean_text(best.get("inventory_id")), score
+
+
+def _best_inventory_label_for_order_line(
+    inv: pd.DataFrame,
+    order_title: str,
+    exclude_inventory_ids: set[str] | None = None,
+) -> tuple[str, str, int]:
+    ready = _inventory_ready_for_sold_order_assignment(inv)
+
+    if ready.empty:
+        return "", "", 0
+
+    exclude_inventory_ids = exclude_inventory_ids or set()
+
+    ready["inventory_id"] = ready["inventory_id"].astype(str).str.strip()
+    ready = ready[~ready["inventory_id"].isin(exclude_inventory_ids)].copy()
+
+    if ready.empty:
+        return "", "", 0
+
+    ready["__match_score"] = ready.apply(
+        lambda r: _score_inventory_match(r, order_title),
+        axis=1,
+    )
+
+    ready = ready.sort_values(
+        ["__match_score", "market_value"],
+        ascending=[False, False],
+    )
+
+    best = ready.iloc[0]
+    score = int(best.get("__match_score", 0) or 0)
+
+    if score <= 0:
+        return "", "", 0
+
+    return _inventory_label(best), clean_text(best.get("inventory_id")), score
+
+
+def _order_line_assignment_key(row: pd.Series) -> str:
+    order_id = clean_text(row.get("ebay_order_id"))
+    line_item_id = clean_text(row.get("ebay_line_item_id"))
+    item_id = clean_text(row.get("ebay_item_id"))
+
+    return f"{order_id}||{line_item_id or item_id}"
+
+
+def _build_manual_unmatched_order_sync_df(
+    to_apply: pd.DataFrame,
+    sync_df: pd.DataFrame,
+    fresh_inv: pd.DataFrame,
+) -> pd.DataFrame:
+    if to_apply.empty or sync_df.empty or fresh_inv.empty:
+        return pd.DataFrame()
+
+    working_sync = sync_df.copy()
+    working_sync["manual_order_line_key"] = working_sync.apply(_order_line_assignment_key, axis=1)
+    working_sync = working_sync.drop_duplicates(subset=["manual_order_line_key"], keep="last")
+    sync_by_key = working_sync.set_index("manual_order_line_key", drop=False)
+
+    fresh_lookup = fresh_inv.copy()
+    fresh_lookup["inventory_id"] = fresh_lookup["inventory_id"].astype(str).str.strip()
+    fresh_lookup = fresh_lookup.drop_duplicates(subset=["inventory_id"], keep=False)
+    fresh_lookup = fresh_lookup.set_index("inventory_id", drop=False)
+
+    manual_rows = []
+
+    for _, selected_row in to_apply.iterrows():
+        key = clean_text(selected_row.get("manual_order_line_key"))
+        inv_id = clean_text(selected_row.get("inventory_id"))
+
+        if not key or not inv_id or key not in sync_by_key.index or inv_id not in fresh_lookup.index:
+            continue
+
+        sync_row = sync_by_key.loc[key].copy()
+        inv_row = fresh_lookup.loc[inv_id]
+
+        total_cost = to_money(inv_row.get("total_cost"))
+        sync_net = to_money(sync_row.get("sync_net_proceeds"))
+
+        sync_row["matched"] = True
+        sync_row["already_sold"] = False
+        sync_row["inventory_id"] = inv_id
+        sync_row["inventory_status"] = clean_text(inv_row.get("inventory_status")).upper()
+        sync_row["total_cost"] = total_cost
+        sync_row["sync_profit"] = round(sync_net - total_cost, 2)
+
+        manual_rows.append(sync_row.to_dict())
+
+    return pd.DataFrame(manual_rows)
 
 
 def _build_order_sync_df(inv: pd.DataFrame, orders_df: pd.DataFrame, finance_by_order_id: dict | None = None) -> pd.DataFrame:
@@ -1860,6 +2024,7 @@ with top2:
             "ebay_orders_filter",
             "ebay_order_sync_df",
             "ebay_finance_audit",
+            "manual_unmatched_order_assignment_editor",
         ]:
             st.session_state.pop(key, None)
         st.success("Cleared eBay page cache.")
@@ -2519,7 +2684,7 @@ with tab_orders:
 
         if not unmatched.empty:
             with st.expander("Unmatched order lines", expanded=True):
-                st.warning("These sold items could not be matched to inventory. Check that the eBay listing was assigned to inventory.")
+                st.warning("These sold items could not be matched to inventory. Use the correction table below if the item sold before you assigned the eBay listing to inventory.")
 
                 show_cols = [
                     "ebay_order_id",
@@ -2543,6 +2708,262 @@ with tab_orders:
                         "sync_net_proceeds": st.column_config.NumberColumn("Net", format="$%.2f"),
                     },
                 )
+
+                st.markdown("#### Correct unmatched sold items")
+                st.caption("Pick the inventory row that belongs to each sold eBay order line. Applying this will link the eBay order to that inventory row and mark it SOLD with the pulled fees, net proceeds, and profit.")
+
+                sold_inventory_options, sold_inventory_label_to_id = _sold_order_inventory_option_map(inv)
+
+                if len(sold_inventory_options) <= 1:
+                    st.info("No safe ACTIVE/LISTED inventory rows are available for sold-order correction. Rows already linked to another eBay listing/order, SOLD rows, and blank/duplicated inventory IDs are intentionally excluded.")
+                else:
+                    manual_rows = []
+                    manual_reserved_inventory_ids = set()
+
+                    for _, order_line in unmatched.iterrows():
+                        best_label, best_inv_id, score = _best_inventory_label_for_order_line(
+                            inv,
+                            clean_text(order_line.get("title")),
+                            exclude_inventory_ids=manual_reserved_inventory_ids,
+                        )
+
+                        if best_inv_id:
+                            manual_reserved_inventory_ids.add(best_inv_id)
+
+                        manual_rows.append(
+                            {
+                                "assign": bool(best_inv_id),
+                                "manual_order_line_key": _order_line_assignment_key(order_line),
+                                "ebay_order_id": clean_text(order_line.get("ebay_order_id")),
+                                "ebay_line_item_id": clean_text(order_line.get("ebay_line_item_id")),
+                                "ebay_item_id": clean_text(order_line.get("ebay_item_id")),
+                                "sold_date": clean_text(order_line.get("sold_date")),
+                                "title": clean_text(order_line.get("title")),
+                                "quantity": int(to_money(order_line.get("quantity")) or 0),
+                                "sync_sold_price": _safe_money_round(order_line.get("sync_sold_price")),
+                                "sync_fees": _safe_money_round(order_line.get("sync_fees")),
+                                "sync_net_proceeds": _safe_money_round(order_line.get("sync_net_proceeds")),
+                                "finance_status": clean_text(order_line.get("finance_status")),
+                                "match_score": score,
+                                "selected_inventory": best_label,
+                            }
+                        )
+
+                    manual_assign_df = pd.DataFrame(manual_rows)
+
+                    edited_manual_assignments = st.data_editor(
+                        manual_assign_df,
+                        key="manual_unmatched_order_assignment_editor",
+                        use_container_width=True,
+                        hide_index=True,
+                        height=450,
+                        column_order=[
+                            "assign",
+                            "ebay_order_id",
+                            "ebay_line_item_id",
+                            "ebay_item_id",
+                            "sold_date",
+                            "title",
+                            "quantity",
+                            "sync_sold_price",
+                            "sync_fees",
+                            "sync_net_proceeds",
+                            "finance_status",
+                            "match_score",
+                            "selected_inventory",
+                        ],
+                        column_config={
+                            "assign": st.column_config.CheckboxColumn("Assign"),
+                            "manual_order_line_key": st.column_config.TextColumn("Manual Key", disabled=True),
+                            "ebay_order_id": st.column_config.TextColumn("Order ID", disabled=True),
+                            "ebay_line_item_id": st.column_config.TextColumn("Line Item ID", disabled=True),
+                            "ebay_item_id": st.column_config.TextColumn("eBay Item ID", disabled=True),
+                            "sold_date": st.column_config.TextColumn("Sold Date", disabled=True),
+                            "title": st.column_config.TextColumn("eBay Title", disabled=True, width="large"),
+                            "quantity": st.column_config.NumberColumn("Qty", disabled=True),
+                            "sync_sold_price": st.column_config.NumberColumn("Sold Price", format="$%.2f", disabled=True),
+                            "sync_fees": st.column_config.NumberColumn("Fees", format="$%.2f", disabled=True),
+                            "sync_net_proceeds": st.column_config.NumberColumn("Net", format="$%.2f", disabled=True),
+                            "finance_status": st.column_config.TextColumn("Finance Status", disabled=True),
+                            "match_score": st.column_config.NumberColumn("Match Score", disabled=True),
+                            "selected_inventory": st.column_config.SelectboxColumn("Selected Inventory Item", options=sold_inventory_options, required=False, width="large"),
+                        },
+                        disabled=[
+                            "manual_order_line_key",
+                            "ebay_order_id",
+                            "ebay_line_item_id",
+                            "ebay_item_id",
+                            "sold_date",
+                            "title",
+                            "quantity",
+                            "sync_sold_price",
+                            "sync_fees",
+                            "sync_net_proceeds",
+                            "finance_status",
+                            "match_score",
+                        ],
+                    )
+
+                    apply_manual_assignments = st.button(
+                        "Assign selected unmatched sold lines + sync",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                    if apply_manual_assignments:
+                        to_apply = edited_manual_assignments[
+                            edited_manual_assignments["assign"].eq(True)
+                            & edited_manual_assignments["selected_inventory"].astype(str).str.strip().ne("")
+                        ].copy()
+
+                        if to_apply.empty:
+                            st.warning("No checked unmatched sold rows with selected inventory items to assign.")
+                            st.stop()
+
+                        to_apply["inventory_id"] = to_apply["selected_inventory"].map(sold_inventory_label_to_id)
+                        to_apply["inventory_id"] = to_apply["inventory_id"].fillna("").astype(str).str.strip()
+
+                        missing_inventory = to_apply[to_apply["inventory_id"].eq("")]
+                        if not missing_inventory.empty:
+                            st.error("One or more selected inventory values could not be mapped to an inventory_id.")
+                            st.dataframe(missing_inventory, use_container_width=True, hide_index=True)
+                            st.stop()
+
+                        duplicate_inventory = to_apply["inventory_id"].value_counts().reset_index()
+                        duplicate_inventory.columns = ["inventory_id", "count"]
+                        duplicate_inventory = duplicate_inventory[duplicate_inventory["count"] > 1]
+
+                        if not duplicate_inventory.empty:
+                            duplicate_ids = duplicate_inventory["inventory_id"].astype(str).tolist()
+                            duplicate_detail = to_apply[to_apply["inventory_id"].astype(str).isin(duplicate_ids)].copy()
+                            duplicate_detail = duplicate_detail[[
+                                "inventory_id",
+                                "ebay_order_id",
+                                "ebay_line_item_id",
+                                "ebay_item_id",
+                                "title",
+                                "selected_inventory",
+                            ]].sort_values(["inventory_id", "title"])
+
+                            st.error("The same inventory item is selected for more than one sold eBay order line. Fix the duplicate rows below before applying.")
+                            st.dataframe(duplicate_detail, use_container_width=True, hide_index=True)
+                            st.stop()
+
+                        duplicate_order_lines = to_apply["manual_order_line_key"].astype(str).str.strip().value_counts().reset_index()
+                        duplicate_order_lines.columns = ["manual_order_line_key", "count"]
+                        duplicate_order_lines = duplicate_order_lines[duplicate_order_lines["count"] > 1]
+
+                        if not duplicate_order_lines.empty:
+                            duplicate_line_keys = duplicate_order_lines["manual_order_line_key"].astype(str).tolist()
+                            duplicate_line_detail = to_apply[to_apply["manual_order_line_key"].astype(str).isin(duplicate_line_keys)].copy()
+
+                            st.error("The same sold eBay order line is selected more than once. Fix the duplicate rows below before applying.")
+                            st.dataframe(
+                                duplicate_line_detail[[
+                                    "ebay_order_id",
+                                    "ebay_line_item_id",
+                                    "ebay_item_id",
+                                    "inventory_id",
+                                    "selected_inventory",
+                                ]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.stop()
+
+                        # Re-load fresh inventory before writing so stale editor selections cannot overwrite
+                        # a row that was sold/listed/linked after this page loaded.
+                        fresh_data = load_data()
+                        fresh_inv = _ensure_cols(_safe_df(fresh_data.inventory), needed_inv_cols)
+                        if not fresh_inv.empty:
+                            fresh_inv["inventory_id"] = fresh_inv["inventory_id"].astype(str).str.strip()
+                            fresh_inv["inventory_status"] = fresh_inv["inventory_status"].astype(str).str.upper().str.strip()
+
+                        safe_sold_assignment_ids = set(
+                            _inventory_ready_for_sold_order_assignment(fresh_inv)["inventory_id"]
+                            .astype(str)
+                            .str.strip()
+                            .tolist()
+                        )
+                        stale_or_invalid = to_apply[~to_apply["inventory_id"].astype(str).str.strip().isin(safe_sold_assignment_ids)].copy()
+
+                        if not stale_or_invalid.empty:
+                            st.error("One or more selected inventory rows are no longer safe to assign as a sold eBay order. They may already be sold, linked to another eBay listing/order, have a blank/duplicate inventory_id, or have changed since the page loaded.")
+                            st.dataframe(
+                                stale_or_invalid[[
+                                    "inventory_id",
+                                    "ebay_order_id",
+                                    "ebay_line_item_id",
+                                    "ebay_item_id",
+                                    "title",
+                                    "selected_inventory",
+                                ]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.stop()
+
+                        already_assigned_order_rows = []
+
+                        for _, pending_row in to_apply.iterrows():
+                            pending_item_id = clean_text(pending_row.get("ebay_item_id"))
+                            existing_matches = _find_inventory_match_by_ebay_id(fresh_inv, pending_item_id)
+
+                            if not existing_matches.empty:
+                                existing_matches = existing_matches.copy()
+                                existing_matches["pending_inventory_id"] = clean_text(pending_row.get("inventory_id"))
+                                existing_matches["pending_ebay_item_id"] = pending_item_id
+                                already_assigned_order_rows.append(existing_matches)
+
+                        if already_assigned_order_rows:
+                            already_assigned_order_df = pd.concat(already_assigned_order_rows, ignore_index=True)
+                            show_cols = [
+                                "pending_ebay_item_id",
+                                "pending_inventory_id",
+                                "inventory_id",
+                                "inventory_status",
+                                "card_name",
+                                "card_number",
+                                "set_name",
+                                "ebay_item_id",
+                                "ebay_listing_id",
+                                "ebay_order_id",
+                                "ebay_line_item_id",
+                            ]
+                            st.error("At least one sold eBay item is already assigned to inventory in the latest database. Refresh the page before applying.")
+                            st.dataframe(
+                                already_assigned_order_df[[c for c in show_cols if c in already_assigned_order_df.columns]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.stop()
+
+                        manual_sync_df = _build_manual_unmatched_order_sync_df(
+                            to_apply=to_apply,
+                            sync_df=sync_df,
+                            fresh_inv=fresh_inv,
+                        )
+
+                        if manual_sync_df.empty:
+                            st.warning("No valid manual sold-order assignments could be built.")
+                            st.stop()
+
+                        changed, ready = _sync_ebay_sales_to_inventory(manual_sync_df)
+                        refresh_database_cache()
+
+                        for key in [
+                            "ebay_orders_df",
+                            "ebay_order_sync_df",
+                            "manual_unmatched_order_assignment_editor",
+                        ]:
+                            st.session_state.pop(key, None)
+
+                        if changed:
+                            st.success(f"Assigned and synced {changed:,} unmatched sold eBay order line(s) to inventory.")
+                        else:
+                            st.info("No unmatched sold eBay order lines were updated.")
+
+                        st.rerun()
 
         ready_to_sync = sync_df[sync_df["matched"].eq(True)].copy()
 
