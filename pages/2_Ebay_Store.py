@@ -684,6 +684,12 @@ def _build_assigned_listing_estimate_df(assigned: pd.DataFrame, inv: pd.DataFram
             assumptions=assumptions,
             target_profit_pct=0.10,
         )
+        twenty_pct_math = _estimate_listing_math(
+            list_price=list_price,
+            total_cost=total_cost,
+            assumptions=assumptions,
+            target_profit_pct=0.20,
+        )
 
         estimated_profit_loss = to_money(current_math.get("estimated_profit_loss"))
         estimated_profit_margin_pct = None
@@ -713,6 +719,7 @@ def _build_assigned_listing_estimate_df(assigned: pd.DataFrame, inv: pd.DataFram
                 "break_even_price": breakeven_math["required_price"],
                 "price_for_5pct_profit": five_pct_math["required_price"],
                 "price_for_10pct_profit": ten_pct_math["required_price"],
+                "price_for_20pct_profit": twenty_pct_math["required_price"],
                 "quantity_available": int(to_money(listing.get("quantity_available")) or 0),
                 "quantity_sold": int(to_money(listing.get("quantity_sold")) or 0),
                 "listing_start_date": clean_text(listing.get("listing_start_date")),
@@ -751,6 +758,7 @@ def _assigned_listing_estimate_cols() -> list[str]:
         "break_even_price",
         "price_for_5pct_profit",
         "price_for_10pct_profit",
+        "price_for_20pct_profit",
         "quantity_available",
         "quantity_sold",
         "listing_start_date",
@@ -759,17 +767,218 @@ def _assigned_listing_estimate_cols() -> list[str]:
     ]
 
 
-def _style_loss_rows(row: pd.Series, max_loss_amount: float = 1.0) -> list[str]:
-    profit = to_money(row.get("estimated_profit_loss"))
+def _unlisted_inventory_pricing_cols() -> list[str]:
+    return [
+        "inventory_id",
+        "inventory_status",
+        "product_type",
+        "inventory_type",
+        "set_name",
+        "card_name",
+        "card_number",
+        "variant",
+        "grading_company",
+        "grade",
+        "total_cost",
+        "market_value",
+        "sticker_price",
+        "break_even_price",
+        "break_even_shipping_option",
+        "break_even_est_label",
+        "break_even_est_ebay_fees",
+        "break_even_est_net",
+        "price_for_10pct_profit",
+        "ten_pct_shipping_option",
+        "ten_pct_est_label",
+        "ten_pct_est_ebay_fees",
+        "ten_pct_est_net",
+        "price_for_20pct_profit",
+        "twenty_pct_shipping_option",
+        "twenty_pct_est_label",
+        "twenty_pct_est_ebay_fees",
+        "twenty_pct_est_net",
+        "reference_link",
+    ]
 
-    if profit >= 0:
+
+def _style_alpha_from_ratio(ratio: float, min_alpha: float = 0.15, max_alpha: float = 0.80) -> float:
+    ratio = min(max(to_money(ratio), 0.0), 1.0)
+    return round(min_alpha + ((max_alpha - min_alpha) * ratio), 3)
+
+
+def _style_profit_margin_rows(
+    row: pd.Series,
+    max_loss_amount: float = 1.0,
+    max_green_margin_pct: float = 50.0,
+) -> list[str]:
+    """
+    Shade assigned-listing rows by estimated profit quality:
+    - Negative profit: red, darker as the loss gets worse.
+    - 0% to 10% margin: yellow, darker as it gets closer to 10%.
+    - 10% to 20% margin: orange, darker as it gets closer to 20%.
+    - 20%+ margin: green, darker as margin improves versus the best visible green row.
+    """
+    profit = to_money(row.get("estimated_profit_loss"))
+    margin = to_money(row.get("estimated_profit_margin_pct"))
+
+    if profit < 0:
+        max_loss_amount = max(to_money(max_loss_amount), 1.0)
+        loss_ratio = min(abs(profit) / max_loss_amount, 1.0)
+        alpha = _style_alpha_from_ratio(loss_ratio)
+        return [f"background-color: rgba(255, 0, 0, {alpha}); color: #111111;" for _ in row.index]
+
+    if pd.isna(row.get("estimated_profit_margin_pct")):
         return ["" for _ in row.index]
 
-    max_loss_amount = max(to_money(max_loss_amount), 1.0)
-    loss_ratio = min(abs(profit) / max_loss_amount, 1.0)
-    alpha = round(0.15 + (0.70 * loss_ratio), 3)
+    if margin < 10:
+        ratio = min(max(margin / 10.0, 0.0), 1.0)
+        alpha = _style_alpha_from_ratio(ratio)
+        return [f"background-color: rgba(255, 235, 59, {alpha}); color: #111111;" for _ in row.index]
 
-    return [f"background-color: rgba(255, 0, 0, {alpha}); color: #111111;" for _ in row.index]
+    if margin < 20:
+        ratio = min(max((margin - 10.0) / 10.0, 0.0), 1.0)
+        alpha = _style_alpha_from_ratio(ratio)
+        return [f"background-color: rgba(255, 152, 0, {alpha}); color: #111111;" for _ in row.index]
+
+    green_ceiling = max(to_money(max_green_margin_pct), 20.0)
+    if green_ceiling <= 20:
+        ratio = 1.0
+    else:
+        ratio = min(max((margin - 20.0) / (green_ceiling - 20.0), 0.0), 1.0)
+
+    alpha = _style_alpha_from_ratio(ratio)
+    return [f"background-color: rgba(76, 175, 80, {alpha}); color: #111111;" for _ in row.index]
+
+
+def _is_unlisted_inventory_row(row: pd.Series) -> bool:
+    status = clean_text(row.get("inventory_status")).upper()
+
+    if status != STATUS_ACTIVE:
+        return False
+
+    ebay_item_id = clean_text(row.get("ebay_item_id"))
+    ebay_listing_id = clean_text(row.get("ebay_listing_id"))
+    ebay_order_id = clean_text(row.get("ebay_order_id"))
+    sold_date = clean_text(row.get("sold_date"))
+
+    return not any([ebay_item_id, ebay_listing_id, ebay_order_id, sold_date])
+
+
+def _build_unlisted_inventory_pricing_df(inv: pd.DataFrame, assumptions: dict) -> pd.DataFrame:
+    if inv.empty:
+        return pd.DataFrame()
+
+    working = _ensure_cols(
+        inv,
+        [
+            "inventory_id",
+            "inventory_status",
+            "product_type",
+            "inventory_type",
+            "set_name",
+            "card_name",
+            "card_number",
+            "variant",
+            "grading_company",
+            "grade",
+            "total_cost",
+            "market_value",
+            "sticker_price",
+            "reference_link",
+            "ebay_item_id",
+            "ebay_listing_id",
+            "ebay_order_id",
+            "sold_date",
+        ],
+    ).copy()
+
+    working["inventory_id"] = working["inventory_id"].astype(str).str.strip()
+    working = working[working["inventory_id"].ne("")].copy()
+    working = working[working.apply(_is_unlisted_inventory_row, axis=1)].copy()
+
+    if working.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for _, item in working.iterrows():
+        total_cost = _round_money(item.get("total_cost"))
+
+        breakeven_price = _estimate_listing_math(
+            list_price=0.0,
+            total_cost=total_cost,
+            assumptions=assumptions,
+            target_profit_pct=0.0,
+        )["required_price"]
+        ten_pct_price = _estimate_listing_math(
+            list_price=0.0,
+            total_cost=total_cost,
+            assumptions=assumptions,
+            target_profit_pct=0.10,
+        )["required_price"]
+        twenty_pct_price = _estimate_listing_math(
+            list_price=0.0,
+            total_cost=total_cost,
+            assumptions=assumptions,
+            target_profit_pct=0.20,
+        )["required_price"]
+
+        breakeven_math = _estimate_listing_at_price(
+            list_price=breakeven_price,
+            total_cost=total_cost,
+            assumptions=assumptions,
+        )
+        ten_pct_math = _estimate_listing_at_price(
+            list_price=ten_pct_price,
+            total_cost=total_cost,
+            assumptions=assumptions,
+        )
+        twenty_pct_math = _estimate_listing_at_price(
+            list_price=twenty_pct_price,
+            total_cost=total_cost,
+            assumptions=assumptions,
+        )
+
+        rows.append(
+            {
+                "inventory_id": clean_text(item.get("inventory_id")),
+                "inventory_status": clean_text(item.get("inventory_status")),
+                "product_type": clean_text(item.get("product_type")),
+                "inventory_type": clean_text(item.get("inventory_type")),
+                "set_name": clean_text(item.get("set_name")),
+                "card_name": clean_text(item.get("card_name")),
+                "card_number": clean_text(item.get("card_number")),
+                "variant": clean_text(item.get("variant")),
+                "grading_company": clean_text(item.get("grading_company")),
+                "grade": clean_text(item.get("grade")),
+                "total_cost": total_cost,
+                "market_value": _round_money(item.get("market_value")),
+                "sticker_price": _round_money(item.get("sticker_price")),
+                "break_even_price": breakeven_price,
+                "break_even_shipping_option": breakeven_math["shipping_option"],
+                "break_even_est_label": breakeven_math["estimated_label_cost"],
+                "break_even_est_ebay_fees": breakeven_math["estimated_ebay_fees"],
+                "break_even_est_net": breakeven_math["estimated_net_proceeds"],
+                "price_for_10pct_profit": ten_pct_price,
+                "ten_pct_shipping_option": ten_pct_math["shipping_option"],
+                "ten_pct_est_label": ten_pct_math["estimated_label_cost"],
+                "ten_pct_est_ebay_fees": ten_pct_math["estimated_ebay_fees"],
+                "ten_pct_est_net": ten_pct_math["estimated_net_proceeds"],
+                "price_for_20pct_profit": twenty_pct_price,
+                "twenty_pct_shipping_option": twenty_pct_math["shipping_option"],
+                "twenty_pct_est_label": twenty_pct_math["estimated_label_cost"],
+                "twenty_pct_est_ebay_fees": twenty_pct_math["estimated_ebay_fees"],
+                "twenty_pct_est_net": twenty_pct_math["estimated_net_proceeds"],
+                "reference_link": clean_text(item.get("reference_link")),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+
+    if not out.empty:
+        out = out.sort_values(["total_cost", "market_value", "card_name"], ascending=[False, False, True]).reset_index(drop=True)
+
+    return out
 
 
 # =========================================================
@@ -2260,6 +2469,20 @@ with tab_assign:
     st.subheader("Assign eBay Listings to Inventory")
 
     listings_df = st.session_state.get("ebay_active_listings_df", pd.DataFrame()).copy()
+    estimator_assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
+
+    with st.expander("Active listing estimator rules", expanded=False):
+        st.caption("These fixed rules are used for the assigned-listing estimate table and the unlisted inventory pricing table. Actual sold-order sync still uses eBay order/finance data after a sale.")
+        st.write(
+            {
+                "Shipping option": "List price over $20.00 = USPS Ground Advantage; $20.00 and under = eBay Standard Envelope",
+                "Standard Envelope assumed shipping / label": money_fmt(estimator_assumptions["standard_envelope_shipping"]),
+                "Ground Advantage assumed shipping / label": money_fmt(estimator_assumptions["ground_advantage_shipping"]),
+                "Estimated buyer tax": f'{estimator_assumptions["estimated_buyer_tax_pct"]:.2f}%',
+                "eBay variable fee": f'{estimator_assumptions["fee_rate_pct"]:.2f}% of item + shipping + estimated tax',
+                "Fixed fee": "Below $10.00 = $0.30; $10.00 and up = $0.40",
+            }
+        )
 
     if listings_df.empty:
         st.info("Pull active listings first on tab 1.")
@@ -2499,21 +2722,6 @@ with tab_assign:
         if assigned.empty:
             st.info("No assigned listings from the pulled active list.")
         else:
-            estimator_assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
-
-            with st.expander("Active listing estimator rules", expanded=False):
-                st.caption("These fixed rules are used only for the active listing estimate table. Actual sold-order sync still uses eBay order/finance data after a sale.")
-                st.write(
-                    {
-                        "Shipping option": "List price over $20.00 = USPS Ground Advantage; $20.00 and under = eBay Standard Envelope",
-                        "Standard Envelope assumed shipping / label": money_fmt(estimator_assumptions["standard_envelope_shipping"]),
-                        "Ground Advantage assumed shipping / label": money_fmt(estimator_assumptions["ground_advantage_shipping"]),
-                        "Estimated buyer tax": f'{estimator_assumptions["estimated_buyer_tax_pct"]:.2f}%',
-                        "eBay variable fee": f'{estimator_assumptions["fee_rate_pct"]:.2f}% of item + shipping + estimated tax',
-                        "Fixed fee": "Below $10.00 = $0.30; $10.00 and up = $0.40",
-                    }
-                )
-
             assigned_estimates = _build_assigned_listing_estimate_df(
                 assigned=assigned,
                 inv=inv,
@@ -2533,12 +2741,25 @@ with tab_assign:
                 p3.metric("Total estimated P/L", money_fmt(total_estimated_profit))
                 p4.metric("Estimated loss exposure", money_fmt(total_estimated_loss))
 
-                st.caption("Rows shaded red are estimated to lose money at the current list price. Darker red means the dollar loss is larger versus the other active listings.")
+                st.caption("Row colors show estimated margin at the current list price: red = loss, yellow = 0-10%, orange = 10-20%, green = 20%+. Darker color means further into that band.")
 
                 cols = [c for c in _assigned_listing_estimate_cols() if c in assigned_estimates.columns]
                 max_loss_amount = abs(loss_rows["estimated_profit_loss"].apply(to_money).min()) if not loss_rows.empty else 1.0
+
+                positive_margin_values = (
+                    assigned_estimates["estimated_profit_margin_pct"]
+                    .dropna()
+                    .apply(to_money)
+                )
+                green_margin_values = positive_margin_values[positive_margin_values >= 20]
+                max_green_margin_pct = green_margin_values.max() if not green_margin_values.empty else 20.0
+
                 styled_assigned_estimates = assigned_estimates[cols].style.apply(
-                    lambda row: _style_loss_rows(row, max_loss_amount=max_loss_amount),
+                    lambda row: _style_profit_margin_rows(
+                        row,
+                        max_loss_amount=max_loss_amount,
+                        max_green_margin_pct=max_green_margin_pct,
+                    ),
                     axis=1,
                 )
 
@@ -2560,6 +2781,7 @@ with tab_assign:
                         "break_even_price": st.column_config.NumberColumn("Break Even Price", format="$%.2f"),
                         "price_for_5pct_profit": st.column_config.NumberColumn("Price for 5% Profit", format="$%.2f"),
                         "price_for_10pct_profit": st.column_config.NumberColumn("Price for 10% Profit", format="$%.2f"),
+                        "price_for_20pct_profit": st.column_config.NumberColumn("Price for 20% Profit", format="$%.2f"),
                     },
                 )
 
@@ -2571,6 +2793,57 @@ with tab_assign:
                         mime="text/csv",
                     )
 
+    st.markdown("---")
+    st.markdown("### Unlisted inventory pricing targets")
+    st.caption("This uses the same active-listing estimator rules above to calculate the lowest list price needed to break even, make 10%, or make 20% profit after estimated eBay fees and label cost.")
+
+    unlisted_pricing = _build_unlisted_inventory_pricing_df(
+        inv=inv,
+        assumptions=estimator_assumptions,
+    )
+
+    if unlisted_pricing.empty:
+        st.info("No unlisted ACTIVE inventory found.")
+    else:
+        u1, u2, u3 = st.columns(3)
+        u1.metric("Unlisted active items", f"{len(unlisted_pricing):,}")
+        u2.metric("Total associated cost", money_fmt(unlisted_pricing["total_cost"].apply(to_money).sum()))
+        u3.metric("Total market value", money_fmt(unlisted_pricing["market_value"].apply(to_money).sum()))
+
+        unlisted_cols = [c for c in _unlisted_inventory_pricing_cols() if c in unlisted_pricing.columns]
+
+        st.dataframe(
+            unlisted_pricing[unlisted_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=650,
+            column_config={
+                "reference_link": st.column_config.LinkColumn("Reference Link"),
+                "total_cost": st.column_config.NumberColumn("Associated Cost", format="$%.2f"),
+                "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
+                "sticker_price": st.column_config.NumberColumn("Sticker Price", format="$%.2f"),
+                "break_even_price": st.column_config.NumberColumn("Break Even List Price", format="$%.2f"),
+                "break_even_est_label": st.column_config.NumberColumn("Break Even Est. Label", format="$%.2f"),
+                "break_even_est_ebay_fees": st.column_config.NumberColumn("Break Even Est. eBay Fees", format="$%.2f"),
+                "break_even_est_net": st.column_config.NumberColumn("Break Even Est. Net", format="$%.2f"),
+                "price_for_10pct_profit": st.column_config.NumberColumn("10% Profit List Price", format="$%.2f"),
+                "ten_pct_est_label": st.column_config.NumberColumn("10% Est. Label", format="$%.2f"),
+                "ten_pct_est_ebay_fees": st.column_config.NumberColumn("10% Est. eBay Fees", format="$%.2f"),
+                "ten_pct_est_net": st.column_config.NumberColumn("10% Est. Net", format="$%.2f"),
+                "price_for_20pct_profit": st.column_config.NumberColumn("20% Profit List Price", format="$%.2f"),
+                "twenty_pct_est_label": st.column_config.NumberColumn("20% Est. Label", format="$%.2f"),
+                "twenty_pct_est_ebay_fees": st.column_config.NumberColumn("20% Est. eBay Fees", format="$%.2f"),
+                "twenty_pct_est_net": st.column_config.NumberColumn("20% Est. Net", format="$%.2f"),
+            },
+        )
+
+        with st.expander("Download unlisted pricing target CSV", expanded=False):
+            st.download_button(
+                "Download unlisted pricing targets",
+                data=unlisted_pricing.to_csv(index=False),
+                file_name="ebay_unlisted_inventory_pricing_targets.csv",
+                mime="text/csv",
+            )
 
 # =========================================================
 # Tab 3: Sold Order Sync
