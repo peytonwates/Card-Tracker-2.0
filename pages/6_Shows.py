@@ -154,6 +154,257 @@ def _build_sale_editor(selected_rows: pd.DataFrame) -> pd.DataFrame:
     return editor[[c for c in keep if c in editor.columns]].copy()
 
 
+def _show_sale_updates(
+    *,
+    selected_show: pd.Series,
+    sale_date: date | str,
+    sold_price: float,
+    fees: float,
+    total_cost: float,
+    sale_notes: str = "",
+) -> dict:
+    sold_price = round(to_money(sold_price), 2)
+    fees = round(to_money(fees), 2)
+    total_cost = round(to_money(total_cost), 2)
+    net = round(sold_price - fees, 2)
+    profit = round(net - total_cost, 2)
+
+    return {
+        "transaction_type": "Card Show",
+        "platform": "",
+        "sold_date": str(sale_date),
+        "sold_price": sold_price,
+        "fees": fees,
+        "fees_total": fees,
+        "shipping_charged": 0,
+        "net_proceeds": net,
+        "profit": profit,
+        "sale_channel": "Card Show",
+        "sale_notes": clean_text(sale_notes),
+        "show_id": clean_text(selected_show.get("show_id")),
+        "show_name": clean_text(selected_show.get("show_name")),
+        "sold_transaction_id": str(uuid.uuid4()),
+        "sold_created_at": now_iso(),
+        "sold_updated_at": now_iso(),
+    }
+
+
+def _bulk_sale_export_cols() -> list[str]:
+    return [
+        "mark_sold",
+        "sold_price",
+        "fees",
+        "sold_date",
+        "sale_notes",
+        "show_id",
+        "show_name",
+        "inventory_id",
+        "inventory_status",
+        "product_type",
+        "inventory_type",
+        "card_type",
+        "set_name",
+        "card_name",
+        "card_number",
+        "variant",
+        "card_subtype",
+        "grading_company",
+        "grade",
+        "condition",
+        "purchase_date",
+        "total_cost",
+        "market_value",
+        "sticker_price",
+    ]
+
+
+def _build_bulk_sale_template(
+    inventory: pd.DataFrame,
+    selected_show: pd.Series,
+    default_sale_date: date,
+) -> pd.DataFrame:
+    template = inventory.copy()
+
+    for col in ["sticker_price", "market_value"]:
+        if col not in template.columns:
+            template[col] = 0.0
+
+    suggested_price = template["sticker_price"].apply(to_money)
+    market_price = template["market_value"].apply(to_money)
+
+    # Assign instead of DataFrame.insert because inventory may already contain
+    # historical sale columns such as sold_price, sold_date, show_id, or show_name.
+    template["mark_sold"] = ""
+    template["sold_price"] = suggested_price.where(suggested_price > 0, market_price)
+    template["fees"] = 0.0
+    template["sold_date"] = str(default_sale_date)
+    template["sale_notes"] = ""
+    template["show_id"] = clean_text(selected_show.get("show_id"))
+    template["show_name"] = clean_text(selected_show.get("show_name"))
+
+    cols = [c for c in _bulk_sale_export_cols() if c in template.columns]
+    return template[cols].copy()
+
+
+def _read_bulk_sale_upload(uploaded_file) -> pd.DataFrame:
+    filename = clean_text(getattr(uploaded_file, "name", "")).lower()
+
+    if filename.endswith(".xlsx"):
+        uploaded = pd.read_excel(uploaded_file, dtype=str)
+    else:
+        uploaded = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
+
+    uploaded.columns = [
+        clean_text(col).replace("\ufeff", "").lower().replace(" ", "_")
+        for col in uploaded.columns
+    ]
+
+    aliases = {
+        "sold": "mark_sold",
+        "mark_as_sold": "mark_sold",
+        "sale_price": "sold_price",
+        "price_sold": "sold_price",
+        "fee": "fees",
+        "fees_total": "fees",
+        "notes": "sale_notes",
+        "date_sold": "sold_date",
+    }
+    uploaded = uploaded.rename(columns={k: v for k, v in aliases.items() if k in uploaded.columns})
+    return uploaded
+
+
+def _is_marked_sold(value) -> bool:
+    return clean_text(value).lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "x",
+        "sold",
+        "sell",
+    }
+
+
+def _parse_sale_date(value, fallback: date) -> str:
+    raw = clean_text(value)
+    if not raw:
+        return str(fallback)
+
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return str(parsed.date())
+
+
+def _validate_bulk_sale_upload(
+    uploaded: pd.DataFrame,
+    inventory: pd.DataFrame,
+    selected_show: pd.Series,
+    fallback_sale_date: date,
+) -> pd.DataFrame:
+    results: list[dict] = []
+
+    if "mark_sold" not in uploaded.columns:
+        return pd.DataFrame(
+            [
+                {
+                    "row": "",
+                    "inventory_id": "",
+                    "card_name": "",
+                    "sold_price": 0.0,
+                    "fees": 0.0,
+                    "net_proceeds": 0.0,
+                    "total_cost": 0.0,
+                    "profit": 0.0,
+                    "sold_date": "",
+                    "sale_notes": "",
+                    "is_valid": False,
+                    "validation": "Missing required mark_sold column.",
+                }
+            ]
+        )
+
+    marked = uploaded[uploaded["mark_sold"].apply(_is_marked_sold)].copy()
+    if marked.empty:
+        return pd.DataFrame()
+
+    for required in ["inventory_id", "sold_price"]:
+        if required not in marked.columns:
+            marked[required] = ""
+
+    for optional in ["fees", "sold_date", "sale_notes", "show_id", "show_name"]:
+        if optional not in marked.columns:
+            marked[optional] = ""
+
+    inventory_lookup = inventory.copy()
+    inventory_lookup["inventory_id"] = inventory_lookup["inventory_id"].astype(str).str.strip()
+
+    upload_id_counts = marked["inventory_id"].apply(clean_text).value_counts()
+
+    for row_index, row in marked.iterrows():
+        inv_id = clean_text(row.get("inventory_id"))
+        sold_price = round(to_money(row.get("sold_price")), 2)
+        fees = round(to_money(row.get("fees")), 2)
+        sold_date = _parse_sale_date(row.get("sold_date"), fallback_sale_date)
+        sale_notes = clean_text(row.get("sale_notes"))
+        uploaded_show_id = clean_text(row.get("show_id"))
+        selected_show_id = clean_text(selected_show.get("show_id"))
+
+        matches = inventory_lookup[inventory_lookup["inventory_id"].eq(inv_id)]
+        validation: list[str] = []
+        current = pd.Series(dtype=object)
+
+        if not inv_id:
+            validation.append("Missing inventory_id")
+        elif upload_id_counts.get(inv_id, 0) > 1:
+            validation.append("Duplicate inventory_id in upload")
+        elif matches.empty:
+            validation.append("inventory_id not found")
+        elif len(matches) > 1:
+            validation.append("inventory_id is duplicated in the inventory database")
+        else:
+            current = matches.iloc[0]
+            current_status = clean_text(current.get("inventory_status")).upper()
+            if current_status not in {STATUS_ACTIVE, STATUS_LISTED}:
+                validation.append(f"Current status is {current_status or 'blank'}, not ACTIVE/LISTED")
+
+        if uploaded_show_id and selected_show_id and uploaded_show_id != selected_show_id:
+            validation.append(
+                f"File show_id {uploaded_show_id} does not match selected show {selected_show_id}"
+            )
+
+        if sold_price <= 0:
+            validation.append("Sold price must be greater than $0")
+        if fees < 0:
+            validation.append("Fees cannot be negative")
+        if not sold_date:
+            validation.append("Invalid sold date")
+
+        total_cost = to_money(current.get("total_cost")) if not current.empty else 0.0
+        net = round(sold_price - fees, 2)
+        profit = round(net - total_cost, 2)
+
+        results.append(
+            {
+                "row": int(row_index) + 2,
+                "inventory_id": inv_id,
+                "card_name": clean_text(current.get("card_name")) if not current.empty else "",
+                "sold_price": sold_price,
+                "fees": fees,
+                "net_proceeds": net,
+                "total_cost": round(total_cost, 2),
+                "profit": profit,
+                "sold_date": sold_date,
+                "sale_notes": sale_notes,
+                "is_valid": not validation,
+                "validation": "; ".join(validation) if validation else "Ready",
+            }
+        )
+
+    return pd.DataFrame(results)
+
+
 # =========================================================
 # Top actions / load
 # =========================================================
@@ -185,8 +436,18 @@ if not inv.empty:
     inv["inventory_status"] = inv["inventory_status"].astype(str).str.upper().str.strip()
 
 
-tab_manage, tab_record, tab_summary, tab_inventory = st.tabs(
-    ["Manage Shows", "Record Show Sale", "Show Summary", "Show Inventory View"]
+if "show_bulk_success" in st.session_state:
+    st.success(st.session_state.pop("show_bulk_success"))
+
+
+tab_manage, tab_record, tab_bulk, tab_summary, tab_inventory = st.tabs(
+    [
+        "Manage Shows",
+        "Record Show Sale",
+        "Bulk Show Sale Upload",
+        "Show Summary",
+        "Show Inventory View",
+    ]
 )
 
 
@@ -440,27 +701,14 @@ with tab_record:
                         fees = to_money(row.get("fees"))
                         total_cost_row = to_money(row.get("total_cost"))
 
-                        net = round(sold_price - fees, 2)
-                        profit = round(net - total_cost_row, 2)
-
-                        updates = {
-                            "transaction_type": "Card Show",
-                            "platform": "",
-                            "sold_date": str(sale_date),
-                            "sold_price": round(sold_price, 2),
-                            "fees": round(fees, 2),
-                            "fees_total": round(fees, 2),
-                            "shipping_charged": 0,
-                            "net_proceeds": net,
-                            "profit": profit,
-                            "sale_channel": "Card Show",
-                            "sale_notes": clean_text(row.get("sale_notes")),
-                            "show_id": clean_text(selected_show.get("show_id")),
-                            "show_name": clean_text(selected_show.get("show_name")),
-                            "sold_transaction_id": str(uuid.uuid4()),
-                            "sold_created_at": now_iso(),
-                            "sold_updated_at": now_iso(),
-                        }
+                        updates = _show_sale_updates(
+                            selected_show=selected_show,
+                            sale_date=sale_date,
+                            sold_price=sold_price,
+                            fees=fees,
+                            total_cost=total_cost_row,
+                            sale_notes=row.get("sale_notes"),
+                        )
 
                         changed += mark_inventory_sold(inv_id, updates)
 
@@ -470,6 +718,237 @@ with tab_record:
 
             else:
                 st.info("Select one or more sold items to enter sale details.")
+
+
+# =========================================================
+# Bulk Show Sale Upload
+# =========================================================
+
+with tab_bulk:
+    st.subheader("Bulk Show Sale Upload")
+    st.caption(
+        "Download a sale template, mark multiple inventory rows as sold, then upload it to update inventory, net proceeds, and profit in one step."
+    )
+
+    if shows.empty:
+        st.info("Add a show first before using the bulk sale upload.")
+    elif inv.empty:
+        st.info("No inventory loaded.")
+    else:
+        bulk_ready = inv[
+            inv["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])
+        ].copy()
+
+        if bulk_ready.empty:
+            st.info("No ACTIVE or LISTED inventory is available to sell.")
+        else:
+            bulk_shows = _date_sort(shows, "show_date", ascending=False).copy()
+            bulk_shows["label"] = bulk_shows.apply(_show_label, axis=1)
+
+            b1, b2 = st.columns([2, 1])
+
+            with b1:
+                bulk_show_label = st.selectbox(
+                    "Show for this upload",
+                    bulk_shows["label"].tolist(),
+                    key="bulk_show_label",
+                )
+
+            bulk_selected_show = bulk_shows[
+                bulk_shows["label"].eq(bulk_show_label)
+            ].iloc[0]
+
+            parsed_show_date = pd.to_datetime(
+                bulk_selected_show.get("show_date"),
+                errors="coerce",
+            )
+            bulk_default_date = (
+                parsed_show_date.date()
+                if not pd.isna(parsed_show_date)
+                else date.today()
+            )
+
+            with b2:
+                bulk_sale_date = st.date_input(
+                    "Default sold date",
+                    value=bulk_default_date,
+                    key="bulk_sale_date",
+                    help="Used when the uploaded sold_date cell is blank.",
+                )
+
+            scope = st.radio(
+                "Inventory to include in the download",
+                ["All ACTIVE/LISTED inventory", "Show Inventory only"],
+                horizontal=True,
+                key="bulk_inventory_scope",
+            )
+
+            export_inventory = bulk_ready.copy()
+            if scope == "Show Inventory only":
+                export_inventory = export_inventory[
+                    export_inventory["inventory_type"]
+                    .astype(str)
+                    .str.lower()
+                    .str.contains("show", na=False)
+                ].copy()
+
+            st.markdown("### 1. Download and edit the template")
+            st.info(
+                "In the **mark_sold** column, enter X, YES, TRUE, 1, or SOLD only for items that sold. Update sold_price, fees, sold_date, and sale_notes as needed. Do not change inventory_id.",
+                icon="ℹ️",
+            )
+
+            bulk_template = _build_bulk_sale_template(
+                export_inventory,
+                bulk_selected_show,
+                bulk_sale_date,
+            )
+
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Rows in template", f"{len(bulk_template):,}")
+            d2.metric(
+                "Inventory cost",
+                money_fmt(export_inventory["total_cost"].apply(to_money).sum()),
+            )
+            d3.metric(
+                "Market value",
+                money_fmt(export_inventory["market_value"].apply(to_money).sum()),
+            )
+            d4.metric(
+                "Sticker total",
+                money_fmt(export_inventory["sticker_price"].apply(to_money).sum()),
+            )
+
+            safe_show_name = (
+                clean_text(bulk_selected_show.get("show_name"))
+                .lower()
+                .replace(" ", "_")
+            ) or "show"
+
+            st.download_button(
+                "Download bulk show sale template CSV",
+                data=bulk_template.to_csv(index=False),
+                file_name=f"{safe_show_name}_bulk_sale_template.csv",
+                mime="text/csv",
+                use_container_width=True,
+                disabled=bulk_template.empty,
+            )
+
+            st.markdown("### 2. Upload the completed file")
+
+            uploaded_bulk_sales = st.file_uploader(
+                "Upload completed CSV or Excel file",
+                type=["csv", "xlsx"],
+                key="bulk_show_sale_upload",
+            )
+
+            if uploaded_bulk_sales is not None:
+                try:
+                    uploaded_df = _read_bulk_sale_upload(uploaded_bulk_sales)
+                    validation_df = _validate_bulk_sale_upload(
+                        uploaded_df,
+                        inv,
+                        bulk_selected_show,
+                        bulk_sale_date,
+                    )
+                except Exception as exc:
+                    st.error(f"Could not read the uploaded file: {exc}")
+                    validation_df = pd.DataFrame()
+
+                if validation_df.empty:
+                    st.warning(
+                        "No rows were marked as sold. Put X, YES, TRUE, 1, or SOLD in mark_sold for each sold item."
+                    )
+                else:
+                    valid_sales = validation_df[validation_df["is_valid"]].copy()
+                    invalid_sales = validation_df[~validation_df["is_valid"]].copy()
+
+                    v1, v2, v3, v4, v5 = st.columns(5)
+                    v1.metric("Marked rows", f"{len(validation_df):,}")
+                    v2.metric("Ready to sync", f"{len(valid_sales):,}")
+                    v3.metric("Needs correction", f"{len(invalid_sales):,}")
+                    v4.metric(
+                        "Sales",
+                        money_fmt(valid_sales["sold_price"].sum()),
+                    )
+                    v5.metric(
+                        "Profit",
+                        money_fmt(valid_sales["profit"].sum()),
+                    )
+
+                    st.dataframe(
+                        validation_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "sold_price": st.column_config.NumberColumn(
+                                "Sold price", format="$%.2f"
+                            ),
+                            "fees": st.column_config.NumberColumn(
+                                "Fees", format="$%.2f"
+                            ),
+                            "net_proceeds": st.column_config.NumberColumn(
+                                "Net proceeds", format="$%.2f"
+                            ),
+                            "total_cost": st.column_config.NumberColumn(
+                                "Total cost", format="$%.2f"
+                            ),
+                            "profit": st.column_config.NumberColumn(
+                                "Profit", format="$%.2f"
+                            ),
+                            "is_valid": st.column_config.CheckboxColumn(
+                                "Valid", disabled=True
+                            ),
+                        },
+                    )
+
+                    if not invalid_sales.empty:
+                        st.warning(
+                            "Rows needing correction will not be synced. You can still process the valid rows below."
+                        )
+
+                    if st.button(
+                        f"Sync {len(valid_sales):,} valid show sale(s)",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=valid_sales.empty,
+                        key="sync_bulk_show_sales",
+                    ):
+                        changed = 0
+                        failed_ids: list[str] = []
+
+                        for _, sale in valid_sales.iterrows():
+                            inv_id = clean_text(sale.get("inventory_id"))
+                            updates = _show_sale_updates(
+                                selected_show=bulk_selected_show,
+                                sale_date=clean_text(sale.get("sold_date")) or bulk_sale_date,
+                                sold_price=sale.get("sold_price"),
+                                fees=sale.get("fees"),
+                                total_cost=sale.get("total_cost"),
+                                sale_notes=sale.get("sale_notes"),
+                            )
+
+                            row_changed = mark_inventory_sold(inv_id, updates)
+                            changed += row_changed
+                            if not row_changed:
+                                failed_ids.append(inv_id)
+
+                        refresh_database_cache()
+
+                        message = (
+                            f"Bulk upload complete: {changed:,} inventory item(s) marked SOLD for "
+                            f"{clean_text(bulk_selected_show.get('show_name'))}."
+                        )
+                        if failed_ids:
+                            message += (
+                                f" {len(failed_ids):,} row(s) were not changed: "
+                                + ", ".join(failed_ids[:10])
+                            )
+                            if len(failed_ids) > 10:
+                                message += ", ..."
+
+                        st.session_state["show_bulk_success"] = message
+                        st.rerun()
 
 
 # =========================================================
