@@ -9,12 +9,12 @@ import streamlit as st
 from core.business import load_data, refresh_database_cache, mark_inventory_sold
 from core.cleaning import now_iso, clean_text, to_money, money_fmt
 from core.config import (
+    INVENTORY_COLUMNS,
     SHOW_COLUMNS,
     STATUS_ACTIVE,
-    STATUS_LISTED,
     STATUS_SOLD,
 )
-from core.sheets import get_ws_name, append_rows
+from core.sheets import get_ws_name, append_rows, update_rows_by_key
 
 
 st.set_page_config(page_title="Shows", layout="wide")
@@ -23,6 +23,7 @@ st.title("Shows")
 st.caption(
     "Manage card shows and record show sales. Pricing-for-shows has been removed."
 )
+st.caption("Shows page build: 2026-07-19 · ACTIVE-only bulk sales · Recall v3")
 
 
 # =========================================================
@@ -162,6 +163,8 @@ def _show_sale_updates(
     fees: float,
     total_cost: float,
     sale_notes: str = "",
+    sold_transaction_id: str | None = None,
+    sold_timestamp: str | None = None,
 ) -> dict:
     sold_price = round(to_money(sold_price), 2)
     fees = round(to_money(fees), 2)
@@ -183,9 +186,9 @@ def _show_sale_updates(
         "sale_notes": clean_text(sale_notes),
         "show_id": clean_text(selected_show.get("show_id")),
         "show_name": clean_text(selected_show.get("show_name")),
-        "sold_transaction_id": str(uuid.uuid4()),
-        "sold_created_at": now_iso(),
-        "sold_updated_at": now_iso(),
+        "sold_transaction_id": sold_transaction_id or str(uuid.uuid4()),
+        "sold_created_at": sold_timestamp or now_iso(),
+        "sold_updated_at": sold_timestamp or now_iso(),
     }
 
 
@@ -366,8 +369,8 @@ def _validate_bulk_sale_upload(
         else:
             current = matches.iloc[0]
             current_status = clean_text(current.get("inventory_status")).upper()
-            if current_status not in {STATUS_ACTIVE, STATUS_LISTED}:
-                validation.append(f"Current status is {current_status or 'blank'}, not ACTIVE/LISTED")
+            if current_status != STATUS_ACTIVE:
+                validation.append(f"Current status is {current_status or 'blank'}, not ACTIVE")
 
         if uploaded_show_id and selected_show_id and uploaded_show_id != selected_show_id:
             validation.append(
@@ -405,6 +408,401 @@ def _validate_bulk_sale_upload(
     return pd.DataFrame(results)
 
 
+def _is_card_show_sale(row: pd.Series) -> bool:
+    return "card show" in clean_text(row.get("sale_channel")).lower()
+
+
+def _show_match_mask(df: pd.DataFrame, show_id: str, show_name: str) -> pd.Series:
+    if df.empty:
+        return pd.Series(False, index=df.index)
+
+    ids = df.get("show_id", pd.Series("", index=df.index)).astype(str).str.strip()
+    names = df.get("show_name", pd.Series("", index=df.index)).astype(str).str.strip()
+
+    if show_id:
+        return ids.eq(show_id)
+    return names.str.lower().eq(show_name.lower())
+
+
+def _assign_recall_batches(show_sales: pd.DataFrame) -> pd.DataFrame:
+    """Assign exact batch IDs for new uploads and time clusters for legacy uploads."""
+    if show_sales.empty:
+        return show_sales.copy()
+
+    out = show_sales.copy()
+    out["__created_dt"] = pd.to_datetime(out.get("sold_created_at", ""), errors="coerce")
+    out["__sold_date"] = pd.to_datetime(out.get("sold_date", ""), errors="coerce").dt.date.astype(str)
+    out["__transaction_id"] = out.get(
+        "sold_transaction_id", pd.Series("", index=out.index)
+    ).astype(str).str.strip()
+    out["__recall_batch_key"] = ""
+
+    tx_counts = out.loc[out["__transaction_id"].ne(""), "__transaction_id"].value_counts()
+    shared_ids = set(tx_counts[tx_counts > 1].index.tolist())
+    explicit_batch_mask = (
+        out["__transaction_id"].isin(shared_ids)
+        | out["__transaction_id"].str.startswith("SHOWBULK-", na=False)
+    )
+
+    if explicit_batch_mask.any():
+        explicit_mask = explicit_batch_mask
+        out.loc[explicit_mask, "__recall_batch_key"] = (
+            "batch:" + out.loc[explicit_mask, "__transaction_id"]
+        )
+
+    # Older bulk uploads generated a different transaction ID for every row.
+    # Group those rows by sold date and creation time, starting a new batch when
+    # the gap between consecutive rows exceeds three minutes.
+    remaining = out[out["__recall_batch_key"].eq("")].copy()
+    legacy_number = 0
+
+    for sold_date, group in remaining.groupby("__sold_date", dropna=False):
+        group = group.sort_values(
+            ["__created_dt", "inventory_id"],
+            ascending=[True, True],
+            na_position="last",
+        )
+        previous_dt = None
+        current_key = ""
+
+        for idx, row in group.iterrows():
+            created_dt = row.get("__created_dt")
+            start_new = not current_key
+
+            if previous_dt is not None and pd.notna(created_dt):
+                gap_seconds = (created_dt - previous_dt).total_seconds()
+                if gap_seconds > 180:
+                    start_new = True
+            elif previous_dt is not None and pd.isna(created_dt):
+                start_new = True
+
+            if start_new:
+                legacy_number += 1
+                current_key = f"legacy:{sold_date}:{legacy_number}"
+
+            out.at[idx, "__recall_batch_key"] = current_key
+            if pd.notna(created_dt):
+                previous_dt = created_dt
+
+    return out
+
+
+def _recall_batch_summary(show_sales: pd.DataFrame) -> pd.DataFrame:
+    assigned = _assign_recall_batches(show_sales)
+    if assigned.empty:
+        return pd.DataFrame()
+
+    summary = (
+        assigned.groupby("__recall_batch_key", dropna=False)
+        .agg(
+            earliest_update=("__created_dt", "min"),
+            latest_update=("__created_dt", "max"),
+            sold_date=("__sold_date", "first"),
+            items=("inventory_id", "count"),
+            sales=("sold_price", lambda x: sum(to_money(v) for v in x)),
+            profit=("profit", lambda x: sum(to_money(v) for v in x)),
+        )
+        .reset_index()
+    )
+
+    summary["latest_sort"] = summary["latest_update"].fillna(summary["earliest_update"])
+    summary = summary.sort_values(
+        ["latest_sort", "sold_date"], ascending=[False, False], na_position="last"
+    )
+
+    def _label(row: pd.Series) -> str:
+        when = row.get("latest_update")
+        if pd.notna(when):
+            when_label = pd.Timestamp(when).strftime("%Y-%m-%d %I:%M:%S %p")
+        else:
+            when_label = clean_text(row.get("sold_date")) or "Unknown time"
+        return (
+            f"{when_label} — {int(row.get('items', 0)):,} item(s) — "
+            f"Sales {money_fmt(row.get('sales'))}"
+        )
+
+    summary["label"] = summary.apply(_label, axis=1)
+    return summary
+
+
+def _recall_inventory_updates() -> dict:
+    """Clear only fields created by a show sale and return inventory to ACTIVE."""
+    return {
+        "inventory_status": STATUS_ACTIVE,
+        "transaction_type": "",
+        "platform": "",
+        "sold_date": "",
+        "sold_price": "",
+        "fees": "",
+        "fees_total": "",
+        "shipping_charged": "",
+        "net_proceeds": "",
+        "profit": "",
+        "sale_channel": "",
+        "sale_notes": "",
+        "show_id": "",
+        "show_name": "",
+        "sold_transaction_id": "",
+        "sold_created_at": "",
+        "sold_updated_at": "",
+    }
+
+
+def _recall_show_sales(
+    inventory_ids: list[str],
+    selected_show_id: str,
+    selected_show_name: str,
+) -> tuple[int, list[str]]:
+    """Revalidate current rows, then restore eligible show sales to ACTIVE."""
+    current_inventory = _safe_df(load_data(force_refresh=True).inventory)
+    if current_inventory.empty:
+        return 0, inventory_ids
+
+    current_inventory["inventory_id"] = (
+        current_inventory["inventory_id"].astype(str).str.strip()
+    )
+    current_inventory["inventory_status"] = (
+        current_inventory["inventory_status"].astype(str).str.upper().str.strip()
+    )
+
+    requested_ids = {clean_text(x) for x in inventory_ids if clean_text(x)}
+    candidates = current_inventory[
+        current_inventory["inventory_id"].isin(requested_ids)
+        & current_inventory["inventory_status"].eq(STATUS_SOLD)
+        & current_inventory.apply(_is_card_show_sale, axis=1)
+        & _show_match_mask(current_inventory, selected_show_id, selected_show_name)
+    ].copy()
+
+    valid_ids = candidates["inventory_id"].astype(str).str.strip().tolist()
+    skipped_ids = sorted(requested_ids.difference(valid_ids))
+
+    updates_by_key = {
+        inv_id: _recall_inventory_updates()
+        for inv_id in valid_ids
+    }
+
+    changed = update_rows_by_key(
+        get_ws_name("inventory_worksheet", "inventory"),
+        INVENTORY_COLUMNS,
+        "inventory_id",
+        updates_by_key,
+    )
+    refresh_database_cache()
+    return changed, skipped_ids
+
+
+
+def _render_recall_workflow(
+    inventory: pd.DataFrame,
+    *,
+    key_prefix: str,
+    show_heading: bool = True,
+) -> None:
+    """Render the recall workflow with unique widget keys."""
+    if show_heading:
+        st.subheader("Recall / Undo Previous Show Upload")
+
+    st.caption(
+        "Select the show and the incorrect upload batch, preview the cards, "
+        "and return the selected inventory from SOLD to ACTIVE."
+    )
+    st.warning(
+        "Recalling a sale clears the show-sale date, price, fees, net proceeds, "
+        "profit, channel, show assignment, notes, and transaction fields. "
+        "Card details, cost, market value, and sticker price are preserved.",
+        icon="⚠️",
+    )
+
+    recall_candidates = inventory[
+        inventory["inventory_status"].eq(STATUS_SOLD)
+        & inventory.apply(_is_card_show_sale, axis=1)
+    ].copy()
+
+    if recall_candidates.empty:
+        st.info("No current Card Show sales are available to recall.")
+        return
+
+    recall_candidates["__show_key"] = recall_candidates.apply(
+        lambda row: clean_text(row.get("show_id"))
+        or f"name:{clean_text(row.get('show_name')).lower()}",
+        axis=1,
+    )
+
+    show_choices = (
+        recall_candidates[["__show_key", "show_id", "show_name"]]
+        .drop_duplicates("__show_key")
+        .copy()
+    )
+    show_choices["label"] = show_choices.apply(
+        lambda row: (
+            f"{clean_text(row.get('show_name')) or 'Unnamed show'}"
+            + (
+                f" — {clean_text(row.get('show_id'))}"
+                if clean_text(row.get("show_id"))
+                else ""
+            )
+        ),
+        axis=1,
+    )
+    show_choices = show_choices.sort_values("label").reset_index(drop=True)
+
+    cullman_matches = show_choices[
+        show_choices["show_name"]
+        .astype(str)
+        .str.lower()
+        .str.contains("cullman", na=False)
+    ]
+    default_show_index = int(cullman_matches.index[0]) if not cullman_matches.empty else 0
+
+    recall_show_label = st.selectbox(
+        "Show to recall",
+        show_choices["label"].tolist(),
+        index=default_show_index,
+        key=f"{key_prefix}_show_label",
+    )
+    recall_show_row = show_choices[
+        show_choices["label"].eq(recall_show_label)
+    ].iloc[0]
+    recall_show_id = clean_text(recall_show_row.get("show_id"))
+    recall_show_name = clean_text(recall_show_row.get("show_name"))
+
+    selected_show_sales = recall_candidates[
+        _show_match_mask(
+            recall_candidates,
+            recall_show_id,
+            recall_show_name,
+        )
+    ].copy()
+    assigned_sales = _assign_recall_batches(selected_show_sales)
+    batch_summary = _recall_batch_summary(selected_show_sales)
+
+    if assigned_sales.empty or batch_summary.empty:
+        st.info("No recallable sold inventory was found for this show.")
+        return
+
+    recall_batch_label = st.selectbox(
+        "Previous upload / sale batch",
+        batch_summary["label"].tolist(),
+        key=f"{key_prefix}_batch_label",
+        help=(
+            "New uploads use an exact shared batch ID. Older uploads are grouped "
+            "by sale date and the time the rows were updated."
+        ),
+    )
+    selected_batch = batch_summary[
+        batch_summary["label"].eq(recall_batch_label)
+    ].iloc[0]
+    recall_batch_key = clean_text(selected_batch.get("__recall_batch_key"))
+
+    batch_rows = assigned_sales[
+        assigned_sales["__recall_batch_key"].eq(recall_batch_key)
+    ].copy()
+    batch_rows = batch_rows.sort_values(
+        ["__created_dt", "card_name"],
+        ascending=[False, True],
+        na_position="last",
+    )
+    batch_rows.insert(0, "recall", True)
+
+    recall_cols = [
+        "recall",
+        "inventory_id",
+        "card_name",
+        "set_name",
+        "card_number",
+        "variant",
+        "grade",
+        "sold_date",
+        "sold_price",
+        "fees_total",
+        "net_proceeds",
+        "total_cost",
+        "profit",
+        "sold_created_at",
+    ]
+    recall_editor = st.data_editor(
+        batch_rows[[c for c in recall_cols if c in batch_rows.columns]],
+        use_container_width=True,
+        hide_index=True,
+        key=f"{key_prefix}_editor_{recall_batch_key}",
+        column_config={
+            "recall": st.column_config.CheckboxColumn("Recall", default=True),
+            "sold_price": st.column_config.NumberColumn(
+                "Sold price", format="$%.2f", disabled=True
+            ),
+            "fees_total": st.column_config.NumberColumn(
+                "Fees", format="$%.2f", disabled=True
+            ),
+            "net_proceeds": st.column_config.NumberColumn(
+                "Net", format="$%.2f", disabled=True
+            ),
+            "total_cost": st.column_config.NumberColumn(
+                "Cost", format="$%.2f", disabled=True
+            ),
+            "profit": st.column_config.NumberColumn(
+                "Profit", format="$%.2f", disabled=True
+            ),
+        },
+        disabled=[c for c in recall_cols if c != "recall"],
+    )
+
+    rows_to_recall = recall_editor[
+        recall_editor["recall"].fillna(False)
+    ].copy()
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Items selected", f"{len(rows_to_recall):,}")
+    r2.metric(
+        "Sales being removed",
+        money_fmt(rows_to_recall["sold_price"].apply(to_money).sum()),
+    )
+    r3.metric(
+        "Profit being removed",
+        money_fmt(rows_to_recall["profit"].apply(to_money).sum()),
+    )
+
+    confirm_recall = st.checkbox(
+        f"I confirm these {len(rows_to_recall):,} item(s) should return to ACTIVE.",
+        key=f"{key_prefix}_confirm_{recall_batch_key}",
+    )
+
+    if st.button(
+        f"Recall {len(rows_to_recall):,} selected sale(s)",
+        type="secondary",
+        use_container_width=True,
+        disabled=rows_to_recall.empty or not confirm_recall,
+        key=f"{key_prefix}_submit_{recall_batch_key}",
+    ):
+        recall_ids = (
+            rows_to_recall["inventory_id"]
+            .astype(str)
+            .str.strip()
+            .tolist()
+        )
+        changed, skipped_ids = _recall_show_sales(
+            recall_ids,
+            recall_show_id,
+            recall_show_name,
+        )
+
+        message = (
+            f"Recalled {changed:,} sale(s) from "
+            f"{recall_show_name or 'the selected show'}; inventory was returned "
+            "to ACTIVE and the show-sale fields were cleared."
+        )
+        if skipped_ids:
+            message += (
+                f" {len(skipped_ids):,} item(s) were skipped because their current "
+                "status or show assignment had changed: "
+                + ", ".join(skipped_ids[:10])
+            )
+            if len(skipped_ids) > 10:
+                message += ", ..."
+
+        st.session_state["show_recall_success"] = message
+        st.rerun()
+
+
 # =========================================================
 # Top actions / load
 # =========================================================
@@ -439,12 +837,16 @@ if not inv.empty:
 if "show_bulk_success" in st.session_state:
     st.success(st.session_state.pop("show_bulk_success"))
 
+if "show_recall_success" in st.session_state:
+    st.success(st.session_state.pop("show_recall_success"))
 
-tab_manage, tab_record, tab_bulk, tab_summary, tab_inventory = st.tabs(
+
+tab_manage, tab_record, tab_bulk, tab_recall, tab_summary, tab_inventory = st.tabs(
     [
         "Manage Shows",
         "Record Show Sale",
         "Bulk Show Sale Upload",
+        "Recall Show Upload",
         "Show Summary",
         "Show Inventory View",
     ]
@@ -540,12 +942,10 @@ with tab_record:
     elif inv.empty:
         st.info("No inventory loaded.")
     else:
-        ready = inv[
-            inv["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])
-        ].copy()
+        ready = inv[inv["inventory_status"].eq(STATUS_ACTIVE)].copy()
 
         if ready.empty:
-            st.info("No ACTIVE or LISTED inventory is available to sell.")
+            st.info("No ACTIVE inventory is available to sell.")
         else:
             shows_for_select = _date_sort(shows, "show_date", ascending=False).copy()
             shows_for_select["label"] = shows_for_select.apply(_show_label, axis=1)
@@ -730,17 +1130,25 @@ with tab_bulk:
         "Download a sale template, mark multiple inventory rows as sold, then upload it to update inventory, net proceeds, and profit in one step."
     )
 
+    st.markdown("### ↩️ Undo an incorrect upload")
+    with st.expander("Recall / undo a previous show upload", expanded=True):
+        _render_recall_workflow(
+            inv,
+            key_prefix="bulk_recall",
+            show_heading=False,
+        )
+
+    st.divider()
+
     if shows.empty:
         st.info("Add a show first before using the bulk sale upload.")
     elif inv.empty:
         st.info("No inventory loaded.")
     else:
-        bulk_ready = inv[
-            inv["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])
-        ].copy()
+        bulk_ready = inv[inv["inventory_status"].eq(STATUS_ACTIVE)].copy()
 
         if bulk_ready.empty:
-            st.info("No ACTIVE or LISTED inventory is available to sell.")
+            st.info("No ACTIVE inventory is available to sell.")
         else:
             bulk_shows = _date_sort(shows, "show_date", ascending=False).copy()
             bulk_shows["label"] = bulk_shows.apply(_show_label, axis=1)
@@ -778,7 +1186,7 @@ with tab_bulk:
 
             scope = st.radio(
                 "Inventory to include in the download",
-                ["All ACTIVE/LISTED inventory", "Show Inventory only"],
+                ["All ACTIVE inventory", "Show Inventory only"],
                 horizontal=True,
                 key="bulk_inventory_scope",
             )
@@ -916,6 +1324,8 @@ with tab_bulk:
                     ):
                         changed = 0
                         failed_ids: list[str] = []
+                        bulk_batch_id = f"SHOWBULK-{uuid.uuid4().hex[:12]}"
+                        bulk_batch_timestamp = now_iso()
 
                         for _, sale in valid_sales.iterrows():
                             inv_id = clean_text(sale.get("inventory_id"))
@@ -926,6 +1336,8 @@ with tab_bulk:
                                 fees=sale.get("fees"),
                                 total_cost=sale.get("total_cost"),
                                 sale_notes=sale.get("sale_notes"),
+                                sold_transaction_id=bulk_batch_id,
+                                sold_timestamp=bulk_batch_timestamp,
                             )
 
                             row_changed = mark_inventory_sold(inv_id, updates)
@@ -937,7 +1349,8 @@ with tab_bulk:
 
                         message = (
                             f"Bulk upload complete: {changed:,} inventory item(s) marked SOLD for "
-                            f"{clean_text(bulk_selected_show.get('show_name'))}."
+                            f"{clean_text(bulk_selected_show.get('show_name'))}. "
+                            f"Batch: {bulk_batch_id}."
                         )
                         if failed_ids:
                             message += (
@@ -949,6 +1362,23 @@ with tab_bulk:
 
                         st.session_state["show_bulk_success"] = message
                         st.rerun()
+
+            st.info(
+                "Need to undo an incorrect upload? Open the **Recall Show Upload** tab.",
+                icon="↩️",
+            )
+
+
+# =========================================================
+# Recall / Undo Previous Show Upload
+# =========================================================
+
+with tab_recall:
+    _render_recall_workflow(
+        inv,
+        key_prefix="recall_tab",
+        show_heading=True,
+    )
 
 
 # =========================================================
@@ -1088,7 +1518,7 @@ with tab_inventory:
     else:
         show_inv = inv[
             inv["inventory_type"].astype(str).str.lower().str.contains("show", na=False)
-            & inv["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])
+            & inv["inventory_status"].eq(STATUS_ACTIVE)
         ].copy()
 
         if show_inv.empty:
