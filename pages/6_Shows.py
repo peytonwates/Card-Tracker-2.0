@@ -27,12 +27,12 @@ from core.sheets import append_rows, get_ws_name
 st.set_page_config(page_title="Shows", layout="wide")
 st.title("Shows")
 st.caption(
-    "Reconcile a Collectr snapshot against ACTIVE, business-owned Pokémon card "
-    "inventory, then process new purchases and missing-card sales."
+    "Reconcile a Collectr snapshot against ACTIVE and LISTED business-owned Pokémon "
+    "card inventory, manually review matches, then process purchases and sales."
 )
 st.caption(
-    "Shows page build: 2026-07-20 · Collectr reconciliation matching v3 · "
-    "Reference-link scoring and full match audit"
+    "Shows page build: 2026-07-20 · Collectr reconciliation matching v4 · "
+    "Interactive one-to-one match review"
 )
 
 
@@ -165,9 +165,13 @@ MISSING_SALE_COLUMNS = [
     "sold_date",
     "sold_price",
     "fees",
+    "transaction_type",
+    "sale_channel",
+    "platform",
     "sale_notes",
     "show_id",
     "show_name",
+    "inventory_status",
     "set_name",
     "card_name",
     "card_number",
@@ -506,10 +510,11 @@ def _is_pokemon_inventory(row: pd.Series) -> bool:
 
 def _inventory_scope_reason(row: pd.Series) -> str:
     status = _status_value(row)
-    if status != _norm(STATUS_ACTIVE):
+    eligible_statuses = {_norm(STATUS_ACTIVE), "listed"}
+    if status not in eligible_statuses:
         if "grad" in status:
-            return "GRADING / not ACTIVE"
-        return "Not ACTIVE"
+            return "GRADING / excluded"
+        return "Not ACTIVE or LISTED"
 
     if _is_explicit_consignment(row):
         return "Consignment"
@@ -523,7 +528,7 @@ def _inventory_scope_reason(row: pd.Series) -> str:
     if not _is_pokemon_inventory(row):
         return "Sports / non-Pokémon"
 
-    return "Eligible ACTIVE owned Pokémon card"
+    return "Eligible ACTIVE/LISTED owned Pokémon card"
 
 
 def _prepare_inventory_scope(inventory: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -538,7 +543,7 @@ def _prepare_inventory_scope(inventory: pd.DataFrame) -> tuple[pd.DataFrame, pd.
     inv["__scope_reason"] = inv.apply(_inventory_scope_reason, axis=1)
 
     eligible = inv[
-        inv["__scope_reason"].eq("Eligible ACTIVE owned Pokémon card")
+        inv["__scope_reason"].eq("Eligible ACTIVE/LISTED owned Pokémon card")
     ].copy()
 
     summary = (
@@ -1141,7 +1146,7 @@ def _reconcile_collectr(
     eligible_inventory: pd.DataFrame,
     *,
     auto_match_threshold: float = AUTO_MATCH_THRESHOLD_DEFAULT,
-    duplicate_policy: str = "Keep newest ACTIVE",
+    duplicate_policy: str = "Keep newest eligible inventory",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     collectr_work = collectr.reset_index(drop=True).copy()
     inventory_work = eligible_inventory.reset_index(drop=True).copy()
@@ -1169,7 +1174,7 @@ def _reconcile_collectr(
             pairs_by_collectr[int(collectr_idx)].append(record)
             pairs_by_inventory[int(inventory_idx)].append(record)
 
-    keep_newest = duplicate_policy == "Keep newest ACTIVE"
+    keep_newest = duplicate_policy == "Keep newest eligible inventory"
     pair_records.sort(
         key=lambda record: (
             record["score"],
@@ -1321,6 +1326,379 @@ def _reconcile_collectr(
 
     return audit, matched, new_cards, missing_inventory
 
+
+
+# =========================================================
+# Interactive reconciliation review
+# =========================================================
+
+NO_INVENTORY_OPTION = "— NEW PURCHASE / NO INVENTORY MATCH —"
+NO_COLLECTR_OPTION = "— MISSING / ASSUMED SOLD —"
+
+
+def _grade_condition_display(row: pd.Series) -> str:
+    company = _text(row.get("grading_company"))
+    grade = _text(row.get("grade"))
+    condition = _text(row.get("condition"))
+    if company or grade:
+        return " ".join(part for part in [company, grade] if part).strip()
+    return condition or "Condition not entered"
+
+
+def _inventory_option_label(row: pd.Series) -> str:
+    inventory_id = _text(row.get("inventory_id"))
+    card_name = _text(row.get("card_name")) or "Unnamed card"
+    card_number = _text(row.get("card_number")) or _reference_parts(
+        row.get("reference_link")
+    ).get("number", "")
+    set_name = _text(row.get("set_name"))
+    status = _text(row.get("inventory_status"))
+    condition_or_grade = _grade_condition_display(row)
+    number_text = f"#{card_number}" if card_number else "#—"
+    return (
+        f"{inventory_id} | {card_name} | {number_text} | {set_name or 'Set not entered'} "
+        f"| {condition_or_grade} | {status} | Cost {money_fmt(row.get('total_cost'))}"
+    )
+
+
+def _collectr_option_label(row: pd.Series) -> str:
+    row_id = _text(row.get("collectr_row_id"))
+    card_name = _text(row.get("card_name")) or "Unnamed card"
+    card_number = _text(row.get("card_number"))
+    set_name = _text(row.get("set_name"))
+    condition_or_grade = _grade_condition_display(row)
+    number_text = f"#{card_number}" if card_number else "#—"
+    return (
+        f"{row_id} | {card_name} | {number_text} | {set_name or 'Set not entered'} "
+        f"| {condition_or_grade} | Value {money_fmt(row.get('market_value'))}"
+    )
+
+
+def _inventory_option_maps(
+    eligible_inventory: pd.DataFrame,
+) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    rows = eligible_inventory.copy()
+    if rows.empty:
+        return [NO_INVENTORY_OPTION], {}, {}
+    rows["__label"] = rows.apply(_inventory_option_label, axis=1)
+    rows = rows.sort_values(
+        [col for col in ["card_name", "set_name", "card_number", "inventory_id"] if col in rows.columns],
+        kind="stable",
+    )
+    label_to_id = {
+        _text(row.get("__label")): _text(row.get("inventory_id"))
+        for _, row in rows.iterrows()
+    }
+    id_to_label = {inventory_id: label for label, inventory_id in label_to_id.items()}
+    options = [NO_INVENTORY_OPTION] + list(label_to_id.keys())
+    return options, label_to_id, id_to_label
+
+
+def _collectr_option_maps(
+    collectr_cards: pd.DataFrame,
+) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    rows = collectr_cards.copy()
+    rows["__label"] = rows.apply(_collectr_option_label, axis=1)
+    rows = rows.sort_values(
+        [col for col in ["card_name", "set_name", "card_number", "collectr_row_id"] if col in rows.columns],
+        kind="stable",
+    )
+    label_to_id = {
+        _text(row.get("__label")): _text(row.get("collectr_row_id"))
+        for _, row in rows.iterrows()
+    }
+    id_to_label = {row_id: label for label, row_id in label_to_id.items()}
+    options = [NO_COLLECTR_OPTION] + list(label_to_id.keys())
+    return options, label_to_id, id_to_label
+
+
+def _initial_review_assignments(audit: pd.DataFrame) -> dict[str, str]:
+    assignments: dict[str, str] = {}
+    for _, row in audit.iterrows():
+        row_id = _text(row.get("collectr_row_id"))
+        inventory_id = (
+            _text(row.get("inventory_id"))
+            if _text(row.get("match_status")) == "MATCHED"
+            else ""
+        )
+        if row_id:
+            assignments[row_id] = inventory_id
+    return assignments
+
+
+def _assignment_state_key(
+    batch_id: str,
+    eligible_inventory: pd.DataFrame,
+    threshold: float,
+    duplicate_policy: str,
+) -> str:
+    fingerprint_source = "|".join(
+        sorted(
+            f"{_text(row.get('inventory_id'))}:{_text(row.get('inventory_status'))}:"
+            f"{_text(row.get('updated_at'))}"
+            for _, row in eligible_inventory.iterrows()
+        )
+    )
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:10]
+    policy = _compact(duplicate_policy)[:12]
+    return f"collectr_review_{batch_id}_{int(threshold)}_{policy}_{fingerprint}"
+
+
+def _set_review_assignment(
+    assignments: dict[str, str],
+    collectr_row_id: str,
+    inventory_id: str,
+) -> None:
+    """Set one-to-one assignment, automatically freeing a previously used inventory ID."""
+    collectr_row_id = _text(collectr_row_id)
+    inventory_id = _text(inventory_id)
+    if not collectr_row_id:
+        return
+
+    if inventory_id:
+        for other_row_id, other_inventory_id in list(assignments.items()):
+            if other_row_id != collectr_row_id and other_inventory_id == inventory_id:
+                assignments[other_row_id] = ""
+    assignments[collectr_row_id] = inventory_id
+
+
+def _best_collectr_for_inventory(
+    inventory_row: pd.Series,
+    collectr_cards: pd.DataFrame,
+    assignments: dict[str, str],
+) -> dict[str, Any]:
+    candidates: list[tuple[float, pd.Series, dict[str, Any]]] = []
+    for _, collectr_row in collectr_cards.iterrows():
+        scored = _score_candidate_pair(collectr_row, inventory_row)
+        if scored is not None:
+            candidates.append((float(scored["score"]), collectr_row, scored))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if not candidates:
+        return {
+            "best_collectr_row_id": "",
+            "best_collectr_card_name": "",
+            "best_collectr_card_number": "",
+            "best_collectr_set_name": "",
+            "best_possible_match_score": 0.0,
+            "best_possible_match_status": "No reliable Collectr candidate",
+        }
+
+    score, collectr_row, _ = candidates[0]
+    collectr_row_id = _text(collectr_row.get("collectr_row_id"))
+    assigned_inventory_id = _text(assignments.get(collectr_row_id))
+    if assigned_inventory_id:
+        status = f"Collectr row is currently assigned to {assigned_inventory_id}"
+    elif score >= AUTO_MATCH_THRESHOLD_DEFAULT:
+        status = "Strong unassigned candidate — review before marking sold"
+    elif score >= REVIEW_MATCH_THRESHOLD:
+        status = "Possible candidate — review before marking sold"
+    else:
+        status = "No reliable Collectr candidate"
+
+    return {
+        "best_collectr_row_id": collectr_row_id,
+        "best_collectr_card_name": _text(collectr_row.get("card_name")),
+        "best_collectr_card_number": _text(collectr_row.get("card_number")),
+        "best_collectr_set_name": _text(collectr_row.get("set_name")),
+        "best_possible_match_score": score,
+        "best_possible_match_status": status,
+    }
+
+
+def _build_reviewed_reconciliation(
+    collectr_cards: pd.DataFrame,
+    eligible_inventory: pd.DataFrame,
+    initial_audit: pd.DataFrame,
+    assignments: dict[str, str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, set[str]]:
+    inventory_by_id = {
+        _text(row.get("inventory_id")): row
+        for _, row in eligible_inventory.iterrows()
+        if _text(row.get("inventory_id"))
+    }
+    initial_by_collectr = {
+        _text(row.get("collectr_row_id")): row
+        for _, row in initial_audit.iterrows()
+        if _text(row.get("collectr_row_id"))
+    }
+
+    selected_values = [
+        _text(value)
+        for value in assignments.values()
+        if _text(value) and _text(value) in inventory_by_id
+    ]
+    duplicate_inventory_ids = {
+        value for value in selected_values if selected_values.count(value) > 1
+    }
+
+    review_rows: list[dict[str, Any]] = []
+    new_card_indexes: list[int] = []
+    for collectr_index, collectr_row in collectr_cards.iterrows():
+        collectr_row_id = _text(collectr_row.get("collectr_row_id"))
+        selected_inventory_id = _text(assignments.get(collectr_row_id))
+        if selected_inventory_id not in inventory_by_id:
+            selected_inventory_id = ""
+
+        initial = initial_by_collectr.get(collectr_row_id, pd.Series(dtype=object))
+        initial_auto_inventory_id = (
+            _text(initial.get("inventory_id"))
+            if _text(initial.get("match_status")) == "MATCHED"
+            else ""
+        )
+        suggested_inventory_id = _text(initial.get("inventory_id"))
+
+        inventory_row = inventory_by_id.get(selected_inventory_id)
+        scored = (
+            _score_candidate_pair(collectr_row, inventory_row)
+            if inventory_row is not None
+            else None
+        )
+        selected_score = float(scored.get("score", 0.0)) if scored else 0.0
+        selected_method = (
+            _text(scored.get("match_method"))
+            if scored
+            else ("Manual override; automatic score unavailable" if inventory_row is not None else "")
+        )
+
+        if selected_inventory_id in duplicate_inventory_ids:
+            review_status = "MATCH CONFLICT"
+        elif selected_inventory_id:
+            review_status = "MATCHED"
+        else:
+            review_status = "NEW IN COLLECTR"
+            new_card_indexes.append(collectr_index)
+
+        if selected_inventory_id and selected_inventory_id == initial_auto_inventory_id:
+            assignment_source = "AUTO"
+        elif selected_inventory_id:
+            assignment_source = "MANUAL"
+        else:
+            assignment_source = "UNMATCHED"
+
+        review_rows.append(
+            {
+                "review_status": review_status,
+                "assignment_source": assignment_source,
+                "collectr_row_id": collectr_row_id,
+                "collectr_source_row": collectr_row.get("source_row_number", ""),
+                "collectr_source_copy": collectr_row.get("source_copy_number", ""),
+                "collectr_set_name": _text(collectr_row.get("set_name")),
+                "collectr_card_name": _text(collectr_row.get("card_name")),
+                "collectr_card_number": _text(collectr_row.get("card_number")),
+                "collectr_rarity": _text(collectr_row.get("card_subtype")),
+                "collectr_variant": _text(collectr_row.get("variant")),
+                "collectr_condition": _text(collectr_row.get("condition")),
+                "collectr_grading_company": _text(collectr_row.get("grading_company")),
+                "collectr_grade": _text(collectr_row.get("grade")),
+                "collectr_market_value": to_money(collectr_row.get("market_value")),
+                "selected_inventory_id": selected_inventory_id,
+                "selected_match_score": selected_score,
+                "selected_match_method": selected_method,
+                "inventory_status": _text(inventory_row.get("inventory_status")) if inventory_row is not None else "",
+                "inventory_set_name": _text(inventory_row.get("set_name")) if inventory_row is not None else "",
+                "inventory_card_name": _text(inventory_row.get("card_name")) if inventory_row is not None else "",
+                "inventory_card_number": _text(inventory_row.get("card_number")) if inventory_row is not None else "",
+                "inventory_reference_link": _text(inventory_row.get("reference_link")) if inventory_row is not None else "",
+                "inventory_condition": _text(inventory_row.get("condition")) if inventory_row is not None else "",
+                "inventory_grading_company": _text(inventory_row.get("grading_company")) if inventory_row is not None else "",
+                "inventory_grade": _text(inventory_row.get("grade")) if inventory_row is not None else "",
+                "inventory_total_cost": to_money(inventory_row.get("total_cost")) if inventory_row is not None else "",
+                "initial_match_status": _text(initial.get("match_status")),
+                "initial_match_score": to_money(initial.get("match_score")),
+                "initial_suggested_inventory_id": suggested_inventory_id,
+            }
+        )
+
+    review_audit = pd.DataFrame(review_rows)
+    matched_review = review_audit[
+        review_audit["review_status"].eq("MATCHED")
+    ].copy()
+
+    new_cards = collectr_cards.loc[new_card_indexes].copy() if new_card_indexes else collectr_cards.iloc[0:0].copy()
+    if not new_cards.empty:
+        new_cards["suggested_inventory_id"] = new_cards["collectr_row_id"].map(
+            lambda row_id: _text(initial_by_collectr.get(_text(row_id), pd.Series(dtype=object)).get("inventory_id"))
+        )
+        new_cards["suggested_inventory_reference_link"] = new_cards["collectr_row_id"].map(
+            lambda row_id: _text(initial_by_collectr.get(_text(row_id), pd.Series(dtype=object)).get("inventory_reference_link"))
+        )
+        new_cards["suggested_match_score"] = new_cards["collectr_row_id"].map(
+            lambda row_id: to_money(initial_by_collectr.get(_text(row_id), pd.Series(dtype=object)).get("match_score"))
+        )
+        new_cards["suggested_match_status"] = new_cards["collectr_row_id"].map(
+            lambda row_id: _text(initial_by_collectr.get(_text(row_id), pd.Series(dtype=object)).get("match_status"))
+        )
+        new_cards["reference_link"] = ""
+        new_cards["year"] = ""
+
+    used_inventory_ids = {
+        _text(value)
+        for value in assignments.values()
+        if _text(value) and _text(value) in inventory_by_id
+    }
+    missing_inventory = eligible_inventory[
+        ~eligible_inventory["inventory_id"].astype(str).str.strip().isin(used_inventory_ids)
+    ].copy()
+    if not missing_inventory.empty:
+        enrichments = [
+            _best_collectr_for_inventory(row, collectr_cards, assignments)
+            for _, row in missing_inventory.iterrows()
+        ]
+        enrichment_df = pd.DataFrame(enrichments, index=missing_inventory.index)
+        for column in enrichment_df.columns:
+            missing_inventory[column] = enrichment_df[column]
+
+    return review_audit, matched_review, new_cards, missing_inventory, duplicate_inventory_ids
+
+
+def _collectr_editor_frame(
+    review_rows: pd.DataFrame,
+    assignments: dict[str, str],
+    id_to_inventory_label: dict[str, str],
+) -> pd.DataFrame:
+    if review_rows.empty:
+        return pd.DataFrame()
+    out = review_rows.copy()
+    out["inventory_match"] = out["collectr_row_id"].map(
+        lambda row_id: id_to_inventory_label.get(
+            _text(assignments.get(_text(row_id))), NO_INVENTORY_OPTION
+        )
+    )
+    columns = [
+        "collectr_row_id",
+        "collectr_set_name",
+        "collectr_card_name",
+        "collectr_card_number",
+        "collectr_condition",
+        "collectr_grading_company",
+        "collectr_grade",
+        "collectr_market_value",
+        "inventory_match",
+        "selected_match_score",
+        "assignment_source",
+        "initial_match_status",
+        "initial_match_score",
+    ]
+    return out[[column for column in columns if column in out.columns]].copy()
+
+
+def _apply_collectr_editor_changes(
+    edited: pd.DataFrame,
+    assignments: dict[str, str],
+    inventory_label_to_id: dict[str, str],
+) -> bool:
+    changed = False
+    for _, row in edited.iterrows():
+        collectr_row_id = _text(row.get("collectr_row_id"))
+        selected_label = _text(row.get("inventory_match"))
+        selected_inventory_id = inventory_label_to_id.get(selected_label, "")
+        if selected_label == NO_INVENTORY_OPTION:
+            selected_inventory_id = ""
+        if _text(assignments.get(collectr_row_id)) != selected_inventory_id:
+            _set_review_assignment(assignments, collectr_row_id, selected_inventory_id)
+            changed = True
+    return changed
+
 def _build_new_purchase_form(
     new_cards: pd.DataFrame,
     selected_show: pd.Series,
@@ -1385,6 +1763,9 @@ def _build_missing_sales_form(
     form["sold_date"] = show_date
     form["sold_price"] = ""
     form["fees"] = 0.0
+    form["transaction_type"] = "Card Show"
+    form["sale_channel"] = "Card Show"
+    form["platform"] = ""
     form["sale_notes"] = ""
     form["show_id"] = _text(selected_show.get("show_id"))
     form["show_name"] = _text(selected_show.get("show_name"))
@@ -1574,7 +1955,7 @@ def _validate_sales_upload(
             errors.append("inventory_id not found")
         else:
             scope_reason = _inventory_scope_reason(current_row)
-            if scope_reason != "Eligible ACTIVE owned Pokémon card":
+            if scope_reason != "Eligible ACTIVE/LISTED owned Pokémon card":
                 errors.append(f"Not eligible: {scope_reason}")
 
         if inventory_id in duplicate_upload_ids:
@@ -1618,9 +1999,9 @@ with top_left:
         st.rerun()
 with top_right:
     st.info(
-        "Comparison scope is locked to ACTIVE, business-owned Pokémon single cards. "
-        "Consignment, personal inventory, sports/non-Pokémon cards, sealed products, "
-        "GRADING, LISTED, and SOLD records are not considered missing.",
+        "Comparison scope includes ACTIVE and LISTED business-owned Pokémon single "
+        "cards. Consignment, personal inventory, sports/non-Pokémon cards, sealed "
+        "products, GRADING, and SOLD records are excluded.",
         icon="ℹ️",
     )
 
@@ -1729,16 +2110,17 @@ with tab_manage:
 with tab_reconcile:
     st.subheader("Reconcile Current Collectr Inventory")
     st.write(
-        "Upload the Collectr export that represents the cards you physically have "
-        "right now. The app compares that snapshot only with eligible ACTIVE Pokémon "
-        "business inventory."
+        "Upload the Collectr export that represents the Pokémon cards you physically "
+        "have now. The initial matcher compares it with eligible ACTIVE and LISTED "
+        "business inventory, then you can correct every assignment before downloading "
+        "purchase and sales forms."
     )
 
     st.markdown("### Inventory scope")
     scope_cols = st.columns(4)
     scope_cols[0].metric("All inventory rows", f"{len(inv):,}")
     scope_cols[1].metric(
-        "Compared ACTIVE Pokémon cards", f"{len(eligible_inventory):,}"
+        "Compared ACTIVE/LISTED Pokémon cards", f"{len(eligible_inventory):,}"
     )
     grading_count = (
         _series(inv, "inventory_status")
@@ -1748,12 +2130,9 @@ with tab_reconcile:
         .sum()
     )
     scope_cols[2].metric("GRADING ignored", f"{int(grading_count):,}")
-    excluded_active = int(
+    excluded_owned = int(
         scope_summary.loc[
-            ~scope_summary["scope_reason"].eq(
-                "Eligible ACTIVE owned Pokémon card"
-            )
-            & scope_summary["scope_reason"].isin(
+            scope_summary["scope_reason"].isin(
                 [
                     "Consignment",
                     "Personal inventory",
@@ -1764,13 +2143,13 @@ with tab_reconcile:
             "count",
         ].sum()
     )
-    scope_cols[3].metric("Other excluded ACTIVE rows", f"{excluded_active:,}")
+    scope_cols[3].metric("Other excluded rows", f"{excluded_owned:,}")
 
     with st.expander("See exactly what is excluded", expanded=False):
         st.dataframe(scope_summary, use_container_width=True, hide_index=True)
         st.caption(
-            "A record must be ACTIVE, Pokémon, non-consignment, non-personal, and a "
-            "single card to participate in the comparison."
+            "A record must be ACTIVE or LISTED, Pokémon, non-consignment, "
+            "non-personal, and a single card to participate in reconciliation."
         )
 
     selected_show = _selected_show(shows, "reconcile_show")
@@ -1784,17 +2163,17 @@ with tab_reconcile:
             value=int(AUTO_MATCH_THRESHOLD_DEFAULT),
             step=1,
             help=(
-                "Scores at or above this threshold are matched one-to-one. Lower "
-                "suggestions remain visible in the audit but are treated as unmatched."
+                "The script initially assigns scores at or above this threshold. "
+                "You can override any result in the review dropdowns."
             ),
         )
     with option_cols[1]:
         duplicate_policy = st.selectbox(
             "When duplicate copies are identical",
-            ["Keep newest ACTIVE", "Keep oldest ACTIVE"],
+            ["Keep newest eligible inventory", "Keep oldest eligible inventory"],
             help=(
-                "Keep newest ACTIVE assumes older inventory copies were sold first. "
-                "Keep oldest ACTIVE does the reverse."
+                "This only determines the initial automatic assignment. Your manual "
+                "review can select the exact inventory ID afterward."
             ),
         )
 
@@ -1815,11 +2194,43 @@ with tab_reconcile:
                     "Check the Category column and confirm the export contains cards."
                 )
             else:
-                audit, matched, new_cards, missing_inventory = _reconcile_collectr(
+                initial_audit, _, _, _ = _reconcile_collectr(
                     collectr_cards,
                     eligible_inventory,
                     auto_match_threshold=float(auto_match_threshold),
                     duplicate_policy=duplicate_policy,
+                )
+
+                review_state_key = _assignment_state_key(
+                    batch_id,
+                    eligible_inventory,
+                    float(auto_match_threshold),
+                    duplicate_policy,
+                )
+                if review_state_key not in st.session_state:
+                    st.session_state[review_state_key] = _initial_review_assignments(
+                        initial_audit
+                    )
+                assignments: dict[str, str] = st.session_state[review_state_key]
+
+                inventory_options, inventory_label_to_id, inventory_id_to_label = (
+                    _inventory_option_maps(eligible_inventory)
+                )
+                collectr_options, collectr_label_to_id, collectr_id_to_label = (
+                    _collectr_option_maps(collectr_cards)
+                )
+
+                (
+                    reviewed_audit,
+                    matched_review,
+                    new_cards,
+                    missing_inventory,
+                    duplicate_inventory_ids,
+                ) = _build_reviewed_reconciliation(
+                    collectr_cards,
+                    eligible_inventory,
+                    initial_audit,
+                    assignments,
                 )
 
                 new_form = _build_new_purchase_form(
@@ -1830,17 +2241,27 @@ with tab_reconcile:
                 )
 
                 st.success(
-                    f"Reconciliation complete. Batch ID: {batch_id}", icon="✅"
+                    f"Initial matching complete. Review batch: {batch_id}", icon="✅"
                 )
 
-                review_count = int(
-                    audit["match_status"].isin(
-                        [
-                            "REVIEW SUGGESTION",
-                            "UNMATCHED COPY - INVENTORY MATCH ALREADY USED",
-                        ]
-                    ).sum()
-                )
+                controls = st.columns([1, 3])
+                with controls[0]:
+                    if st.button(
+                        "Reset to script matches",
+                        key=f"reset_{review_state_key}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[review_state_key] = _initial_review_assignments(
+                            initial_audit
+                        )
+                        st.rerun()
+                with controls[1]:
+                    st.info(
+                        "Changing a dropdown to an inventory ID automatically frees that "
+                        "ID from any other Collectr row, preserving one-to-one matching. "
+                        "Choose the NEW PURCHASE option to remove a match.",
+                        icon="ℹ️",
+                    )
 
                 metrics = st.columns(7)
                 metrics[0].metric(
@@ -1849,38 +2270,37 @@ with tab_reconcile:
                 metrics[1].metric(
                     "Collectr card copies", f"{collectr_stats['individual_cards']:,}"
                 )
-                metrics[2].metric("Matched", f"{len(matched):,}")
-                metrics[3].metric("Review suggestions", f"{review_count:,}")
-                metrics[4].metric("Possible new buys", f"{len(new_cards):,}")
+                metrics[2].metric("Reviewed matches", f"{len(matched_review):,}")
+                metrics[3].metric("New purchases", f"{len(new_cards):,}")
+                metrics[4].metric("Missing / possible sales", f"{len(missing_inventory):,}")
                 metrics[5].metric(
-                    "ACTIVE cards missing", f"{len(missing_inventory):,}"
+                    "Manual overrides",
+                    f"{int(reviewed_audit['assignment_source'].eq('MANUAL').sum()):,}",
                 )
                 metrics[6].metric(
                     "Upload rows ignored",
                     f"{collectr_stats['non_pokemon_rows_ignored'] + collectr_stats.get('sealed_rows_ignored', 0):,}",
                 )
 
-                st.info(
-                    "Matching now uses card-name variants, the numerator of Collectr "
-                    "card numbers, set aliases, grade, condition, and information derived "
-                    "from each inventory PriceCharting reference link. Matching is "
-                    "one-to-one, so quantities and duplicate copies are respected.",
-                    icon="ℹ️",
-                )
-                st.warning(
-                    "Review the full match audit before processing either difference "
-                    "form. Missing means absent from this Collectr snapshot—not "
-                    "automatically sold. Consignment, personal, sports/non-Pokémon, "
-                    "sealed, and GRADING inventory were excluded before comparison.",
-                    icon="⚠️",
-                )
+                if duplicate_inventory_ids:
+                    st.error(
+                        "One or more inventory IDs are assigned more than once: "
+                        + ", ".join(sorted(duplicate_inventory_ids))
+                        + ". Correct these before downloading forms."
+                    )
 
+                reviewed_audit_download = reviewed_audit.copy()
+                reviewed_audit_download["selected_inventory_label"] = (
+                    reviewed_audit_download["selected_inventory_id"].map(
+                        inventory_id_to_label
+                    )
+                )
                 st.download_button(
-                    "Download full match audit CSV",
-                    data=_csv_download_data(audit),
+                    "Download reviewed match audit CSV",
+                    data=_csv_download_data(reviewed_audit_download),
                     file_name=(
                         f"{_compact(selected_show.get('show_name')) or 'show'}_"
-                        f"{batch_id}_match_audit.csv"
+                        f"{batch_id}_reviewed_match_audit.csv"
                     ),
                     mime="text/csv",
                     use_container_width=True,
@@ -1888,109 +2308,131 @@ with tab_reconcile:
 
                 result_tabs = st.tabs(
                     [
-                        f"Full Match Audit ({len(audit):,})",
-                        f"Matched ({len(matched):,})",
+                        f"Full Review ({len(reviewed_audit):,})",
+                        f"Matched ({len(matched_review):,})",
                         f"New in Collectr ({len(new_cards):,})",
                         f"Missing from Collectr ({len(missing_inventory):,})",
                     ]
                 )
 
+                editor_config = {
+                    "inventory_match": st.column_config.SelectboxColumn(
+                        "Matching inventory",
+                        options=inventory_options,
+                        required=True,
+                        width="large",
+                        help=(
+                            "Inventory ID | card name | card number | set | "
+                            "condition or graded company/grade | status | total cost"
+                        ),
+                    ),
+                    "collectr_market_value": st.column_config.NumberColumn(
+                        "Collectr value", format="$%.2f"
+                    ),
+                    "selected_match_score": st.column_config.NumberColumn(
+                        "Current match score", format="%.1f"
+                    ),
+                    "initial_match_score": st.column_config.NumberColumn(
+                        "Initial score", format="%.1f"
+                    ),
+                }
+
                 with result_tabs[0]:
                     st.caption(
-                        "One row per physical Collectr copy. Inventory fields are prefixed "
-                        "with inventory_. Rows not automatically matched still show the "
-                        "best suggestion and its score when one exists."
+                        "All Collectr copies in standard format with the current inventory "
+                        "assignment. You can make corrections here or in the Matched/New tabs."
+                    )
+                    full_editor = _collectr_editor_frame(
+                        reviewed_audit, assignments, inventory_id_to_label
                     )
                     st.dataframe(
-                        audit,
+                        full_editor,
                         use_container_width=True,
                         hide_index=True,
-                        column_config={
-                            "match_score": st.column_config.NumberColumn(
-                                "Match score", format="%.1f"
-                            ),
-                            "inventory_reference_link": st.column_config.LinkColumn(
-                                "Inventory reference link"
-                            ),
-                            "collectr_market_value": st.column_config.NumberColumn(
-                                "Collectr market value", format="$%.2f"
-                            ),
-                            "inventory_total_cost": st.column_config.NumberColumn(
-                                "Inventory total cost", format="$%.2f"
-                            ),
-                            "inventory_market_value": st.column_config.NumberColumn(
-                                "Inventory market value", format="$%.2f"
-                            ),
-                            "inventory_sticker_price": st.column_config.NumberColumn(
-                                "Inventory sticker price", format="$%.2f"
-                            ),
-                        },
+                        column_config=editor_config,
+                    )
+                    st.caption(
+                        "Use the Matched, New in Collectr, or Missing from Collectr tabs "
+                        "to change assignments. This full view is a consolidated audit."
                     )
 
                 with result_tabs[1]:
-                    if matched.empty:
-                        st.info("No automatic matches met the selected score threshold.")
+                    if matched_review.empty:
+                        st.info("No Collectr rows are currently assigned to inventory.")
                     else:
-                        st.dataframe(
-                            matched,
+                        st.caption(
+                            "Review each automatic or manual match. Change the dropdown to "
+                            "the correct inventory ID, or choose NEW PURCHASE to unmatch it."
+                        )
+                        matched_editor = _collectr_editor_frame(
+                            matched_review, assignments, inventory_id_to_label
+                        )
+                        matched_row_hash = hashlib.sha256(
+                            "|".join(
+                                matched_editor["collectr_row_id"].astype(str).tolist()
+                            ).encode("utf-8")
+                        ).hexdigest()[:8]
+                        edited_matched = st.data_editor(
+                            matched_editor,
                             use_container_width=True,
                             hide_index=True,
-                            column_config={
-                                "match_score": st.column_config.NumberColumn(
-                                    "Match score", format="%.1f"
-                                ),
-                                "inventory_reference_link": st.column_config.LinkColumn(
-                                    "Inventory reference link"
-                                ),
-                            },
+                            key=f"matched_editor_{review_state_key}_{matched_row_hash}",
+                            column_config=editor_config,
+                            disabled=[
+                                column
+                                for column in matched_editor.columns
+                                if column != "inventory_match"
+                            ],
                         )
+                        if _apply_collectr_editor_changes(
+                            edited_matched, assignments, inventory_label_to_id
+                        ):
+                            st.session_state[review_state_key] = assignments
+                            st.rerun()
 
                 with result_tabs[2]:
                     if new_cards.empty:
                         st.success(
-                            "Every Collectr card matched an eligible ACTIVE inventory row."
+                            "Every Collectr card is currently assigned to an eligible "
+                            "ACTIVE/LISTED inventory record."
                         )
                     else:
-                        new_display_cols = [
-                            "collectr_row_id",
-                            "set_name",
-                            "card_name",
-                            "card_number",
-                            "card_subtype",
-                            "variant",
-                            "grading_company",
-                            "grade",
-                            "condition",
-                            "market_value",
-                            "suggested_inventory_id",
-                            "suggested_inventory_reference_link",
-                            "suggested_match_score",
-                            "suggested_match_status",
-                        ]
-                        st.dataframe(
-                            new_cards[
-                                [
-                                    col
-                                    for col in new_display_cols
-                                    if col in new_cards.columns
-                                ]
-                            ],
+                        st.caption(
+                            "These Collectr rows are currently treated as new purchases. "
+                            "Use the Matching inventory dropdown when one is already in your "
+                            "database. Leave NEW PURCHASE selected only for genuinely new cards."
+                        )
+                        new_review_rows = reviewed_audit[
+                            reviewed_audit["review_status"].eq("NEW IN COLLECTR")
+                        ].copy()
+                        new_editor = _collectr_editor_frame(
+                            new_review_rows, assignments, inventory_id_to_label
+                        )
+                        new_row_hash = hashlib.sha256(
+                            "|".join(
+                                new_editor["collectr_row_id"].astype(str).tolist()
+                            ).encode("utf-8")
+                        ).hexdigest()[:8]
+                        edited_new = st.data_editor(
+                            new_editor,
                             use_container_width=True,
                             hide_index=True,
-                            column_config={
-                                "suggested_inventory_reference_link": st.column_config.LinkColumn(
-                                    "Suggested inventory reference"
-                                ),
-                                "suggested_match_score": st.column_config.NumberColumn(
-                                    "Suggested score", format="%.1f"
-                                ),
-                                "market_value": st.column_config.NumberColumn(
-                                    "Market value", format="$%.2f"
-                                ),
-                            },
+                            key=f"new_editor_{review_state_key}_{new_row_hash}",
+                            column_config=editor_config,
+                            disabled=[
+                                column
+                                for column in new_editor.columns
+                                if column != "inventory_match"
+                            ],
                         )
+                        if _apply_collectr_editor_changes(
+                            edited_new, assignments, inventory_label_to_id
+                        ):
+                            st.session_state[review_state_key] = assignments
+                            st.rerun()
+
                         st.download_button(
-                            "Download new-purchase form",
+                            "Download reviewed new-purchase form",
                             data=_csv_download_data(new_form),
                             file_name=(
                                 f"{_compact(selected_show.get('show_name')) or 'show'}_"
@@ -1998,69 +2440,121 @@ with tab_reconcile:
                             ),
                             mime="text/csv",
                             use_container_width=True,
+                            disabled=bool(duplicate_inventory_ids),
                         )
                         st.caption(
-                            "Fill in purchase price and source. Before adding a row, check "
-                            "its suggested match columns. Change process_row to NO for "
-                            "anything that should not be added."
+                            "Fill in purchase_date, purchased_from, purchase_price, shipping, "
+                            "tax, grading_fee, reference_link, sticker_price, and notes as "
+                            "needed. Reupload the completed file under Add New Inventory."
                         )
 
                 with result_tabs[3]:
                     if missing_inventory.empty:
                         st.success(
-                            "No eligible ACTIVE Pokémon cards are missing from Collectr."
+                            "Every eligible ACTIVE/LISTED inventory record is currently "
+                            "assigned to a Collectr card."
                         )
                     else:
-                        missing_display_cols = [
-                            "inventory_id",
-                            "set_name",
-                            "card_name",
-                            "card_number",
+                        st.caption(
+                            "Each row below is an inventory record not currently assigned to "
+                            "Collectr. The inventory record column contains ID, name, number, "
+                            "condition/grade, status, and cost. To correct a false missing item, "
+                            "select the Collectr card it should match. That Collectr card will be "
+                            "moved from its previous assignment automatically."
+                        )
+                        missing_editor = missing_inventory.copy()
+                        missing_editor["inventory_record"] = missing_editor.apply(
+                            _inventory_option_label, axis=1
+                        )
+                        missing_editor["collectr_match"] = NO_COLLECTR_OPTION
+                        missing_columns = [
+                            "inventory_record",
                             "reference_link",
-                            "variant",
-                            "grading_company",
-                            "grade",
-                            "condition",
-                            "total_cost",
-                            "market_value",
-                            "sticker_price",
-                            "best_collectr_row_id",
                             "best_collectr_card_name",
                             "best_collectr_card_number",
                             "best_collectr_set_name",
                             "best_possible_match_score",
                             "best_possible_match_status",
+                            "collectr_match",
                         ]
-                        st.dataframe(
-                            missing_inventory[
-                                [
-                                    col
-                                    for col in missing_display_cols
-                                    if col in missing_inventory.columns
-                                ]
-                            ],
+                        missing_editor = missing_editor[
+                            [column for column in missing_columns if column in missing_editor.columns]
+                        ].copy()
+                        missing_key_hash = hashlib.sha256(
+                            "|".join(
+                                sorted(missing_inventory["inventory_id"].astype(str).tolist())
+                            ).encode("utf-8")
+                        ).hexdigest()[:8]
+                        edited_missing = st.data_editor(
+                            missing_editor,
                             use_container_width=True,
                             hide_index=True,
+                            key=f"missing_editor_{review_state_key}_{missing_key_hash}",
                             column_config={
                                 "reference_link": st.column_config.LinkColumn(
                                     "Inventory reference link"
                                 ),
                                 "best_possible_match_score": st.column_config.NumberColumn(
-                                    "Best possible score", format="%.1f"
+                                    "Best script score", format="%.1f"
                                 ),
-                                "total_cost": st.column_config.NumberColumn(
-                                    "Total cost", format="$%.2f"
-                                ),
-                                "market_value": st.column_config.NumberColumn(
-                                    "Market value", format="$%.2f"
-                                ),
-                                "sticker_price": st.column_config.NumberColumn(
-                                    "Sticker price", format="$%.2f"
+                                "collectr_match": st.column_config.SelectboxColumn(
+                                    "Match to Collectr item",
+                                    options=collectr_options,
+                                    required=True,
+                                    width="large",
                                 ),
                             },
+                            disabled=[
+                                column
+                                for column in missing_editor.columns
+                                if column != "collectr_match"
+                            ],
                         )
+
+                        selected_collectr_rows = edited_missing[
+                            edited_missing["collectr_match"].astype(str).ne(
+                                NO_COLLECTR_OPTION
+                            )
+                        ].copy()
+                        if not selected_collectr_rows.empty:
+                            duplicate_collectr_labels = selected_collectr_rows.loc[
+                                selected_collectr_rows["collectr_match"].duplicated(
+                                    keep=False
+                                ),
+                                "collectr_match",
+                            ].tolist()
+                            if duplicate_collectr_labels:
+                                st.error(
+                                    "The same Collectr row was selected for more than one "
+                                    "missing inventory record. Choose only one inventory record "
+                                    "for each Collectr copy."
+                                )
+                            else:
+                                missing_label_to_id = {
+                                    _inventory_option_label(row): _text(
+                                        row.get("inventory_id")
+                                    )
+                                    for _, row in missing_inventory.iterrows()
+                                }
+                                changed = False
+                                for _, row in selected_collectr_rows.iterrows():
+                                    inventory_id = missing_label_to_id.get(
+                                        _text(row.get("inventory_record")), ""
+                                    )
+                                    collectr_row_id = collectr_label_to_id.get(
+                                        _text(row.get("collectr_match")), ""
+                                    )
+                                    if inventory_id and collectr_row_id:
+                                        _set_review_assignment(
+                                            assignments, collectr_row_id, inventory_id
+                                        )
+                                        changed = True
+                                if changed:
+                                    st.session_state[review_state_key] = assignments
+                                    st.rerun()
+
                         st.download_button(
-                            "Download missing-card sales form",
+                            "Download reviewed missing-card sales form",
                             data=_csv_download_data(sales_form),
                             file_name=(
                                 f"{_compact(selected_show.get('show_name')) or 'show'}_"
@@ -2068,11 +2562,13 @@ with tab_reconcile:
                             ),
                             mime="text/csv",
                             use_container_width=True,
+                            disabled=bool(duplicate_inventory_ids),
                         )
                         st.caption(
-                            "Fill in sold price. Review any best_possible_match_score before "
-                            "marking a card sold. Change process_row to NO for any card that "
-                            "was not sold."
+                            "Fill in sold_date, sold_price, fees, transaction_type, "
+                            "sale_channel, platform, show information, and sale_notes. Set "
+                            "process_row to NO for anything that was not sold. Reupload the "
+                            "completed file under Update Missing Sales."
                         )
 
         except Exception as exc:
@@ -2227,7 +2723,7 @@ with tab_sales:
     st.subheader("Update Missing Cards as Show Sales")
     st.write(
         "Upload the completed missing-card sales form. Only rows still qualifying "
-        "as ACTIVE, business-owned Pokémon single cards can be marked SOLD."
+        "as ACTIVE or LISTED business-owned Pokémon single cards can be marked SOLD."
     )
     st.warning(
         "Set process_row to NO for anything that is still owned, was omitted from "
@@ -2334,7 +2830,7 @@ with tab_sales:
                 totals[3].metric("Profit", money_fmt(preview["profit"].sum()))
 
                 confirm_sales = st.checkbox(
-                    f"I confirm that I want to mark {len(valid_sales):,} ACTIVE "
+                    f"I confirm that I want to mark {len(valid_sales):,} ACTIVE/LISTED "
                     "inventory record(s) SOLD.",
                     key="confirm_reconciled_sales",
                 )
@@ -2399,8 +2895,8 @@ with tab_sales:
                             ).date()
 
                             updates = {
-                                "transaction_type": "Card Show",
-                                "platform": "",
+                                "transaction_type": _text(row.get("transaction_type")) or "Card Show",
+                                "platform": _text(row.get("platform")),
                                 "sold_date": str(sold_date_value),
                                 "sold_price": sold_price,
                                 "fees": fees,
@@ -2408,7 +2904,7 @@ with tab_sales:
                                 "shipping_charged": 0,
                                 "net_proceeds": net,
                                 "profit": profit,
-                                "sale_channel": "Card Show",
+                                "sale_channel": _text(row.get("sale_channel")) or "Card Show",
                                 "sale_notes": _text(row.get("sale_notes")),
                                 "show_id": _text(row.get("show_id")),
                                 "show_name": _text(row.get("show_name")),
