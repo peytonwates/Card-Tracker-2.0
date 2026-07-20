@@ -31,8 +31,8 @@ st.caption(
     "card inventory, manually review matches, then process purchases and sales."
 )
 st.caption(
-    "Shows page build: 2026-07-20 · Collectr reconciliation matching v4 · "
-    "Interactive one-to-one match review"
+    "Shows page build: 2026-07-20 · Collectr reconciliation matching v5 · "
+    "Whole-word sealed detection and interactive one-to-one match review"
 )
 
 
@@ -493,7 +493,10 @@ def _is_sealed_or_non_card(row: pd.Series) -> bool:
         "collection box",
         "tin",
     }
-    return any(term in product_text for term in sealed_terms)
+    return any(
+        _contains_whole_term(product_text, term)
+        for term in sealed_terms
+    )
 
 
 def _is_pokemon_inventory(row: pd.Series) -> bool:
@@ -598,13 +601,37 @@ def _parse_collectr_grade(value: Any) -> tuple[str, str]:
     return "", text
 
 
+def _contains_whole_term(value: Any, term: str) -> bool:
+    """
+    Match a normalized word or phrase without treating a partial card-name
+    substring as a product type.
+
+    Example:
+      - "Pokemon Tin" matches the sealed term "tin".
+      - "Tinkatink" does NOT match the sealed term "tin".
+    """
+    normalized_value = _norm(value)
+    normalized_term = _norm(term)
+    if not normalized_value or not normalized_term:
+        return False
+
+    pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])"
+    return re.search(pattern, normalized_value) is not None
+
+
 def _collectr_is_sealed_or_non_card(row: pd.Series) -> bool:
     product_name = _norm(row.get("card_name"))
     rarity = _norm(row.get("rarity"))
-    if any(term in product_name for term in SEALED_COLLECTR_TERMS):
+
+    if any(
+        _contains_whole_term(product_name, term)
+        for term in SEALED_COLLECTR_TERMS
+    ):
         return True
-    if "sealed" in rarity:
+
+    if _contains_whole_term(rarity, "sealed"):
         return True
+
     return False
 
 
