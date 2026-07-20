@@ -3,6 +3,7 @@ from __future__ import annotations
 # new version
 import base64
 import math
+import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
@@ -58,86 +59,214 @@ def _first_secret_value(source, keys: list[str], default: str = "") -> str:
     return default
 
 
-def get_ebay_secrets():
-    try:
-        ebay_section = _safe_secret_get(st.secrets, "ebay", None)
+def _first_value_from_sources(
+    sources: list[tuple[str, object]],
+    keys: list[str],
+    default: str = "",
+) -> tuple[str, str]:
+    """
+    Return the first nonblank value found across Streamlit secret sections,
+    top-level secrets, or environment variables. The returned source label
+    is safe to display because it never contains the secret value.
+    """
+    for source_label, source in sources:
+        value = _first_secret_value(source, keys, default="")
+        if value:
+            return value, source_label
 
-        if ebay_section is not None:
-            source = ebay_section
-            source_label = "[ebay]"
-            client_id_keys = ["client_id", "CLIENT_ID", "app_id", "APP_ID", "EBAY_CLIENT_ID", "EBAY_APP_ID"]
-            client_secret_keys = ["client_secret", "CLIENT_SECRET", "cert_id", "CERT_ID", "EBAY_CLIENT_SECRET", "EBAY_CERT_ID"]
-            ru_name_keys = ["ru_name", "RU_NAME", "runame", "RUNAME", "EBAY_RU_NAME", "EBAY_RUNAME"]
-            scopes_keys = ["scopes", "scope", "SCOPES", "SCOPE", "EBAY_SCOPES", "EBAY_SCOPE"]
-            refresh_token_keys = ["refresh_token", "REFRESH_TOKEN", "EBAY_REFRESH_TOKEN"]
-            environment_keys = ["environment", "ENVIRONMENT", "EBAY_ENVIRONMENT"]
-            marketplace_keys = ["marketplace_id", "MARKETPLACE_ID", "EBAY_MARKETPLACE_ID"]
-        else:
-            source = st.secrets
-            source_label = "top-level secrets"
-            client_id_keys = ["EBAY_CLIENT_ID", "ebay_client_id", "EBAY_APP_ID", "ebay_app_id", "app_id", "APP_ID", "client_id"]
-            client_secret_keys = ["EBAY_CLIENT_SECRET", "ebay_client_secret", "EBAY_CERT_ID", "ebay_cert_id", "cert_id", "CERT_ID", "client_secret"]
-            ru_name_keys = ["EBAY_RU_NAME", "EBAY_RUNAME", "ebay_ru_name", "ebay_runame", "ru_name", "runame", "RUNAME"]
-            scopes_keys = ["EBAY_SCOPES", "EBAY_SCOPE", "ebay_scopes", "ebay_scope", "scopes", "scope"]
-            refresh_token_keys = ["EBAY_REFRESH_TOKEN", "ebay_refresh_token", "refresh_token"]
-            environment_keys = ["EBAY_ENVIRONMENT", "ebay_environment", "environment"]
-            marketplace_keys = ["EBAY_MARKETPLACE_ID", "ebay_marketplace_id", "marketplace_id"]
+    return default, ""
 
-        config = {
-            "source_label": source_label,
-            "environment": _first_secret_value(source, environment_keys, default="production"),
-            "marketplace_id": _first_secret_value(source, marketplace_keys, default="EBAY_US"),
-            "client_id": _first_secret_value(source, client_id_keys),
-            "client_secret": _first_secret_value(source, client_secret_keys),
-            "ru_name": _first_secret_value(source, ru_name_keys),
-            "scopes": _first_secret_value(source, scopes_keys),
-            "refresh_token": _first_secret_value(source, refresh_token_keys),
-        }
 
-        missing = [
-            field
-            for field in ["client_id", "client_secret", "ru_name", "scopes", "refresh_token"]
-            if not clean_text(config.get(field))
-        ]
-
-        if missing:
-            st.error(f"Could not load required eBay secret fields: {', '.join(missing)}")
-
-            with st.expander("eBay secrets debug - key names only", expanded=True):
-                st.write(f"Secrets source checked: `{source_label}`")
-
-                try:
-                    if ebay_section is not None:
-                        st.write("Keys found under `[ebay]`:")
-                        st.code("\n".join(list(ebay_section.keys())))
-                    else:
-                        st.write("No `[ebay]` section found. Top-level keys found:")
-                        st.code("\n".join(list(st.secrets.keys())))
-                except Exception as exc:
-                    st.write(f"Could not list secret keys: {exc}")
-
-                st.write("Expected format:")
-                st.code(
-                    """
+def _ebay_expected_secrets_toml() -> str:
+    return """
 [ebay]
 environment = "production"
 marketplace_id = "EBAY_US"
 client_id = "..."
 client_secret = "..."
-ru_name = "..."
+ru_name = "..."  # Optional for this page once a refresh token already exists.
 scopes = "..."
 refresh_token = "..."
-""".strip(),
-                    language="toml",
+""".strip()
+
+
+def get_ebay_secrets():
+    """
+    Load eBay settings without blocking the inventory-pricing portion of the page.
+
+    Supported locations, in priority order:
+    1. [ebay], [EBAY], or [eBay] section in Streamlit secrets
+    2. Top-level Streamlit secrets
+    3. Environment variables such as EBAY_CLIENT_ID
+
+    ru_name is intentionally optional here. It is needed when initially creating
+    the OAuth authorization flow, but it is not required to exchange an existing
+    refresh token for an access token.
+    """
+    try:
+        sources: list[tuple[str, object]] = []
+        ebay_section = None
+        ebay_section_name = ""
+
+        for section_name in ("ebay", "EBAY", "eBay"):
+            possible_section = _safe_secret_get(st.secrets, section_name, None)
+            if possible_section is not None:
+                ebay_section = possible_section
+                ebay_section_name = f"[{section_name}]"
+                sources.append((ebay_section_name, possible_section))
+                break
+
+        # Always check top-level secrets as a fallback, even when a section exists.
+        sources.append(("top-level Streamlit secrets", st.secrets))
+        sources.append(("environment variables", os.environ))
+
+        aliases = {
+            "environment": [
+                "environment",
+                "ENVIRONMENT",
+                "EBAY_ENVIRONMENT",
+                "ebay_environment",
+            ],
+            "marketplace_id": [
+                "marketplace_id",
+                "MARKETPLACE_ID",
+                "EBAY_MARKETPLACE_ID",
+                "ebay_marketplace_id",
+            ],
+            "client_id": [
+                "client_id",
+                "CLIENT_ID",
+                "app_id",
+                "APP_ID",
+                "EBAY_CLIENT_ID",
+                "ebay_client_id",
+                "EBAY_APP_ID",
+                "ebay_app_id",
+            ],
+            "client_secret": [
+                "client_secret",
+                "CLIENT_SECRET",
+                "cert_id",
+                "CERT_ID",
+                "EBAY_CLIENT_SECRET",
+                "ebay_client_secret",
+                "EBAY_CERT_ID",
+                "ebay_cert_id",
+            ],
+            "ru_name": [
+                "ru_name",
+                "RU_NAME",
+                "runame",
+                "RUNAME",
+                "EBAY_RU_NAME",
+                "EBAY_RUNAME",
+                "ebay_ru_name",
+                "ebay_runame",
+            ],
+            "scopes": [
+                "scopes",
+                "scope",
+                "SCOPES",
+                "SCOPE",
+                "EBAY_SCOPES",
+                "EBAY_SCOPE",
+                "ebay_scopes",
+                "ebay_scope",
+            ],
+            "refresh_token": [
+                "refresh_token",
+                "REFRESH_TOKEN",
+                "EBAY_REFRESH_TOKEN",
+                "ebay_refresh_token",
+            ],
+        }
+
+        config: dict[str, str] = {}
+        source_by_field: dict[str, str] = {}
+
+        defaults = {
+            "environment": "production",
+            "marketplace_id": "EBAY_US",
+        }
+
+        for field, keys in aliases.items():
+            value, source_label = _first_value_from_sources(
+                sources=sources,
+                keys=keys,
+                default=defaults.get(field, ""),
+            )
+            config[field] = value
+            if source_label:
+                source_by_field[field] = source_label
+
+        config["source_label"] = ", ".join(
+            sorted(set(source_by_field.values()))
+        ) or "not found"
+        config["source_by_field"] = source_by_field
+
+        required_fields = [
+            "client_id",
+            "client_secret",
+            "scopes",
+            "refresh_token",
+        ]
+        missing = [
+            field
+            for field in required_fields
+            if not clean_text(config.get(field))
+        ]
+
+        if missing:
+            st.warning(
+                "eBay API credentials are not configured, so listing pulls and "
+                "sold-order sync are disabled. The Active Inventory Pricing tab "
+                "still works because it only uses your inventory database."
+            )
+
+            with st.expander("Fix eBay connection settings", expanded=True):
+                st.write(
+                    "Missing required fields: "
+                    + ", ".join(f"`{field}`" for field in missing)
+                )
+
+                if ebay_section is None:
+                    st.write("No `[ebay]` section was found in Streamlit secrets.")
+                else:
+                    st.write(f"eBay section found: `{ebay_section_name}`")
+
+                try:
+                    top_level_keys = list(st.secrets.keys())
+                except Exception:
+                    top_level_keys = []
+
+                if top_level_keys:
+                    st.write("Top-level secret key names currently found:")
+                    st.code("\n".join(top_level_keys))
+                else:
+                    st.write("No readable top-level Streamlit secret keys were found.")
+
+                st.write(
+                    "Add the following section in Streamlit Cloud under "
+                    "**App settings → Secrets**, or in `.streamlit/secrets.toml` locally:"
+                )
+                st.code(_ebay_expected_secrets_toml(), language="toml")
+                st.caption(
+                    "The code also accepts top-level EBAY_* keys and operating-system "
+                    "environment variables. Secret values are never displayed here."
                 )
 
             return None
 
         return config
 
-    except Exception as e:
-        st.error("Could not load eBay secrets from Streamlit secrets.")
-        st.exception(e)
+    except Exception as exc:
+        st.warning(
+            "The eBay connection settings could not be read. API controls are "
+            "disabled, but inventory pricing remains available."
+        )
+        with st.expander("eBay settings read error", expanded=False):
+            st.write(str(exc))
+            st.code(_ebay_expected_secrets_toml(), language="toml")
         return None
 
 
@@ -169,6 +298,13 @@ def get_access_token_from_refresh_token(ebay_config):
 
 
 def get_access_token_or_stop(ebay_config):
+    if not ebay_config:
+        st.error(
+            "eBay API credentials are not configured. Add the [ebay] secrets "
+            "shown near the top of this page before using pull or sync actions."
+        )
+        st.stop()
+
     with st.spinner("Getting eBay access token..."):
         token_status, token_payload = get_access_token_from_refresh_token(ebay_config)
 
@@ -767,7 +903,7 @@ def _assigned_listing_estimate_cols() -> list[str]:
     ]
 
 
-def _unlisted_inventory_pricing_cols() -> list[str]:
+def _active_inventory_pricing_cols() -> list[str]:
     return [
         "inventory_id",
         "inventory_status",
@@ -781,6 +917,12 @@ def _unlisted_inventory_pricing_cols() -> list[str]:
         "grade",
         "total_cost",
         "market_value",
+        "sticker_price",
+        "break_even_price",
+        "price_for_5pct_profit",
+        "price_for_10pct_profit",
+        "price_for_20pct_profit",
+        "price_for_30pct_profit",
         "market_est_profit_loss",
         "market_est_margin_pct",
         "market_value_over_20pct_price",
@@ -790,24 +932,29 @@ def _unlisted_inventory_pricing_cols() -> list[str]:
         "market_est_label",
         "market_shipping_option",
         "market_opportunity_tier",
-        "sticker_price",
-        "break_even_price",
         "break_even_shipping_option",
         "break_even_est_label",
         "break_even_est_ebay_fees",
         "break_even_est_net",
-        "price_for_10pct_profit",
+        "five_pct_shipping_option",
+        "five_pct_est_label",
+        "five_pct_est_ebay_fees",
+        "five_pct_est_net",
         "ten_pct_shipping_option",
         "ten_pct_est_label",
         "ten_pct_est_ebay_fees",
         "ten_pct_est_net",
-        "price_for_20pct_profit",
         "twenty_pct_shipping_option",
         "twenty_pct_est_label",
         "twenty_pct_est_ebay_fees",
         "twenty_pct_est_net",
+        "thirty_pct_shipping_option",
+        "thirty_pct_est_label",
+        "thirty_pct_est_ebay_fees",
+        "thirty_pct_est_net",
         "reference_link",
     ]
+
 
 
 def _style_alpha_from_ratio(ratio: float, min_alpha: float = 0.15, max_alpha: float = 0.80) -> float:
@@ -859,21 +1006,21 @@ def _style_profit_margin_rows(
     return [f"background-color: rgba(76, 175, 80, {alpha}); color: #111111;" for _ in row.index]
 
 
-def _is_unlisted_inventory_row(row: pd.Series) -> bool:
-    status = clean_text(row.get("inventory_status")).upper()
+def _is_active_inventory_pricing_row(row: pd.Series) -> bool:
+    """
+    Pricing scope is intentionally based only on current inventory status.
 
-    if status != STATUS_ACTIVE:
-        return False
-
-    ebay_item_id = clean_text(row.get("ebay_item_id"))
-    ebay_listing_id = clean_text(row.get("ebay_listing_id"))
-    ebay_order_id = clean_text(row.get("ebay_order_id"))
-    sold_date = clean_text(row.get("sold_date"))
-
-    return not any([ebay_item_id, ebay_listing_id, ebay_order_id, sold_date])
+    Every row currently marked ACTIVE is included, even if a stale eBay ID or
+    old list/sold field remains on the record. This makes the table a true
+    pre-listing view of all ACTIVE inventory.
+    """
+    return clean_text(row.get("inventory_status")).upper() == STATUS_ACTIVE
 
 
-def _build_unlisted_inventory_pricing_df(inv: pd.DataFrame, assumptions: dict) -> pd.DataFrame:
+def _build_active_inventory_pricing_df(
+    inv: pd.DataFrame,
+    assumptions: dict,
+) -> pd.DataFrame:
     if inv.empty:
         return pd.DataFrame()
 
@@ -894,16 +1041,14 @@ def _build_unlisted_inventory_pricing_df(inv: pd.DataFrame, assumptions: dict) -
             "market_value",
             "sticker_price",
             "reference_link",
-            "ebay_item_id",
-            "ebay_listing_id",
-            "ebay_order_id",
-            "sold_date",
         ],
     ).copy()
 
     working["inventory_id"] = working["inventory_id"].astype(str).str.strip()
     working = working[working["inventory_id"].ne("")].copy()
-    working = working[working.apply(_is_unlisted_inventory_row, axis=1)].copy()
+    working = working[
+        working.apply(_is_active_inventory_pricing_row, axis=1)
+    ].copy()
 
     if working.empty:
         return pd.DataFrame()
@@ -914,40 +1059,29 @@ def _build_unlisted_inventory_pricing_df(inv: pd.DataFrame, assumptions: dict) -
         total_cost = _round_money(item.get("total_cost"))
         market_value = _round_money(item.get("market_value"))
 
-        breakeven_price = _estimate_listing_math(
-            list_price=0.0,
-            total_cost=total_cost,
-            assumptions=assumptions,
-            target_profit_pct=0.0,
-        )["required_price"]
-        ten_pct_price = _estimate_listing_math(
-            list_price=0.0,
-            total_cost=total_cost,
-            assumptions=assumptions,
-            target_profit_pct=0.10,
-        )["required_price"]
-        twenty_pct_price = _estimate_listing_math(
-            list_price=0.0,
-            total_cost=total_cost,
-            assumptions=assumptions,
-            target_profit_pct=0.20,
-        )["required_price"]
+        target_prices = {}
+        target_math = {}
 
-        breakeven_math = _estimate_listing_at_price(
-            list_price=breakeven_price,
-            total_cost=total_cost,
-            assumptions=assumptions,
-        )
-        ten_pct_math = _estimate_listing_at_price(
-            list_price=ten_pct_price,
-            total_cost=total_cost,
-            assumptions=assumptions,
-        )
-        twenty_pct_math = _estimate_listing_at_price(
-            list_price=twenty_pct_price,
-            total_cost=total_cost,
-            assumptions=assumptions,
-        )
+        for label, target_pct in [
+            ("break_even", 0.00),
+            ("five_pct", 0.05),
+            ("ten_pct", 0.10),
+            ("twenty_pct", 0.20),
+            ("thirty_pct", 0.30),
+        ]:
+            required_price = _estimate_listing_math(
+                list_price=0.0,
+                total_cost=total_cost,
+                assumptions=assumptions,
+                target_profit_pct=target_pct,
+            )["required_price"]
+
+            target_prices[label] = required_price
+            target_math[label] = _estimate_listing_at_price(
+                list_price=required_price,
+                total_cost=total_cost,
+                assumptions=assumptions,
+            )
 
         if market_value > 0:
             market_math = _estimate_listing_at_price(
@@ -955,13 +1089,27 @@ def _build_unlisted_inventory_pricing_df(inv: pd.DataFrame, assumptions: dict) -
                 total_cost=total_cost,
                 assumptions=assumptions,
             )
-            market_est_profit_loss = _round_money(market_math.get("estimated_profit_loss"))
-            market_est_net = _round_money(market_math.get("estimated_net_proceeds"))
-            market_est_ebay_fees = _round_money(market_math.get("estimated_ebay_fees"))
-            market_est_label = _round_money(market_math.get("estimated_label_cost"))
-            market_shipping_option = clean_text(market_math.get("shipping_option"))
-            market_value_over_10pct_price = _round_money(market_value - ten_pct_price)
-            market_value_over_20pct_price = _round_money(market_value - twenty_pct_price)
+            market_est_profit_loss = _round_money(
+                market_math.get("estimated_profit_loss")
+            )
+            market_est_net = _round_money(
+                market_math.get("estimated_net_proceeds")
+            )
+            market_est_ebay_fees = _round_money(
+                market_math.get("estimated_ebay_fees")
+            )
+            market_est_label = _round_money(
+                market_math.get("estimated_label_cost")
+            )
+            market_shipping_option = clean_text(
+                market_math.get("shipping_option")
+            )
+            market_value_over_10pct_price = _round_money(
+                market_value - target_prices["ten_pct"]
+            )
+            market_value_over_20pct_price = _round_money(
+                market_value - target_prices["twenty_pct"]
+            )
         else:
             market_est_profit_loss = None
             market_est_net = None
@@ -972,7 +1120,10 @@ def _build_unlisted_inventory_pricing_df(inv: pd.DataFrame, assumptions: dict) -
             market_value_over_20pct_price = None
 
         if total_cost > 0 and market_est_profit_loss is not None:
-            market_est_margin_pct = round((market_est_profit_loss / total_cost) * 100, 2)
+            market_est_margin_pct = round(
+                (market_est_profit_loss / total_cost) * 100,
+                2,
+            )
         else:
             market_est_margin_pct = None
 
@@ -986,57 +1137,60 @@ def _build_unlisted_inventory_pricing_df(inv: pd.DataFrame, assumptions: dict) -
             market_opportunity_tier = "0-10% at market"
         elif market_est_margin_pct < 20:
             market_opportunity_tier = "10-20% at market"
+        elif market_est_margin_pct < 30:
+            market_opportunity_tier = "20-30% at market"
         else:
-            market_opportunity_tier = "20%+ at market"
+            market_opportunity_tier = "30%+ at market"
 
-        rows.append(
-            {
-                "inventory_id": clean_text(item.get("inventory_id")),
-                "inventory_status": clean_text(item.get("inventory_status")),
-                "product_type": clean_text(item.get("product_type")),
-                "inventory_type": clean_text(item.get("inventory_type")),
-                "set_name": clean_text(item.get("set_name")),
-                "card_name": clean_text(item.get("card_name")),
-                "card_number": clean_text(item.get("card_number")),
-                "variant": clean_text(item.get("variant")),
-                "grading_company": clean_text(item.get("grading_company")),
-                "grade": clean_text(item.get("grade")),
-                "total_cost": total_cost,
-                "market_value": market_value,
-                "market_est_profit_loss": market_est_profit_loss,
-                "market_est_margin_pct": market_est_margin_pct,
-                "market_value_over_20pct_price": market_value_over_20pct_price,
-                "market_value_over_10pct_price": market_value_over_10pct_price,
-                "market_est_net": market_est_net,
-                "market_est_ebay_fees": market_est_ebay_fees,
-                "market_est_label": market_est_label,
-                "market_shipping_option": market_shipping_option,
-                "market_opportunity_tier": market_opportunity_tier,
-                "sticker_price": _round_money(item.get("sticker_price")),
-                "break_even_price": breakeven_price,
-                "break_even_shipping_option": breakeven_math["shipping_option"],
-                "break_even_est_label": breakeven_math["estimated_label_cost"],
-                "break_even_est_ebay_fees": breakeven_math["estimated_ebay_fees"],
-                "break_even_est_net": breakeven_math["estimated_net_proceeds"],
-                "price_for_10pct_profit": ten_pct_price,
-                "ten_pct_shipping_option": ten_pct_math["shipping_option"],
-                "ten_pct_est_label": ten_pct_math["estimated_label_cost"],
-                "ten_pct_est_ebay_fees": ten_pct_math["estimated_ebay_fees"],
-                "ten_pct_est_net": ten_pct_math["estimated_net_proceeds"],
-                "price_for_20pct_profit": twenty_pct_price,
-                "twenty_pct_shipping_option": twenty_pct_math["shipping_option"],
-                "twenty_pct_est_label": twenty_pct_math["estimated_label_cost"],
-                "twenty_pct_est_ebay_fees": twenty_pct_math["estimated_ebay_fees"],
-                "twenty_pct_est_net": twenty_pct_math["estimated_net_proceeds"],
-                "reference_link": clean_text(item.get("reference_link")),
-            }
-        )
+        row = {
+            "inventory_id": clean_text(item.get("inventory_id")),
+            "inventory_status": clean_text(item.get("inventory_status")),
+            "product_type": clean_text(item.get("product_type")),
+            "inventory_type": clean_text(item.get("inventory_type")),
+            "set_name": clean_text(item.get("set_name")),
+            "card_name": clean_text(item.get("card_name")),
+            "card_number": clean_text(item.get("card_number")),
+            "variant": clean_text(item.get("variant")),
+            "grading_company": clean_text(item.get("grading_company")),
+            "grade": clean_text(item.get("grade")),
+            "total_cost": total_cost,
+            "market_value": market_value,
+            "sticker_price": _round_money(item.get("sticker_price")),
+            "break_even_price": target_prices["break_even"],
+            "price_for_5pct_profit": target_prices["five_pct"],
+            "price_for_10pct_profit": target_prices["ten_pct"],
+            "price_for_20pct_profit": target_prices["twenty_pct"],
+            "price_for_30pct_profit": target_prices["thirty_pct"],
+            "market_est_profit_loss": market_est_profit_loss,
+            "market_est_margin_pct": market_est_margin_pct,
+            "market_value_over_20pct_price": market_value_over_20pct_price,
+            "market_value_over_10pct_price": market_value_over_10pct_price,
+            "market_est_net": market_est_net,
+            "market_est_ebay_fees": market_est_ebay_fees,
+            "market_est_label": market_est_label,
+            "market_shipping_option": market_shipping_option,
+            "market_opportunity_tier": market_opportunity_tier,
+            "reference_link": clean_text(item.get("reference_link")),
+        }
+
+        for label, math_values in target_math.items():
+            row[f"{label}_shipping_option"] = math_values["shipping_option"]
+            row[f"{label}_est_label"] = math_values["estimated_label_cost"]
+            row[f"{label}_est_ebay_fees"] = math_values["estimated_ebay_fees"]
+            row[f"{label}_est_net"] = math_values["estimated_net_proceeds"]
+
+        rows.append(row)
 
     out = pd.DataFrame(rows)
 
     if not out.empty:
         out = out.sort_values(
-            ["market_est_margin_pct", "market_est_profit_loss", "market_value", "card_name"],
+            [
+                "market_est_margin_pct",
+                "market_est_profit_loss",
+                "market_value",
+                "card_name",
+            ],
             ascending=[False, False, False, True],
             na_position="last",
         ).reset_index(drop=True)
@@ -2233,9 +2387,7 @@ def _display_order_cols() -> list[str]:
 # =========================================================
 
 ebay_config = get_ebay_secrets()
-
-if not ebay_config:
-    st.stop()
+ebay_ready = bool(ebay_config)
 
 data = load_data()
 inv = _safe_df(data.inventory)
@@ -2302,10 +2454,31 @@ with top2:
         st.success("Cleared eBay page cache.")
 
 with top3:
-    sync_now = st.button("Sync eBay sales now", type="primary", use_container_width=True)
+    sync_now = st.button(
+        "Sync eBay sales now",
+        type="primary",
+        use_container_width=True,
+        disabled=not ebay_ready,
+        help=(
+            "Configure eBay secrets first."
+            if not ebay_ready
+            else "Pull recent eBay orders and sync matched sales."
+        ),
+    )
 
 with top4:
-    st.info("Workflow: pull active listings → review assignments → sync sold eBay orders with fees.", icon="ℹ️")
+    if ebay_ready:
+        st.info(
+            "Workflow: price ACTIVE inventory → pull listings → review assignments "
+            "→ sync sold eBay orders with fees.",
+            icon="ℹ️",
+        )
+    else:
+        st.info(
+            "Inventory pricing is available now. eBay pull and sync controls will "
+            "unlock after the [ebay] secrets are added.",
+            icon="ℹ️",
+        )
 
 if sync_now:
     access_token = get_access_token_or_stop(ebay_config)
@@ -2341,17 +2514,31 @@ if sync_now:
     st.rerun()
 
 with st.expander("eBay config check", expanded=False):
-    st.write(
-        {
-            "secrets_source": ebay_config.get("source_label", "unknown"),
-            "environment": ebay_config["environment"],
-            "marketplace_id": ebay_config["marketplace_id"],
-            "client_id_prefix": ebay_config["client_id"][:12] + "...",
-            "ru_name": ebay_config["ru_name"],
-            "refresh_token_loaded": bool(ebay_config.get("refresh_token")),
-            "scopes": ebay_config["scopes"],
-        }
-    )
+    if ebay_ready:
+        st.write(
+            {
+                "connection_ready": True,
+                "secrets_source": ebay_config.get("source_label", "unknown"),
+                "environment": ebay_config.get("environment", "production"),
+                "marketplace_id": ebay_config.get("marketplace_id", "EBAY_US"),
+                "client_id_prefix": clean_text(
+                    ebay_config.get("client_id")
+                )[:12] + "...",
+                "ru_name": ebay_config.get("ru_name", ""),
+                "refresh_token_loaded": bool(
+                    ebay_config.get("refresh_token")
+                ),
+                "scopes_loaded": bool(ebay_config.get("scopes")),
+            }
+        )
+    else:
+        st.write({"connection_ready": False})
+        st.info(
+            "Pricing does not require eBay credentials. Add the [ebay] secrets "
+            "shown above to enable listing pulls and sold-order sync."
+        )
+        st.code(_ebay_expected_secrets_toml(), language="toml")
+
 
 
 duplicate_inventory_id_rows = _duplicate_inventory_id_rows(inv)
@@ -2409,14 +2596,425 @@ if not duplicate_ebay_assignments.empty:
             st.rerun()
 
 
-tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
+tab_pricing, tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
     [
-        "1. Pull Active Listings",
-        "2. Assign Listings",
-        "3. Sold Order Sync",
+        "1. Active Inventory Pricing",
+        "2. Pull Active Listings",
+        "3. Assign Listings",
+        "4. Sold Order Sync",
         "Audit / Raw Data",
     ]
 )
+
+
+
+# =========================================================
+# Tab 1: Active Inventory Pricing
+# =========================================================
+
+with tab_pricing:
+    st.subheader("ACTIVE Inventory eBay Pricing Targets")
+    st.caption(
+        "This table uses every inventory row currently marked ACTIVE. It does "
+        "not require an eBay connection and is designed for pricing cards before "
+        "you create the listing."
+    )
+
+    estimator_assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
+
+    with st.expander("Pricing assumptions", expanded=False):
+        st.write(
+            {
+                "Shipping rule": (
+                    "List price over $20.00 = USPS Ground Advantage; "
+                    "$20.00 and under = eBay Standard Envelope"
+                ),
+                "Standard Envelope label": money_fmt(
+                    estimator_assumptions["standard_envelope_shipping"]
+                ),
+                "Ground Advantage label": money_fmt(
+                    estimator_assumptions["ground_advantage_shipping"]
+                ),
+                "Estimated buyer tax": (
+                    f'{estimator_assumptions["estimated_buyer_tax_pct"]:.2f}%'
+                ),
+                "eBay variable fee": (
+                    f'{estimator_assumptions["fee_rate_pct"]:.2f}% of item + '
+                    "shipping + estimated buyer tax"
+                ),
+                "Fixed order fee": (
+                    "Below $10.00 = $0.30; $10.00 and above = $0.40"
+                ),
+                "Profit percentages": (
+                    "Profit divided by the inventory row's total cost"
+                ),
+            }
+        )
+
+    active_pricing = _build_active_inventory_pricing_df(
+        inv=inv,
+        assumptions=estimator_assumptions,
+    )
+
+    if active_pricing.empty:
+        st.info("No inventory rows are currently marked ACTIVE.")
+    else:
+        f1, f2, f3, f4, f5 = st.columns([1, 1, 1, 1, 1.5])
+
+        with f1:
+            product_options = sorted(
+                active_pricing["product_type"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            selected_products = st.multiselect(
+                "Product type",
+                product_options,
+                key="active_pricing_product_type",
+            )
+
+        with f2:
+            inventory_type_options = sorted(
+                active_pricing["inventory_type"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            selected_inventory_types = st.multiselect(
+                "Inventory type",
+                inventory_type_options,
+                key="active_pricing_inventory_type",
+            )
+
+        with f3:
+            set_options = sorted(
+                active_pricing["set_name"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            selected_sets = st.multiselect(
+                "Set",
+                set_options,
+                key="active_pricing_set",
+            )
+
+        with f4:
+            opportunity_options = sorted(
+                active_pricing["market_opportunity_tier"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            selected_opportunities = st.multiselect(
+                "Market opportunity",
+                opportunity_options,
+                key="active_pricing_opportunity",
+            )
+
+        with f5:
+            active_search = st.text_input(
+                "Search ID, card, set, number, grade",
+                key="active_pricing_search",
+            )
+
+        active_display = active_pricing.copy()
+
+        if selected_products:
+            active_display = active_display[
+                active_display["product_type"].isin(selected_products)
+            ].copy()
+
+        if selected_inventory_types:
+            active_display = active_display[
+                active_display["inventory_type"].isin(
+                    selected_inventory_types
+                )
+            ].copy()
+
+        if selected_sets:
+            active_display = active_display[
+                active_display["set_name"].isin(selected_sets)
+            ].copy()
+
+        if selected_opportunities:
+            active_display = active_display[
+                active_display["market_opportunity_tier"].isin(
+                    selected_opportunities
+                )
+            ].copy()
+
+        if active_search.strip():
+            query = active_search.lower().strip()
+
+            def _active_pricing_match(row: pd.Series) -> bool:
+                values = [
+                    row.get("inventory_id", ""),
+                    row.get("card_name", ""),
+                    row.get("card_number", ""),
+                    row.get("set_name", ""),
+                    row.get("variant", ""),
+                    row.get("grading_company", ""),
+                    row.get("grade", ""),
+                ]
+                return query in " ".join(
+                    str(value).lower() for value in values
+                )
+
+            active_display = active_display[
+                active_display.apply(_active_pricing_match, axis=1)
+            ].copy()
+
+        sort_options = {
+            "Best margin at market price": (
+                ["market_est_margin_pct", "market_est_profit_loss", "market_value"],
+                [False, False, False],
+            ),
+            "Best dollar profit at market price": (
+                ["market_est_profit_loss", "market_est_margin_pct", "market_value"],
+                [False, False, False],
+            ),
+            "Highest market value": (
+                ["market_value", "market_est_profit_loss"],
+                [False, False],
+            ),
+            "Highest total cost": (
+                ["total_cost", "market_value"],
+                [False, False],
+            ),
+            "Lowest break-even price": (
+                ["break_even_price", "card_name"],
+                [True, True],
+            ),
+            "Card name A-Z": (
+                ["card_name", "set_name", "card_number"],
+                [True, True, True],
+            ),
+        }
+
+        sort_choice = st.selectbox(
+            "Sort table by",
+            options=list(sort_options.keys()),
+            index=0,
+            key="active_pricing_sort",
+        )
+
+        sort_cols, sort_ascending = sort_options[sort_choice]
+        sort_cols = [c for c in sort_cols if c in active_display.columns]
+
+        if sort_cols:
+            active_display = active_display.sort_values(
+                sort_cols,
+                ascending=sort_ascending[: len(sort_cols)],
+                na_position="last",
+            ).reset_index(drop=True)
+
+        market_known = active_display[
+            active_display["market_value"].apply(to_money) > 0
+        ].copy()
+        twenty_plus = active_display[
+            active_display["market_est_margin_pct"].apply(to_money) >= 20
+        ].copy()
+        loss_at_market = active_display[
+            active_display["market_est_profit_loss"].apply(to_money) < 0
+        ].copy()
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("ACTIVE items", f"{len(active_display):,}")
+        m2.metric(
+            "Total cost",
+            money_fmt(active_display["total_cost"].apply(to_money).sum()),
+        )
+        m3.metric(
+            "Market value",
+            money_fmt(active_display["market_value"].apply(to_money).sum()),
+        )
+        m4.metric("Market value known", f"{len(market_known):,}")
+        m5.metric("20%+ at market", f"{len(twenty_plus):,}")
+        m6.metric("Loss at market", f"{len(loss_at_market):,}")
+
+        st.caption(
+            "Break-even and target prices are the minimum eBay item prices "
+            "estimated to reach each return after the assumed eBay fee and label. "
+            "Buyer-paid shipping is modeled as a pass-through."
+        )
+
+        active_cols = [
+            c
+            for c in _active_inventory_pricing_cols()
+            if c in active_display.columns
+        ]
+
+        st.dataframe(
+            active_display[active_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=700,
+            column_config={
+                "reference_link": st.column_config.LinkColumn(
+                    "Reference Link"
+                ),
+                "total_cost": st.column_config.NumberColumn(
+                    "Total Cost",
+                    format="$%.2f",
+                ),
+                "market_value": st.column_config.NumberColumn(
+                    "Market Value",
+                    format="$%.2f",
+                ),
+                "sticker_price": st.column_config.NumberColumn(
+                    "Sticker Price",
+                    format="$%.2f",
+                ),
+                "break_even_price": st.column_config.NumberColumn(
+                    "Break-even Price",
+                    format="$%.2f",
+                ),
+                "price_for_5pct_profit": st.column_config.NumberColumn(
+                    "Price for 5% Profit",
+                    format="$%.2f",
+                ),
+                "price_for_10pct_profit": st.column_config.NumberColumn(
+                    "Price for 10% Profit",
+                    format="$%.2f",
+                ),
+                "price_for_20pct_profit": st.column_config.NumberColumn(
+                    "Price for 20% Profit",
+                    format="$%.2f",
+                ),
+                "price_for_30pct_profit": st.column_config.NumberColumn(
+                    "Price for 30% Profit",
+                    format="$%.2f",
+                ),
+                "market_est_profit_loss": st.column_config.NumberColumn(
+                    "Est. Profit at Market",
+                    format="$%.2f",
+                ),
+                "market_est_margin_pct": st.column_config.NumberColumn(
+                    "Est. Margin at Market",
+                    format="%.2f%%",
+                ),
+                "market_value_over_20pct_price": (
+                    st.column_config.NumberColumn(
+                        "Market Above 20% Target",
+                        format="$%.2f",
+                    )
+                ),
+                "market_value_over_10pct_price": (
+                    st.column_config.NumberColumn(
+                        "Market Above 10% Target",
+                        format="$%.2f",
+                    )
+                ),
+                "market_est_net": st.column_config.NumberColumn(
+                    "Market Est. Net",
+                    format="$%.2f",
+                ),
+                "market_est_ebay_fees": st.column_config.NumberColumn(
+                    "Market Est. eBay Fees",
+                    format="$%.2f",
+                ),
+                "market_est_label": st.column_config.NumberColumn(
+                    "Market Est. Label",
+                    format="$%.2f",
+                ),
+                "break_even_est_label": st.column_config.NumberColumn(
+                    "Break-even Est. Label",
+                    format="$%.2f",
+                ),
+                "break_even_est_ebay_fees": st.column_config.NumberColumn(
+                    "Break-even Est. Fees",
+                    format="$%.2f",
+                ),
+                "break_even_est_net": st.column_config.NumberColumn(
+                    "Break-even Est. Net",
+                    format="$%.2f",
+                ),
+                "five_pct_est_label": st.column_config.NumberColumn(
+                    "5% Est. Label",
+                    format="$%.2f",
+                ),
+                "five_pct_est_ebay_fees": st.column_config.NumberColumn(
+                    "5% Est. Fees",
+                    format="$%.2f",
+                ),
+                "five_pct_est_net": st.column_config.NumberColumn(
+                    "5% Est. Net",
+                    format="$%.2f",
+                ),
+                "ten_pct_est_label": st.column_config.NumberColumn(
+                    "10% Est. Label",
+                    format="$%.2f",
+                ),
+                "ten_pct_est_ebay_fees": st.column_config.NumberColumn(
+                    "10% Est. Fees",
+                    format="$%.2f",
+                ),
+                "ten_pct_est_net": st.column_config.NumberColumn(
+                    "10% Est. Net",
+                    format="$%.2f",
+                ),
+                "twenty_pct_est_label": st.column_config.NumberColumn(
+                    "20% Est. Label",
+                    format="$%.2f",
+                ),
+                "twenty_pct_est_ebay_fees": st.column_config.NumberColumn(
+                    "20% Est. Fees",
+                    format="$%.2f",
+                ),
+                "twenty_pct_est_net": st.column_config.NumberColumn(
+                    "20% Est. Net",
+                    format="$%.2f",
+                ),
+                "thirty_pct_est_label": st.column_config.NumberColumn(
+                    "30% Est. Label",
+                    format="$%.2f",
+                ),
+                "thirty_pct_est_ebay_fees": st.column_config.NumberColumn(
+                    "30% Est. Fees",
+                    format="$%.2f",
+                ),
+                "thirty_pct_est_net": st.column_config.NumberColumn(
+                    "30% Est. Net",
+                    format="$%.2f",
+                ),
+            },
+        )
+
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Download all ACTIVE pricing targets",
+                data=active_pricing.to_csv(index=False),
+                file_name="ebay_active_inventory_pricing_targets.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with d2:
+            st.download_button(
+                "Download current filtered view",
+                data=active_display.to_csv(index=False),
+                file_name="ebay_active_inventory_pricing_filtered.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 
 # =========================================================
@@ -2426,6 +3024,12 @@ tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
 with tab_active:
     st.subheader("Pull Active eBay Listings")
     st.caption("This pulls listings currently active in your eBay account. Sold listings usually disappear from this list, so use Sync eBay sales now after sales.")
+
+    if not ebay_ready:
+        st.warning(
+            "eBay credentials are not configured. Use the Active Inventory "
+            "Pricing tab now, then add the [ebay] secrets to unlock this pull."
+        )
 
     c1, c2, c3 = st.columns([1, 1, 2])
 
@@ -2438,7 +3042,13 @@ with tab_active:
     with c3:
         st.write("")
         st.write("")
-        pull_active = st.button("Pull Active eBay Listings", type="primary", use_container_width=True)
+        pull_active = st.button(
+            "Pull Active eBay Listings",
+            type="primary",
+            use_container_width=True,
+            disabled=not ebay_ready,
+            help="Configure eBay secrets first." if not ebay_ready else None,
+        )
 
     if pull_active:
         access_token = get_access_token_or_stop(ebay_config)
@@ -2530,6 +3140,12 @@ with tab_active:
 
 with tab_assign:
     st.subheader("Assign eBay Listings to Inventory")
+
+    if not ebay_ready:
+        st.warning(
+            "eBay credentials are not configured. You can still use tab 1 to "
+            "price every ACTIVE inventory item before listing."
+        )
 
     listings_df = st.session_state.get("ebay_active_listings_df", pd.DataFrame()).copy()
     estimator_assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
@@ -2857,133 +3473,24 @@ with tab_assign:
                     )
 
     st.markdown("---")
-    st.markdown("### Unlisted inventory pricing targets")
-    st.caption("This uses the same active-listing estimator rules above to calculate the lowest list price needed to break even, make 10%, or make 20% profit after estimated eBay fees and label cost.")
-
-    unlisted_pricing = _build_unlisted_inventory_pricing_df(
-        inv=inv,
-        assumptions=estimator_assumptions,
+    st.info(
+        "Pre-listing break-even and profit targets for every ACTIVE inventory "
+        "item are now available in the Active Inventory Pricing tab."
     )
 
-    if unlisted_pricing.empty:
-        st.info("No unlisted ACTIVE inventory found.")
-    else:
-        market_profitable = unlisted_pricing[unlisted_pricing["market_est_profit_loss"].apply(to_money) > 0].copy()
-        market_20pct_plus = unlisted_pricing[unlisted_pricing["market_est_margin_pct"].apply(to_money) >= 20].copy()
-        total_market_est_profit = unlisted_pricing["market_est_profit_loss"].apply(to_money).sum()
-
-        u1, u2, u3, u4, u5 = st.columns(5)
-        u1.metric("Unlisted active items", f"{len(unlisted_pricing):,}")
-        u2.metric("Total associated cost", money_fmt(unlisted_pricing["total_cost"].apply(to_money).sum()))
-        u3.metric("Total market value", money_fmt(unlisted_pricing["market_value"].apply(to_money).sum()))
-        u4.metric("20%+ at market", f"{len(market_20pct_plus):,}")
-        u5.metric("Est. P/L at market", money_fmt(total_market_est_profit))
-
-        st.caption("Market opportunity columns estimate what would happen if you listed the item at its current market value. Sort by Market Margin % to find cards you can list near market and still make strong profit.")
-
-        sort_options = {
-            "Best margin at market price": (["market_est_margin_pct", "market_est_profit_loss", "market_value"], [False, False, False]),
-            "Best dollar profit at market price": (["market_est_profit_loss", "market_est_margin_pct", "market_value"], [False, False, False]),
-            "Market clears 20% target by most": (["market_value_over_20pct_price", "market_est_margin_pct", "market_est_profit_loss"], [False, False, False]),
-            "Market clears 10% target by most": (["market_value_over_10pct_price", "market_est_margin_pct", "market_est_profit_loss"], [False, False, False]),
-            "Highest market value": (["market_value", "market_est_profit_loss"], [False, False]),
-            "Highest cost": (["total_cost", "market_value"], [False, False]),
-            "Card name A-Z": (["card_name", "set_name"], [True, True]),
-        }
-
-        sort_col, filter_col = st.columns([2, 1])
-        with sort_col:
-            unlisted_sort_choice = st.selectbox(
-                "Sort unlisted table by",
-                options=list(sort_options.keys()),
-                index=0,
-                help="Default shows your best margin opportunities first based on estimated profit if listed at market value.",
-            )
-
-        with filter_col:
-            only_show_20pct_at_market = st.checkbox(
-                "Only show 20%+ at market",
-                value=False,
-                help="Show only inventory where listing around market value is estimated to clear at least 20% profit on cost.",
-            )
-
-        unlisted_display = unlisted_pricing.copy()
-
-        if only_show_20pct_at_market:
-            unlisted_display = unlisted_display[unlisted_display["market_est_margin_pct"].apply(to_money) >= 20].copy()
-
-        sort_cols, sort_ascending = sort_options[unlisted_sort_choice]
-        sort_cols = [c for c in sort_cols if c in unlisted_display.columns]
-
-        for col in sort_cols:
-            if col not in {"card_name", "set_name"}:
-                unlisted_display[col] = pd.to_numeric(unlisted_display[col], errors="coerce")
-
-        if sort_cols:
-            unlisted_display = unlisted_display.sort_values(
-                sort_cols,
-                ascending=sort_ascending[:len(sort_cols)],
-                na_position="last",
-            ).reset_index(drop=True)
-
-        if unlisted_display.empty:
-            st.info("No unlisted inventory matches the selected opportunity filter.")
-        else:
-            unlisted_cols = [c for c in _unlisted_inventory_pricing_cols() if c in unlisted_display.columns]
-
-            st.dataframe(
-                unlisted_display[unlisted_cols],
-                use_container_width=True,
-                hide_index=True,
-                height=650,
-                column_config={
-                    "reference_link": st.column_config.LinkColumn("Reference Link"),
-                    "total_cost": st.column_config.NumberColumn("Associated Cost", format="$%.2f"),
-                    "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
-                    "market_est_profit_loss": st.column_config.NumberColumn("Est. Profit at Market", format="$%.2f"),
-                    "market_est_margin_pct": st.column_config.NumberColumn("Market Margin %", format="%.2f%%"),
-                    "market_value_over_20pct_price": st.column_config.NumberColumn("Market Over 20% Price", format="$%.2f"),
-                    "market_value_over_10pct_price": st.column_config.NumberColumn("Market Over 10% Price", format="$%.2f"),
-                    "market_est_net": st.column_config.NumberColumn("Market Est. Net", format="$%.2f"),
-                    "market_est_ebay_fees": st.column_config.NumberColumn("Market Est. eBay Fees", format="$%.2f"),
-                    "market_est_label": st.column_config.NumberColumn("Market Est. Label", format="$%.2f"),
-                    "sticker_price": st.column_config.NumberColumn("Sticker Price", format="$%.2f"),
-                    "break_even_price": st.column_config.NumberColumn("Break Even List Price", format="$%.2f"),
-                    "break_even_est_label": st.column_config.NumberColumn("Break Even Est. Label", format="$%.2f"),
-                    "break_even_est_ebay_fees": st.column_config.NumberColumn("Break Even Est. eBay Fees", format="$%.2f"),
-                    "break_even_est_net": st.column_config.NumberColumn("Break Even Est. Net", format="$%.2f"),
-                    "price_for_10pct_profit": st.column_config.NumberColumn("10% Profit List Price", format="$%.2f"),
-                    "ten_pct_est_label": st.column_config.NumberColumn("10% Est. Label", format="$%.2f"),
-                    "ten_pct_est_ebay_fees": st.column_config.NumberColumn("10% Est. eBay Fees", format="$%.2f"),
-                    "ten_pct_est_net": st.column_config.NumberColumn("10% Est. Net", format="$%.2f"),
-                    "price_for_20pct_profit": st.column_config.NumberColumn("20% Profit List Price", format="$%.2f"),
-                    "twenty_pct_est_label": st.column_config.NumberColumn("20% Est. Label", format="$%.2f"),
-                    "twenty_pct_est_ebay_fees": st.column_config.NumberColumn("20% Est. eBay Fees", format="$%.2f"),
-                    "twenty_pct_est_net": st.column_config.NumberColumn("20% Est. Net", format="$%.2f"),
-                },
-            )
-
-        with st.expander("Download unlisted pricing target CSV", expanded=False):
-            st.download_button(
-                "Download all unlisted pricing targets",
-                data=unlisted_pricing.to_csv(index=False),
-                file_name="ebay_unlisted_inventory_pricing_targets.csv",
-                mime="text/csv",
-            )
-            st.download_button(
-                "Download current unlisted view",
-                data=unlisted_display.to_csv(index=False),
-                file_name="ebay_unlisted_inventory_pricing_targets_current_view.csv",
-                mime="text/csv",
-            )
-
 # =========================================================
-# Tab 3: Sold Order Sync
+# Tab 4: Sold Order Sync
 # =========================================================
 
 with tab_orders:
     st.subheader("Sold eBay Order Sync")
     st.caption("This pulls recent sold orders, pulls eBay Finances transactions, and writes sold price / fees / net / profit to inventory.")
+
+    if not ebay_ready:
+        st.warning(
+            "eBay credentials are not configured, so sold-order pull and sync "
+            "are disabled. Inventory pricing remains available in tab 1."
+        )
 
     c1, c2, c3, c4 = st.columns([1, 1, 1.5, 1.5])
 
@@ -2996,12 +3503,23 @@ with tab_orders:
     with c3:
         st.write("")
         st.write("")
-        pull_orders = st.button("Pull Recent eBay Orders + Fees", use_container_width=True)
+        pull_orders = st.button(
+            "Pull Recent eBay Orders + Fees",
+            use_container_width=True,
+            disabled=not ebay_ready,
+            help="Configure eBay secrets first." if not ebay_ready else None,
+        )
 
     with c4:
         st.write("")
         st.write("")
-        pull_and_sync = st.button("Pull + Sync Sold Orders + Fees", type="primary", use_container_width=True)
+        pull_and_sync = st.button(
+            "Pull + Sync Sold Orders + Fees",
+            type="primary",
+            use_container_width=True,
+            disabled=not ebay_ready,
+            help="Configure eBay secrets first." if not ebay_ready else None,
+        )
 
     if pull_orders or pull_and_sync:
         access_token = get_access_token_or_stop(ebay_config)
@@ -3422,7 +3940,7 @@ with tab_orders:
 
 
 # =========================================================
-# Tab 4: Audit / Raw Data
+# Tab 5: Audit / Raw Data
 # =========================================================
 
 with tab_audit:
