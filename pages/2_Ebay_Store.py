@@ -522,9 +522,12 @@ def _safe_money_round(x) -> float:
 # =========================================================
 
 DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS = {
-    # Fixed assumptions requested for active listing estimates.
-    # Do not use eBay's pulled shipping charge for this table.
+    # Default stays conservative until the seller chooses their actual Store tier.
+    # The pricing-settings controls below can apply the Top Rated Plus discount.
+    "base_fee_rate_pct": 13.25,
     "fee_rate_pct": 13.25,
+    "top_rated_plus_discount_pct": 0.00,
+    "apply_top_rated_plus_discount": False,
     "estimated_buyer_tax_pct": 9.00,
     "standard_envelope_shipping": 1.32,
     "ground_advantage_shipping": 5.30,
@@ -533,6 +536,43 @@ DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS = {
     "high_fixed_order_fee": 0.40,         # $10 and up.
     "fixed_fee_threshold": 10.00,
 }
+
+
+EBAY_CARD_FEE_PLAN_OPTIONS = {
+    "No Store or Starter Store — 13.25%": 13.25,
+    "Basic, Premium, Anchor, or Enterprise Store — 12.35%": 12.35,
+}
+
+
+def _build_page_estimator_assumptions(
+    fee_plan_label: str,
+    apply_top_rated_plus_discount: bool,
+) -> dict:
+    """
+    Build one assumptions dictionary used by every pricing table on the page.
+
+    The Top Rated Plus benefit is modeled as a 10% discount on the percentage
+    portion of the final value fee. The per-order fee is not discounted.
+    """
+    assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
+
+    base_fee_rate_pct = to_money(
+        EBAY_CARD_FEE_PLAN_OPTIONS.get(
+            fee_plan_label,
+            assumptions.get("base_fee_rate_pct", 13.25),
+        )
+    )
+    discount_pct = 10.0 if apply_top_rated_plus_discount else 0.0
+    effective_fee_rate_pct = base_fee_rate_pct * (1 - (discount_pct / 100.0))
+
+    assumptions["base_fee_rate_pct"] = round(base_fee_rate_pct, 4)
+    assumptions["top_rated_plus_discount_pct"] = round(discount_pct, 2)
+    assumptions["apply_top_rated_plus_discount"] = bool(
+        apply_top_rated_plus_discount
+    )
+    assumptions["fee_rate_pct"] = round(effective_fee_rate_pct, 4)
+
+    return assumptions
 
 
 def _pct_to_rate(x) -> float:
@@ -587,7 +627,9 @@ def _estimate_listing_at_price(list_price: float, total_cost: float, assumptions
 
     Buyer pays list price + assumed shipping.
     Sales tax is estimated at 9% of list price + assumed shipping.
-    eBay variable fee is 13.25% of list price + assumed shipping + estimated tax.
+    eBay variable fee uses the configured effective percentage of list price
+    + assumed shipping + estimated tax. The effective percentage may include
+    the optional Top Rated Plus discount.
     Net proceeds subtract eBay fees and the assumed label cost.
     """
     list_price = _round_money(list_price)
@@ -619,6 +661,16 @@ def _estimate_listing_at_price(list_price: float, total_cost: float, assumptions
         "estimated_buyer_total_before_tax": buyer_subtotal,
         "estimated_tax_for_fee_basis": estimated_tax,
         "estimated_fee_basis": fee_basis,
+        "base_fee_rate_pct": _round_money(
+            assumptions.get("base_fee_rate_pct", assumptions.get("fee_rate_pct"))
+        ),
+        "effective_fee_rate_pct": round(
+            to_money(assumptions.get("fee_rate_pct")),
+            4,
+        ),
+        "top_rated_plus_discount_applied": bool(
+            assumptions.get("apply_top_rated_plus_discount", False)
+        ),
         "estimated_variable_fee": estimated_variable_fee,
         "estimated_fixed_order_fee": fixed_order_fee,
         "estimated_ebay_fees": estimated_ebay_fees,
@@ -2596,6 +2648,68 @@ if not duplicate_ebay_assignments.empty:
             st.rerun()
 
 
+st.markdown("---")
+with st.expander("eBay pricing estimator settings", expanded=True):
+    st.caption(
+        "These settings drive the ACTIVE inventory pricing table, assigned-listing "
+        "estimates, and unlisted-inventory targets. Actual sold-order sync continues "
+        "to use eBay order and Finances data."
+    )
+
+    fee_setting_col, top_rated_setting_col, rate_summary_col = st.columns(
+        [1.6, 1.35, 1.05]
+    )
+
+    with fee_setting_col:
+        estimator_fee_plan = st.selectbox(
+            "Collectible-card fee plan",
+            options=list(EBAY_CARD_FEE_PLAN_OPTIONS.keys()),
+            index=0,
+            key="ebay_estimator_fee_plan",
+            help=(
+                "Choose the category rate that matches your eBay Store subscription. "
+                "This is the percentage portion before any Top Rated Plus discount."
+            ),
+        )
+
+    with top_rated_setting_col:
+        estimator_apply_top_rated_plus = st.checkbox(
+            "Apply Top Rated Plus 10% fee discount",
+            value=False,
+            key="ebay_estimator_apply_top_rated_plus",
+            help=(
+                "Use this only for listings that qualify for the Top Rated Plus "
+                "final-value-fee discount. It reduces the percentage portion by 10%; "
+                "the $0.30/$0.40 per-order fee is unchanged."
+            ),
+        )
+
+    page_estimator_assumptions = _build_page_estimator_assumptions(
+        fee_plan_label=estimator_fee_plan,
+        apply_top_rated_plus_discount=estimator_apply_top_rated_plus,
+    )
+
+    with rate_summary_col:
+        st.metric(
+            "Effective variable fee",
+            f'{page_estimator_assumptions["fee_rate_pct"]:.3f}%',
+            delta=(
+                f'-{page_estimator_assumptions["top_rated_plus_discount_pct"]:.0f}% '
+                "of variable fee"
+                if estimator_apply_top_rated_plus
+                else "No Top Rated discount"
+            ),
+        )
+
+    st.caption(
+        "Base category rate: "
+        f'{page_estimator_assumptions["base_fee_rate_pct"]:.2f}% · '
+        "Buyer tax assumption: "
+        f'{page_estimator_assumptions["estimated_buyer_tax_pct"]:.2f}% · '
+        "Fixed order fee remains $0.30 below $10 and $0.40 at $10 or above."
+    )
+
+
 tab_pricing, tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
     [
         "1. Active Inventory Pricing",
@@ -2620,7 +2734,7 @@ with tab_pricing:
         "you create the listing."
     )
 
-    estimator_assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
+    estimator_assumptions = page_estimator_assumptions.copy()
 
     with st.expander("Pricing assumptions", expanded=False):
         st.write(
@@ -2638,8 +2752,19 @@ with tab_pricing:
                 "Estimated buyer tax": (
                     f'{estimator_assumptions["estimated_buyer_tax_pct"]:.2f}%'
                 ),
-                "eBay variable fee": (
-                    f'{estimator_assumptions["fee_rate_pct"]:.2f}% of item + '
+                "Base category fee": (
+                    f'{estimator_assumptions["base_fee_rate_pct"]:.2f}%'
+                ),
+                "Top Rated Plus discount applied": (
+                    "Yes — 10% off the variable fee portion"
+                    if estimator_assumptions.get(
+                        "apply_top_rated_plus_discount",
+                        False,
+                    )
+                    else "No"
+                ),
+                "Effective eBay variable fee": (
+                    f'{estimator_assumptions["fee_rate_pct"]:.3f}% of item + '
                     "shipping + estimated buyer tax"
                 ),
                 "Fixed order fee": (
@@ -3148,7 +3273,7 @@ with tab_assign:
         )
 
     listings_df = st.session_state.get("ebay_active_listings_df", pd.DataFrame()).copy()
-    estimator_assumptions = DEFAULT_LISTING_ESTIMATOR_ASSUMPTIONS.copy()
+    estimator_assumptions = page_estimator_assumptions.copy()
 
     with st.expander("Active listing estimator rules", expanded=False):
         st.caption("These fixed rules are used for the assigned-listing estimate table and the unlisted inventory pricing table. Actual sold-order sync still uses eBay order/finance data after a sale.")
@@ -3158,7 +3283,16 @@ with tab_assign:
                 "Standard Envelope assumed shipping / label": money_fmt(estimator_assumptions["standard_envelope_shipping"]),
                 "Ground Advantage assumed shipping / label": money_fmt(estimator_assumptions["ground_advantage_shipping"]),
                 "Estimated buyer tax": f'{estimator_assumptions["estimated_buyer_tax_pct"]:.2f}%',
-                "eBay variable fee": f'{estimator_assumptions["fee_rate_pct"]:.2f}% of item + shipping + estimated tax',
+                "Base category fee": f'{estimator_assumptions["base_fee_rate_pct"]:.2f}%',
+                "Top Rated Plus discount": (
+                    "Applied — 10% off variable fee portion"
+                    if estimator_assumptions.get(
+                        "apply_top_rated_plus_discount",
+                        False,
+                    )
+                    else "Not applied"
+                ),
+                "Effective eBay variable fee": f'{estimator_assumptions["fee_rate_pct"]:.3f}% of item + shipping + estimated tax',
                 "Fixed fee": "Below $10.00 = $0.30; $10.00 and up = $0.40",
             }
         )
