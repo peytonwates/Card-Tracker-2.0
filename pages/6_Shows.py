@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlparse
 import pandas as pd
 import streamlit as st
 
-from core.business import load_data, mark_inventory_sold, refresh_database_cache
+from core.business import load_data, refresh_database_cache
 from core.cleaning import clean_text, money_fmt, now_iso, to_money
 from core.config import (
     INVENTORY_COLUMNS,
@@ -21,7 +21,7 @@ from core.config import (
     STATUS_ACTIVE,
     STATUS_SOLD,
 )
-from core.sheets import append_rows, get_ws_name
+from core.sheets import append_rows, get_ws_name, update_rows_by_key
 
 
 st.set_page_config(page_title="Shows", layout="wide")
@@ -2898,7 +2898,6 @@ with tab_sales:
                             for _, row in latest_inventory.iterrows()
                             if _text(row.get("inventory_id"))
                         }
-                        changed = 0
                         shared_batch_id = (
                             _text(final_valid.iloc[0].get("reconciliation_batch_id"))
                             if not final_valid.empty
@@ -2906,6 +2905,15 @@ with tab_sales:
                         )
                         if not shared_batch_id:
                             shared_batch_id = f"REC-{uuid.uuid4().hex[:10].upper()}"
+
+                        # Build every inventory change in memory, then send the entire
+                        # set to Google Sheets in one update_rows_by_key call. The old
+                        # implementation called mark_inventory_sold once per row, which
+                        # reopened the worksheet and reread its headers for every sale.
+                        # Large show uploads therefore exhausted the Sheets per-minute
+                        # read quota after only a few records.
+                        inventory_updates: dict[str, dict[str, Any]] = {}
+                        processed_at = now_iso()
 
                         for _, row in final_valid.iterrows():
                             inventory_id = _text(row.get("inventory_id"))
@@ -2921,8 +2929,12 @@ with tab_sales:
                                 row.get("sold_date"), errors="coerce"
                             ).date()
 
-                            updates = {
-                                "transaction_type": _text(row.get("transaction_type")) or "Card Show",
+                            inventory_updates[inventory_id] = {
+                                "inventory_status": STATUS_SOLD,
+                                "transaction_type": _text(
+                                    row.get("transaction_type")
+                                )
+                                or "Card Show",
                                 "platform": _text(row.get("platform")),
                                 "sold_date": str(sold_date_value),
                                 "sold_price": sold_price,
@@ -2931,16 +2943,24 @@ with tab_sales:
                                 "shipping_charged": 0,
                                 "net_proceeds": net,
                                 "profit": profit,
-                                "sale_channel": _text(row.get("sale_channel")) or "Card Show",
+                                "sale_channel": _text(row.get("sale_channel"))
+                                or "Card Show",
                                 "sale_notes": _text(row.get("sale_notes")),
                                 "show_id": _text(row.get("show_id")),
                                 "show_name": _text(row.get("show_name")),
                                 "sold_transaction_id": shared_batch_id,
                                 "reconciliation_batch_id": shared_batch_id,
-                                "sold_created_at": now_iso(),
-                                "sold_updated_at": now_iso(),
+                                "sold_created_at": processed_at,
+                                "sold_updated_at": processed_at,
+                                "updated_at": processed_at,
                             }
-                            changed += mark_inventory_sold(inventory_id, updates)
+
+                        changed = update_rows_by_key(
+                            get_ws_name("inventory_worksheet", "inventory"),
+                            INVENTORY_COLUMNS,
+                            "inventory_id",
+                            inventory_updates,
+                        )
 
                         refresh_database_cache()
                         st.success(f"Recorded {changed:,} show sale(s).")
