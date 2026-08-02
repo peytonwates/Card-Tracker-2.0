@@ -2628,7 +2628,7 @@ with tab_add:
     if purchase_upload_file is not None:
         try:
             purchase_upload = _read_csv_or_excel(purchase_upload_file)
-            current_inventory = _safe_df(load_data(force_refresh=True).inventory)
+            current_inventory = inv.copy()
             valid_purchases, purchase_validation = _validate_purchase_upload(
                 purchase_upload,
                 current_inventory,
@@ -2696,9 +2696,7 @@ with tab_add:
                     key="process_reconciled_purchases",
                 ):
                     # Revalidate immediately before writing.
-                    latest_inventory = _safe_df(
-                        load_data(force_refresh=True).inventory
-                    )
+                    latest_inventory = current_inventory.copy()
                     final_valid, final_validation = _validate_purchase_upload(
                         valid_purchases,
                         latest_inventory,
@@ -2768,7 +2766,7 @@ with tab_sales:
     if sales_upload_file is not None:
         try:
             sales_upload = _read_csv_or_excel(sales_upload_file)
-            current_inventory = _safe_df(load_data(force_refresh=True).inventory)
+            current_inventory = inv.copy()
             valid_sales, sales_validation = _validate_sales_upload(
                 sales_upload,
                 current_inventory,
@@ -2869,9 +2867,7 @@ with tab_sales:
                     key="process_reconciled_sales",
                 ):
                     # Revalidate against fresh data immediately before changing statuses.
-                    latest_inventory = _safe_df(
-                        load_data(force_refresh=True).inventory
-                    )
+                    latest_inventory = current_inventory.copy()
                     final_valid, final_validation = _validate_sales_upload(
                         valid_sales,
                         latest_inventory,
