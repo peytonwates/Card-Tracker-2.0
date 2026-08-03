@@ -92,6 +92,98 @@ refresh_token = "..."
 
 def get_ebay_secrets():
     """
+    Load all eBay credentials exclusively from the [ebay] section.
+
+    Keeping every OAuth value in one section prevents an old environment
+    variable or top-level secret from being mixed with the current keyset.
+    """
+    try:
+        ebay_section = st.secrets.get("ebay")
+
+        if ebay_section is None:
+            st.warning(
+                "No [ebay] section was found in Streamlit secrets. "
+                "eBay listing and sold-order controls are disabled."
+            )
+
+            with st.expander("Fix eBay connection settings", expanded=True):
+                st.code(_ebay_expected_secrets_toml(), language="toml")
+
+            return None
+
+        def section_value(key: str, default: str = "") -> str:
+            value = ebay_section.get(key, default)
+
+            if isinstance(value, (list, tuple)):
+                return " ".join(
+                    str(item).strip()
+                    for item in value
+                    if str(item).strip()
+                )
+
+            return str(value or "").strip()
+
+        config = {
+            "environment": section_value("environment", "production").lower(),
+            "marketplace_id": section_value("marketplace_id", "EBAY_US"),
+            "client_id": section_value("client_id"),
+            "client_secret": section_value("client_secret"),
+            "ru_name": section_value("ru_name"),
+            "scopes": section_value("scopes"),
+            "refresh_token": section_value("refresh_token"),
+            "source_label": "[ebay]",
+            "source_by_field": {
+                "environment": "[ebay]",
+                "marketplace_id": "[ebay]",
+                "client_id": "[ebay]",
+                "client_secret": "[ebay]",
+                "ru_name": "[ebay]",
+                "scopes": "[ebay]",
+                "refresh_token": "[ebay]",
+            },
+        }
+
+        required_fields = [
+            "client_id",
+            "client_secret",
+            "scopes",
+            "refresh_token",
+        ]
+
+        missing = [
+            field
+            for field in required_fields
+            if not clean_text(config.get(field))
+        ]
+
+        if missing:
+            st.warning(
+                "The [ebay] section is missing required credentials, so eBay "
+                "listing pulls and sold-order sync are disabled."
+            )
+
+            with st.expander("Fix eBay connection settings", expanded=True):
+                st.write(
+                    "Missing required fields: "
+                    + ", ".join(f"`{field}`" for field in missing)
+                )
+                st.code(_ebay_expected_secrets_toml(), language="toml")
+
+            return None
+
+        return config
+
+    except Exception as exc:
+        st.warning(
+            "The [ebay] secrets could not be read. eBay API controls are disabled."
+        )
+
+        with st.expander("eBay settings read error", expanded=False):
+            st.write(str(exc))
+            st.code(_ebay_expected_secrets_toml(), language="toml")
+
+        return None
+    """
     Load eBay settings without blocking the inventory-pricing portion of the page.
 
     Supported locations, in priority order:
@@ -271,31 +363,102 @@ def get_ebay_secrets():
 
 
 def get_access_token_from_refresh_token(ebay_config):
-    token_url = "https://api.ebay.com/identity/v1/oauth2/token"
+    environment = clean_text(
+        ebay_config.get("environment", "production")
+    ).lower()
 
-    credentials = f"{ebay_config['client_id']}:{ebay_config['client_secret']}"
-    encoded_credentials = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+    if environment == "sandbox":
+        token_url = "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+    else:
+        token_url = "https://api.ebay.com/identity/v1/oauth2/token"
+
+    client_id = clean_text(ebay_config.get("client_id"))
+    client_secret = clean_text(ebay_config.get("client_secret"))
+    refresh_token = clean_text(ebay_config.get("refresh_token"))
+    scopes = " ".join(
+        clean_text(ebay_config.get("scopes")).split()
+    )
+
+    credentials = f"{client_id}:{client_secret}"
+    encoded_credentials = base64.b64encode(
+        credentials.encode("utf-8")
+    ).decode("ascii")
 
     headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
         "Authorization": f"Basic {encoded_credentials}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
     }
 
     data = {
         "grant_type": "refresh_token",
-        "refresh_token": ebay_config["refresh_token"],
-        "scope": ebay_config["scopes"],
+        "refresh_token": refresh_token,
     }
 
-    response = requests.post(token_url, headers=headers, data=data, timeout=30)
+    if scopes:
+        data["scope"] = scopes
+
+    response = requests.post(
+        token_url,
+        headers=headers,
+        data=data,
+        timeout=30,
+    )
 
     try:
         payload = response.json()
     except Exception:
         payload = {"raw_response": response.text}
 
-    return response.status_code, payload
+    # Retry without scope. A refresh request can omit scope and receive the
+    # permissions already granted to the refresh token.
+    if response.status_code == 400 and scopes:
+        retry_data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
 
+        retry_response = requests.post(
+            token_url,
+            headers=headers,
+            data=retry_data,
+            timeout=30,
+        )
+
+        try:
+            retry_payload = retry_response.json()
+        except Exception:
+            retry_payload = {
+                "raw_response": retry_response.text
+            }
+
+        if retry_response.status_code == 200:
+            retry_payload["_token_request_note"] = (
+                "Succeeded after retrying without an explicit scope."
+            )
+            return retry_response.status_code, retry_payload
+
+        payload["_retry_without_scope"] = {
+            "status_code": retry_response.status_code,
+            "response": retry_payload,
+        }
+
+    payload["_safe_debug"] = {
+        "environment": environment,
+        "token_url": token_url,
+        "secrets_source": ebay_config.get("source_label", ""),
+        "client_id_prefix": client_id[:18] + "..." if client_id else "",
+        "client_id_suffix": "..." + client_id[-8:] if client_id else "",
+        "client_secret_prefix": client_secret[:7] + "..."
+        if client_secret
+        else "",
+        "refresh_token_prefix": refresh_token[:12] + "..."
+        if refresh_token
+        else "",
+        "scope_count": len(scopes.split()) if scopes else 0,
+    }
+
+    return response.status_code, payload
 
 def get_access_token_or_stop(ebay_config):
     if not ebay_config:
