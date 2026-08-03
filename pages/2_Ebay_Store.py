@@ -2,11 +2,15 @@
 from __future__ import annotations
 # new version
 import base64
+import hashlib
+import hmac
 import math
-import os
 import re
+import secrets as pysecrets
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import unquote, urlencode
 
 import pandas as pd
 import requests
@@ -28,87 +32,30 @@ st.caption("Pull active eBay listings, assign them to inventory, then sync sold 
 # eBay auth / config
 # =========================================================
 
-def _safe_secret_get(source, key, default=None):
-    try:
-        if hasattr(source, "get"):
-            return source.get(key, default)
-    except Exception:
-        pass
-
-    try:
-        return source[key]
-    except Exception:
-        return default
-
-
-def _first_secret_value(source, keys: list[str], default: str = "") -> str:
-    for key in keys:
-        value = _safe_secret_get(source, key, None)
-
-        if value is None:
-            continue
-
-        if isinstance(value, (list, tuple)):
-            value = " ".join(str(v).strip() for v in value if str(v).strip())
-        else:
-            value = str(value).strip()
-
-        if value:
-            return value
-
-    return default
-
-
-def _first_value_from_sources(
-    sources: list[tuple[str, object]],
-    keys: list[str],
-    default: str = "",
-) -> tuple[str, str]:
-    """
-    Return the first nonblank value found across Streamlit secret sections,
-    top-level secrets, or environment variables. The returned source label
-    is safe to display because it never contains the secret value.
-    """
-    for source_label, source in sources:
-        value = _first_secret_value(source, keys, default="")
-        if value:
-            return value, source_label
-
-    return default, ""
-
-
 def _ebay_expected_secrets_toml() -> str:
     return """
 [ebay]
 environment = "production"
 marketplace_id = "EBAY_US"
-client_id = "..."
-client_secret = "..."
-ru_name = "..."  # Optional for this page once a refresh token already exists.
-scopes = "..."
-refresh_token = "..."
+client_id = "YOUR_PRODUCTION_APP_ID"
+client_secret = "YOUR_PRODUCTION_CERT_ID"
+ru_name = "YOUR_OAUTH_ENABLED_RUNAME"
+scopes = "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly https://api.ebay.com/oauth/api_scope/sell.finances"
+refresh_token = "PASTE_REFRESH_TOKEN_GENERATED_IN_CONNECT_TAB"
 """.strip()
 
 
 def get_ebay_secrets():
     """
-    Load all eBay credentials exclusively from the [ebay] section.
+    Read eBay settings exclusively from the [ebay] section in Streamlit Secrets.
 
-    Keeping every OAuth value in one section prevents an old environment
-    variable or top-level secret from being mixed with the current keyset.
+    The OAuth setup tab can work before a refresh token exists, so this loader
+    returns the base OAuth settings even when refresh_token is blank.
     """
     try:
         ebay_section = st.secrets.get("ebay")
 
         if ebay_section is None:
-            st.warning(
-                "No [ebay] section was found in Streamlit secrets. "
-                "eBay listing and sold-order controls are disabled."
-            )
-
-            with st.expander("Fix eBay connection settings", expanded=True):
-                st.code(_ebay_expected_secrets_toml(), language="toml")
-
             return None
 
         def section_value(key: str, default: str = "") -> str:
@@ -129,232 +76,26 @@ def get_ebay_secrets():
             "client_id": section_value("client_id"),
             "client_secret": section_value("client_secret"),
             "ru_name": section_value("ru_name"),
-            "scopes": section_value("scopes"),
+            "scopes": " ".join(section_value("scopes").split()),
             "refresh_token": section_value("refresh_token"),
             "source_label": "[ebay]",
-            "source_by_field": {
-                "environment": "[ebay]",
-                "marketplace_id": "[ebay]",
-                "client_id": "[ebay]",
-                "client_secret": "[ebay]",
-                "ru_name": "[ebay]",
-                "scopes": "[ebay]",
-                "refresh_token": "[ebay]",
-            },
         }
 
-        required_fields = [
-            "client_id",
-            "client_secret",
-            "scopes",
-            "refresh_token",
-        ]
-
-        missing = [
+        config["missing_oauth_fields"] = [
             field
-            for field in required_fields
+            for field in ["client_id", "client_secret", "ru_name", "scopes"]
             if not clean_text(config.get(field))
         ]
-
-        if missing:
-            st.warning(
-                "The [ebay] section is missing required credentials, so eBay "
-                "listing pulls and sold-order sync are disabled."
-            )
-
-            with st.expander("Fix eBay connection settings", expanded=True):
-                st.write(
-                    "Missing required fields: "
-                    + ", ".join(f"`{field}`" for field in missing)
-                )
-                st.code(_ebay_expected_secrets_toml(), language="toml")
-
-            return None
-
-        return config
-
-    except Exception as exc:
-        st.warning(
-            "The [ebay] secrets could not be read. eBay API controls are disabled."
+        config["oauth_setup_ready"] = not config["missing_oauth_fields"]
+        config["refresh_token_configured"] = bool(
+            clean_text(config.get("refresh_token"))
         )
 
-        with st.expander("eBay settings read error", expanded=False):
-            st.write(str(exc))
-            st.code(_ebay_expected_secrets_toml(), language="toml")
-
-        return None
-    """
-    Load eBay settings without blocking the inventory-pricing portion of the page.
-
-    Supported locations, in priority order:
-    1. [ebay], [EBAY], or [eBay] section in Streamlit secrets
-    2. Top-level Streamlit secrets
-    3. Environment variables such as EBAY_CLIENT_ID
-
-    ru_name is intentionally optional here. It is needed when initially creating
-    the OAuth authorization flow, but it is not required to exchange an existing
-    refresh token for an access token.
-    """
-    try:
-        sources: list[tuple[str, object]] = []
-        ebay_section = None
-        ebay_section_name = ""
-
-        for section_name in ("ebay", "EBAY", "eBay"):
-            possible_section = _safe_secret_get(st.secrets, section_name, None)
-            if possible_section is not None:
-                ebay_section = possible_section
-                ebay_section_name = f"[{section_name}]"
-                sources.append((ebay_section_name, possible_section))
-                break
-
-        # Always check top-level secrets as a fallback, even when a section exists.
-        sources.append(("top-level Streamlit secrets", st.secrets))
-        sources.append(("environment variables", os.environ))
-
-        aliases = {
-            "environment": [
-                "environment",
-                "ENVIRONMENT",
-                "EBAY_ENVIRONMENT",
-                "ebay_environment",
-            ],
-            "marketplace_id": [
-                "marketplace_id",
-                "MARKETPLACE_ID",
-                "EBAY_MARKETPLACE_ID",
-                "ebay_marketplace_id",
-            ],
-            "client_id": [
-                "client_id",
-                "CLIENT_ID",
-                "app_id",
-                "APP_ID",
-                "EBAY_CLIENT_ID",
-                "ebay_client_id",
-                "EBAY_APP_ID",
-                "ebay_app_id",
-            ],
-            "client_secret": [
-                "client_secret",
-                "CLIENT_SECRET",
-                "cert_id",
-                "CERT_ID",
-                "EBAY_CLIENT_SECRET",
-                "ebay_client_secret",
-                "EBAY_CERT_ID",
-                "ebay_cert_id",
-            ],
-            "ru_name": [
-                "ru_name",
-                "RU_NAME",
-                "runame",
-                "RUNAME",
-                "EBAY_RU_NAME",
-                "EBAY_RUNAME",
-                "ebay_ru_name",
-                "ebay_runame",
-            ],
-            "scopes": [
-                "scopes",
-                "scope",
-                "SCOPES",
-                "SCOPE",
-                "EBAY_SCOPES",
-                "EBAY_SCOPE",
-                "ebay_scopes",
-                "ebay_scope",
-            ],
-            "refresh_token": [
-                "refresh_token",
-                "REFRESH_TOKEN",
-                "EBAY_REFRESH_TOKEN",
-                "ebay_refresh_token",
-            ],
-        }
-
-        config: dict[str, str] = {}
-        source_by_field: dict[str, str] = {}
-
-        defaults = {
-            "environment": "production",
-            "marketplace_id": "EBAY_US",
-        }
-
-        for field, keys in aliases.items():
-            value, source_label = _first_value_from_sources(
-                sources=sources,
-                keys=keys,
-                default=defaults.get(field, ""),
-            )
-            config[field] = value
-            if source_label:
-                source_by_field[field] = source_label
-
-        config["source_label"] = ", ".join(
-            sorted(set(source_by_field.values()))
-        ) or "not found"
-        config["source_by_field"] = source_by_field
-
-        required_fields = [
-            "client_id",
-            "client_secret",
-            "scopes",
-            "refresh_token",
-        ]
-        missing = [
-            field
-            for field in required_fields
-            if not clean_text(config.get(field))
-        ]
-
-        if missing:
-            st.warning(
-                "eBay API credentials are not configured, so listing pulls and "
-                "sold-order sync are disabled. The Active Inventory Pricing tab "
-                "still works because it only uses your inventory database."
-            )
-
-            with st.expander("Fix eBay connection settings", expanded=True):
-                st.write(
-                    "Missing required fields: "
-                    + ", ".join(f"`{field}`" for field in missing)
-                )
-
-                if ebay_section is None:
-                    st.write("No `[ebay]` section was found in Streamlit secrets.")
-                else:
-                    st.write(f"eBay section found: `{ebay_section_name}`")
-
-                try:
-                    top_level_keys = list(st.secrets.keys())
-                except Exception:
-                    top_level_keys = []
-
-                if top_level_keys:
-                    st.write("Top-level secret key names currently found:")
-                    st.code("\n".join(top_level_keys))
-                else:
-                    st.write("No readable top-level Streamlit secret keys were found.")
-
-                st.write(
-                    "Add the following section in Streamlit Cloud under "
-                    "**App settings → Secrets**, or in `.streamlit/secrets.toml` locally:"
-                )
-                st.code(_ebay_expected_secrets_toml(), language="toml")
-                st.caption(
-                    "The code also accepts top-level EBAY_* keys and operating-system "
-                    "environment variables. Secret values are never displayed here."
-                )
-
-            return None
-
         return config
 
     except Exception as exc:
         st.warning(
-            "The eBay connection settings could not be read. API controls are "
-            "disabled, but inventory pricing remains available."
+            "The [ebay] section in Streamlit Secrets could not be read."
         )
         with st.expander("eBay settings read error", expanded=False):
             st.write(str(exc))
@@ -362,16 +103,228 @@ def get_ebay_secrets():
         return None
 
 
-def get_access_token_from_refresh_token(ebay_config):
+def _ebay_oauth_endpoints(ebay_config: dict) -> tuple[str, str]:
     environment = clean_text(
         ebay_config.get("environment", "production")
     ).lower()
 
     if environment == "sandbox":
-        token_url = "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
-    else:
-        token_url = "https://api.ebay.com/identity/v1/oauth2/token"
+        return (
+            "https://auth.sandbox.ebay.com/oauth2/authorize",
+            "https://api.sandbox.ebay.com/identity/v1/oauth2/token",
+        )
 
+    return (
+        "https://auth.ebay.com/oauth2/authorize",
+        "https://api.ebay.com/identity/v1/oauth2/token",
+    )
+
+
+def _create_ebay_oauth_state(ebay_config: dict) -> str:
+    """
+    Create a short-lived signed state value.
+
+    The signature makes the OAuth callback verifiable even when eBay returns
+    in a new browser tab, where Streamlit session_state may be different.
+    """
+    timestamp = str(int(time.time()))
+    nonce = pysecrets.token_urlsafe(18)
+    payload = f"{timestamp}.{nonce}"
+
+    client_secret = clean_text(
+        ebay_config.get("client_secret")
+    ).encode("utf-8")
+
+    signature = hmac.new(
+        client_secret,
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    raw_state = f"{payload}.{signature}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw_state).decode("ascii").rstrip("=")
+
+
+def _verify_ebay_oauth_state(
+    ebay_config: dict,
+    state: str,
+    max_age_seconds: int = 900,
+) -> bool:
+    try:
+        padded_state = state + ("=" * (-len(state) % 4))
+        decoded = base64.urlsafe_b64decode(
+            padded_state.encode("ascii")
+        ).decode("utf-8")
+
+        timestamp_text, nonce, supplied_signature = decoded.split(
+            ".",
+            2,
+        )
+        payload = f"{timestamp_text}.{nonce}"
+
+        client_secret = clean_text(
+            ebay_config.get("client_secret")
+        ).encode("utf-8")
+
+        expected_signature = hmac.new(
+            client_secret,
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            supplied_signature,
+            expected_signature,
+        ):
+            return False
+
+        issued_at = int(timestamp_text)
+        age_seconds = int(time.time()) - issued_at
+
+        return -60 <= age_seconds <= max_age_seconds
+
+    except Exception:
+        return False
+
+
+def _build_ebay_authorization_url(ebay_config: dict, state: str) -> str:
+    authorization_url, _ = _ebay_oauth_endpoints(ebay_config)
+
+    params = {
+        "client_id": clean_text(ebay_config.get("client_id")),
+        "response_type": "code",
+        # eBay expects the OAuth-enabled RuName here, not the Streamlit URL.
+        "redirect_uri": clean_text(ebay_config.get("ru_name")),
+        "scope": " ".join(
+            clean_text(ebay_config.get("scopes")).split()
+        ),
+        "state": state,
+        # Forces a fresh eBay login so the intended seller account is obvious.
+        "prompt": "login",
+    }
+
+    return f"{authorization_url}?{urlencode(params)}"
+
+
+def _exchange_ebay_authorization_code(
+    ebay_config: dict,
+    authorization_code: str,
+) -> tuple[int, dict]:
+    """
+    Exchange the one-time authorization code returned by eBay for a short-lived
+    access token and a long-lived refresh token.
+    """
+    _, token_url = _ebay_oauth_endpoints(ebay_config)
+
+    client_id = clean_text(ebay_config.get("client_id"))
+    client_secret = clean_text(ebay_config.get("client_secret"))
+    ru_name = clean_text(ebay_config.get("ru_name"))
+
+    # Streamlit normally gives us a decoded query parameter. If an encoded
+    # value survives, decode it once; requests will form-encode it correctly.
+    code = clean_text(authorization_code)
+    if "%" in code:
+        code = unquote(code)
+
+    credentials = f"{client_id}:{client_secret}"
+    encoded_credentials = base64.b64encode(
+        credentials.encode("utf-8")
+    ).decode("ascii")
+
+    headers = {
+        "Authorization": f"Basic {encoded_credentials}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        # For eBay this must be the RuName assigned to the keyset.
+        "redirect_uri": ru_name,
+    }
+
+    response = requests.post(
+        token_url,
+        headers=headers,
+        data=data,
+        timeout=30,
+    )
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw_response": response.text}
+
+    if response.status_code != 200:
+        payload["_safe_debug"] = {
+            "environment": clean_text(
+                ebay_config.get("environment", "production")
+            ),
+            "token_url": token_url,
+            "client_id_prefix": (
+                client_id[:18] + "..." if client_id else ""
+            ),
+            "client_id_suffix": (
+                "..." + client_id[-8:] if client_id else ""
+            ),
+            "ru_name": ru_name,
+            "authorization_code_loaded": bool(code),
+        }
+
+    return response.status_code, payload
+
+
+def _get_query_param(name: str) -> str:
+    try:
+        value = st.query_params.get(name, "")
+    except Exception:
+        try:
+            value = st.experimental_get_query_params().get(name, "")
+        except Exception:
+            value = ""
+
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+
+    return str(value or "").strip()
+
+
+def _clear_ebay_oauth_query_params() -> None:
+    oauth_keys = {
+        "code",
+        "state",
+        "expires_in",
+        "error",
+        "error_description",
+    }
+
+    try:
+        for key in oauth_keys:
+            if key in st.query_params:
+                del st.query_params[key]
+        return
+    except Exception:
+        pass
+
+    try:
+        existing = st.experimental_get_query_params()
+        keep = {
+            key: value
+            for key, value in existing.items()
+            if key not in oauth_keys
+        }
+        st.experimental_set_query_params(**keep)
+    except Exception:
+        pass
+
+
+def get_access_token_from_refresh_token(ebay_config):
+    _, token_url = _ebay_oauth_endpoints(ebay_config)
+
+    environment = clean_text(
+        ebay_config.get("environment", "production")
+    ).lower()
     client_id = clean_text(ebay_config.get("client_id"))
     client_secret = clean_text(ebay_config.get("client_secret"))
     refresh_token = clean_text(ebay_config.get("refresh_token"))
@@ -410,18 +363,15 @@ def get_access_token_from_refresh_token(ebay_config):
     except Exception:
         payload = {"raw_response": response.text}
 
-    # Retry without scope. A refresh request can omit scope and receive the
-    # permissions already granted to the refresh token.
+    # A refresh request may omit scope and inherit the scopes from consent.
     if response.status_code == 400 and scopes:
-        retry_data = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }
-
         retry_response = requests.post(
             token_url,
             headers=headers,
-            data=retry_data,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
             timeout=30,
         )
 
@@ -447,33 +397,62 @@ def get_access_token_from_refresh_token(ebay_config):
         "environment": environment,
         "token_url": token_url,
         "secrets_source": ebay_config.get("source_label", ""),
-        "client_id_prefix": client_id[:18] + "..." if client_id else "",
-        "client_id_suffix": "..." + client_id[-8:] if client_id else "",
-        "client_secret_prefix": client_secret[:7] + "..."
-        if client_secret
-        else "",
-        "refresh_token_prefix": refresh_token[:12] + "..."
-        if refresh_token
-        else "",
+        "client_id_prefix": (
+            client_id[:18] + "..." if client_id else ""
+        ),
+        "client_id_suffix": (
+            "..." + client_id[-8:] if client_id else ""
+        ),
+        "client_secret_prefix": (
+            client_secret[:7] + "..." if client_secret else ""
+        ),
+        "refresh_token_prefix": (
+            refresh_token[:12] + "..." if refresh_token else ""
+        ),
         "scope_count": len(scopes.split()) if scopes else 0,
     }
 
     return response.status_code, payload
 
+
 def get_access_token_or_stop(ebay_config):
     if not ebay_config:
         st.error(
-            "eBay API credentials are not configured. Add the [ebay] secrets "
-            "shown near the top of this page before using pull or sync actions."
+            "No [ebay] section was found in Streamlit Secrets. "
+            "Open the Connect eBay Account tab for setup instructions."
+        )
+        st.stop()
+
+    missing_oauth_fields = ebay_config.get("missing_oauth_fields", [])
+    if missing_oauth_fields:
+        st.error(
+            "The [ebay] section is missing: "
+            + ", ".join(missing_oauth_fields)
+            + ". Open the Connect eBay Account tab."
+        )
+        st.stop()
+
+    if not clean_text(ebay_config.get("refresh_token")):
+        st.error(
+            "No refresh_token is saved in Streamlit Secrets. "
+            "Use the Connect eBay Account tab to generate one."
         )
         st.stop()
 
     with st.spinner("Getting eBay access token..."):
-        token_status, token_payload = get_access_token_from_refresh_token(ebay_config)
+        token_status, token_payload = get_access_token_from_refresh_token(
+            ebay_config
+        )
 
     if token_status != 200:
-        st.error(f"Could not get eBay access token. Status code: {token_status}")
+        st.error(
+            f"Could not get eBay access token. Status code: {token_status}"
+        )
         st.write(token_payload)
+        st.info(
+            "Use the Connect eBay Account tab to generate a new refresh token, "
+            "then replace refresh_token in Streamlit Secrets."
+        )
         st.stop()
 
     access_token = token_payload.get("access_token")
@@ -484,6 +463,239 @@ def get_access_token_or_stop(ebay_config):
         st.stop()
 
     return access_token
+
+
+def _render_ebay_connect_tab(ebay_config: dict | None) -> None:
+    st.subheader("Connect eBay Account")
+    st.caption(
+        "This creates the long-lived refresh token your app needs. "
+        "No PowerShell is required."
+    )
+
+    if not ebay_config:
+        st.error(
+            "First add an [ebay] section in Streamlit Cloud under "
+            "App settings → Secrets."
+        )
+        st.code(_ebay_expected_secrets_toml(), language="toml")
+        return
+
+    missing_fields = ebay_config.get("missing_oauth_fields", [])
+    if missing_fields:
+        st.error(
+            "Before connecting, add these values to the [ebay] section in "
+            "Streamlit Secrets: "
+            + ", ".join(f"`{field}`" for field in missing_fields)
+        )
+        st.code(_ebay_expected_secrets_toml(), language="toml")
+        return
+
+    st.write(
+        {
+            "environment": ebay_config.get("environment", "production"),
+            "client_id": (
+                clean_text(ebay_config.get("client_id"))[:18] + "..."
+            ),
+            "ru_name": ebay_config.get("ru_name", ""),
+            "scope_count": len(
+                clean_text(ebay_config.get("scopes")).split()
+            ),
+            "refresh_token_currently_saved": bool(
+                clean_text(ebay_config.get("refresh_token"))
+            ),
+        }
+    )
+
+    callback_error = _get_query_param("error")
+    callback_error_description = _get_query_param("error_description")
+
+    if callback_error:
+        st.error(
+            "eBay did not authorize the connection: "
+            + callback_error
+            + (
+                f" — {callback_error_description}"
+                if callback_error_description
+                else ""
+            )
+        )
+        if st.button("Clear eBay authorization error"):
+            _clear_ebay_oauth_query_params()
+            st.rerun()
+
+    returned_code = _get_query_param("code")
+    returned_state = _get_query_param("state")
+
+    if returned_code:
+        if not returned_state or not _verify_ebay_oauth_state(
+            ebay_config,
+            returned_state,
+        ):
+            st.error(
+                "The eBay callback could not be verified or took longer "
+                "than 15 minutes. Start the connection again."
+            )
+            _clear_ebay_oauth_query_params()
+
+        else:
+            code_fingerprint = hashlib.sha256(
+                returned_code.encode("utf-8")
+            ).hexdigest()
+
+            already_processed = (
+                st.session_state.get(
+                    "ebay_oauth_code_fingerprint"
+                )
+                == code_fingerprint
+            )
+
+            if not already_processed:
+                with st.spinner(
+                    "Exchanging eBay authorization code for tokens..."
+                ):
+                    status_code, payload = (
+                        _exchange_ebay_authorization_code(
+                            ebay_config=ebay_config,
+                            authorization_code=returned_code,
+                        )
+                    )
+
+                if status_code == 200 and payload.get("refresh_token"):
+                    st.session_state[
+                        "ebay_oauth_token_payload"
+                    ] = payload
+                    st.session_state[
+                        "ebay_oauth_code_fingerprint"
+                    ] = code_fingerprint
+                    _clear_ebay_oauth_query_params()
+                    st.rerun()
+                else:
+                    st.error(
+                        "eBay sign-in succeeded, but the authorization code "
+                        "could not be exchanged for a refresh token."
+                    )
+                    st.write(payload)
+
+    token_payload = st.session_state.get(
+        "ebay_oauth_token_payload",
+        {},
+    )
+    generated_refresh_token = clean_text(
+        token_payload.get("refresh_token")
+    )
+
+    if generated_refresh_token:
+        st.success("Your new eBay refresh token is ready.")
+
+        st.warning(
+            "Copy the line below now. Then open Streamlit Cloud → "
+            "App settings → Secrets and replace only your existing "
+            "`refresh_token = ...` line."
+        )
+
+        st.code(
+            f'refresh_token = "{generated_refresh_token}"',
+            language="toml",
+        )
+
+        refresh_days = round(
+            to_money(
+                token_payload.get("refresh_token_expires_in")
+            )
+            / 86400,
+            1,
+        )
+        if refresh_days > 0:
+            st.caption(
+                f"eBay reported approximately {refresh_days:,.1f} days "
+                "until this refresh token expires."
+            )
+
+        st.markdown(
+            "**After pasting it into Streamlit Secrets:** save the secrets, "
+            "reboot the app, return here, and click **Test saved refresh token**."
+        )
+
+        clear_col, test_col = st.columns(2)
+
+        with clear_col:
+            if st.button(
+                "I copied it — clear token from this page",
+                use_container_width=True,
+            ):
+                st.session_state.pop(
+                    "ebay_oauth_token_payload",
+                    None,
+                )
+                st.session_state.pop(
+                    "ebay_oauth_code_fingerprint",
+                    None,
+                )
+                st.rerun()
+
+        with test_col:
+            if st.button(
+                "Test saved refresh token",
+                use_container_width=True,
+                disabled=not bool(
+                    clean_text(
+                        ebay_config.get("refresh_token")
+                    )
+                ),
+            ):
+                status_code, payload = (
+                    get_access_token_from_refresh_token(
+                        ebay_config
+                    )
+                )
+
+                if status_code == 200:
+                    st.success(
+                        "The refresh token currently saved in "
+                        "Streamlit Secrets works."
+                    )
+                else:
+                    st.error(
+                        "The refresh token currently saved in "
+                        "Streamlit Secrets is still invalid."
+                    )
+                    st.write(payload)
+
+        st.markdown("---")
+
+    authorization_url = _build_ebay_authorization_url(
+        ebay_config=ebay_config,
+        state=_create_ebay_oauth_state(ebay_config),
+    )
+
+    st.markdown("### Start a new eBay connection")
+    st.write(
+        "1. Click the button below.\n"
+        "2. Sign in to the eBay seller account used by this app.\n"
+        "3. Approve access.\n"
+        "4. eBay will return you to this page and the refresh token "
+        "will appear above."
+    )
+
+    st.link_button(
+        "Connect eBay Account",
+        authorization_url,
+        type="primary",
+        use_container_width=True,
+    )
+
+    with st.expander("Troubleshooting this connection", expanded=False):
+        st.write(
+            "The `ru_name` in Streamlit Secrets must be the OAuth-enabled "
+            "RuName from the same Production keyset as the Client ID and "
+            "Client Secret. In eBay Developer settings, that RuName's "
+            "Auth Accepted URL must point to this Streamlit eBay Store page."
+        )
+        st.write(
+            "The app cannot write to Streamlit Secrets automatically. "
+            "For security, it shows the new refresh-token line so you can "
+            "copy it into Streamlit settings yourself."
+        )
 
 
 # =========================================================
@@ -2602,7 +2814,14 @@ def _display_order_cols() -> list[str]:
 # =========================================================
 
 ebay_config = get_ebay_secrets()
-ebay_ready = bool(ebay_config)
+ebay_oauth_setup_ready = bool(
+    ebay_config
+    and ebay_config.get("oauth_setup_ready")
+)
+ebay_ready = bool(
+    ebay_oauth_setup_ready
+    and clean_text(ebay_config.get("refresh_token"))
+)
 
 data = load_data()
 inv = _safe_df(data.inventory)
@@ -2684,14 +2903,20 @@ with top3:
 with top4:
     if ebay_ready:
         st.info(
-            "Workflow: price ACTIVE inventory → pull listings → review assignments "
-            "→ sync sold eBay orders with fees.",
+            "eBay credentials are loaded. Pull listings, assign inventory, "
+            "and sync sold orders.",
+            icon="ℹ️",
+        )
+    elif ebay_oauth_setup_ready:
+        st.info(
+            "Open the Connect eBay Account tab to generate a refresh token. "
+            "Inventory pricing remains available.",
             icon="ℹ️",
         )
     else:
         st.info(
-            "Inventory pricing is available now. eBay pull and sync controls will "
-            "unlock after the [ebay] secrets are added.",
+            "Add the base [ebay] credentials in Streamlit Secrets, then use "
+            "the Connect eBay Account tab.",
             icon="ℹ️",
         )
 
@@ -2729,28 +2954,54 @@ if sync_now:
     st.rerun()
 
 with st.expander("eBay config check", expanded=False):
-    if ebay_ready:
+    if ebay_config:
         st.write(
             {
-                "connection_ready": True,
-                "secrets_source": ebay_config.get("source_label", "unknown"),
-                "environment": ebay_config.get("environment", "production"),
-                "marketplace_id": ebay_config.get("marketplace_id", "EBAY_US"),
-                "client_id_prefix": clean_text(
-                    ebay_config.get("client_id")
-                )[:12] + "...",
+                "oauth_setup_ready": ebay_oauth_setup_ready,
+                "api_connection_ready": ebay_ready,
+                "secrets_source": ebay_config.get(
+                    "source_label",
+                    "unknown",
+                ),
+                "environment": ebay_config.get(
+                    "environment",
+                    "production",
+                ),
+                "marketplace_id": ebay_config.get(
+                    "marketplace_id",
+                    "EBAY_US",
+                ),
+                "client_id_prefix": (
+                    clean_text(
+                        ebay_config.get("client_id")
+                    )[:12]
+                    + "..."
+                ),
                 "ru_name": ebay_config.get("ru_name", ""),
                 "refresh_token_loaded": bool(
-                    ebay_config.get("refresh_token")
+                    clean_text(
+                        ebay_config.get("refresh_token")
+                    )
                 ),
-                "scopes_loaded": bool(ebay_config.get("scopes")),
+                "scopes_loaded": bool(
+                    clean_text(ebay_config.get("scopes"))
+                ),
+                "missing_oauth_fields": ebay_config.get(
+                    "missing_oauth_fields",
+                    [],
+                ),
             }
         )
+        if not ebay_ready:
+            st.info(
+                "Open the Connect eBay Account tab to finish OAuth setup."
+            )
     else:
-        st.write({"connection_ready": False})
-        st.info(
-            "Pricing does not require eBay credentials. Add the [ebay] secrets "
-            "shown above to enable listing pulls and sold-order sync."
+        st.write(
+            {
+                "oauth_setup_ready": False,
+                "api_connection_ready": False,
+            }
         )
         st.code(_ebay_expected_secrets_toml(), language="toml")
 
@@ -2873,8 +3124,9 @@ with st.expander("eBay pricing estimator settings", expanded=True):
     )
 
 
-tab_pricing, tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
+tab_connect, tab_pricing, tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
     [
+        "0. Connect eBay Account",
         "1. Active Inventory Pricing",
         "2. Pull Active Listings",
         "3. Assign Listings",
@@ -2882,6 +3134,10 @@ tab_pricing, tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
         "Audit / Raw Data",
     ]
 )
+
+with tab_connect:
+    _render_ebay_connect_tab(ebay_config)
+
 
 
 
