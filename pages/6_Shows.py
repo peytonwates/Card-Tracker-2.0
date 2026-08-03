@@ -31,8 +31,8 @@ st.caption(
     "card inventory, manually review matches, then process purchases and sales."
 )
 st.caption(
-    "Shows page build: 2026-07-20 · Collectr reconciliation matching v5 · "
-    "Whole-word sealed detection and interactive one-to-one match review"
+    "Shows page build: 2026-08-02 · Collectr reconciliation matching v6 · "
+    "Availability-aware duplicate matching and interactive one-to-one review"
 )
 
 
@@ -63,6 +63,7 @@ COLLECTR_ALIASES = {
 
 AUTO_MATCH_THRESHOLD_DEFAULT = 80.0
 REVIEW_MATCH_THRESHOLD = 60.0
+MATCHING_ENGINE_VERSION = "v6-availability-aware"
 
 SEALED_COLLECTR_TERMS = {
     "booster box",
@@ -459,7 +460,14 @@ def _is_explicit_consignment(row: pd.Series) -> bool:
 
 
 def _is_explicit_personal(row: pd.Series) -> bool:
-    structured_text = " ".join(
+    """Return True only when ownership fields explicitly mark the row personal.
+
+    `purchased_from` and free-form `notes` are intentionally excluded. A business
+    inventory card may have been sourced from a personal collection without being
+    Personal Inventory. Treating source text as ownership caused valid ACTIVE cards
+    such as the second Team Rocket's Weezing copy to be removed before matching.
+    """
+    ownership_text = " ".join(
         _norm(row.get(col))
         for col in [
             "inventory_type",
@@ -467,11 +475,9 @@ def _is_explicit_personal(row: pd.Series) -> bool:
             "owner_type",
             "inventory_owner",
             "portfolio_name",
-            "purchased_from",
-            "notes",
         ]
     )
-    if "personal" in structured_text:
+    if "personal" in ownership_text:
         return True
     return _truthy(row.get("is_personal"), default=False)
 
@@ -1202,28 +1208,101 @@ def _reconcile_collectr(
             pairs_by_inventory[int(inventory_idx)].append(record)
 
     keep_newest = duplicate_policy == "Keep newest eligible inventory"
-    pair_records.sort(
-        key=lambda record: (
+
+    def candidate_preference_key(record: dict[str, Any]) -> tuple[Any, ...]:
+        """Sort one Collectr row's candidates from strongest to weakest.
+
+        Purchase date is only a tie-breaker for genuinely identical copies. The
+        match score and exact identity fields always take priority.
+        """
+        purchase_preference = (
+            record["purchase_rank"]
+            if keep_newest
+            else -record["purchase_rank"]
+        )
+        return (
             record["score"],
             int(record["exact_number"]),
             int(record["exact_name"]),
             int(record["exact_set"]),
-            record["purchase_rank"] if keep_newest else -record["purchase_rank"],
+            purchase_preference,
+            -record["inventory_index"],
+        )
+
+    qualifying_by_collectr: dict[int, list[dict[str, Any]]] = {}
+    for collectr_idx in collectr_work.index:
+        qualifying = [
+            record
+            for record in pairs_by_collectr.get(int(collectr_idx), [])
+            if record["score"] >= auto_match_threshold
+        ]
+        qualifying.sort(key=candidate_preference_key, reverse=True)
+        qualifying_by_collectr[int(collectr_idx)] = qualifying
+
+    # Match the most constrained Collectr copies first. Then use an augmenting
+    # path whenever the preferred inventory row is already occupied. This is
+    # the key duplicate fix: a second copy does not stop at the already-used
+    # best candidate; it can move the first copy to another valid inventory row
+    # and consume the remaining copy instead.
+    collectr_match_order = sorted(
+        [
+            int(collectr_idx)
+            for collectr_idx in collectr_work.index
+            if qualifying_by_collectr.get(int(collectr_idx))
+        ],
+        key=lambda collectr_idx: (
+            len(qualifying_by_collectr[collectr_idx]),
+            -qualifying_by_collectr[collectr_idx][0]["score"],
+            collectr_idx,
         ),
-        reverse=True,
     )
 
     assigned_collectr: dict[int, dict[str, Any]] = {}
     assigned_inventory: dict[int, dict[str, Any]] = {}
-    for record in pair_records:
-        if record["score"] < auto_match_threshold:
-            continue
-        collectr_idx = record["collectr_index"]
-        inventory_idx = record["inventory_index"]
-        if collectr_idx in assigned_collectr or inventory_idx in assigned_inventory:
-            continue
-        assigned_collectr[collectr_idx] = record
-        assigned_inventory[inventory_idx] = record
+
+    def try_assign_collectr(
+        collectr_idx: int,
+        seen_collectr: set[int],
+        seen_inventory: set[int],
+    ) -> bool:
+        if collectr_idx in seen_collectr:
+            return False
+        seen_collectr.add(collectr_idx)
+
+        for record in qualifying_by_collectr.get(collectr_idx, []):
+            inventory_idx = int(record["inventory_index"])
+            if inventory_idx in seen_inventory:
+                continue
+            seen_inventory.add(inventory_idx)
+
+            existing = assigned_inventory.get(inventory_idx)
+            if existing is None:
+                assigned_collectr[collectr_idx] = record
+                assigned_inventory[inventory_idx] = record
+                return True
+
+            existing_collectr_idx = int(existing["collectr_index"])
+            if try_assign_collectr(
+                existing_collectr_idx,
+                seen_collectr,
+                seen_inventory,
+            ):
+                assigned_collectr[collectr_idx] = record
+                assigned_inventory[inventory_idx] = record
+                return True
+
+        return False
+
+    for collectr_idx in collectr_match_order:
+        try_assign_collectr(collectr_idx, set(), set())
+
+    # Rebuild the inventory-side map from the final Collectr assignments. During
+    # an augmenting path, a Collectr row can move to a different inventory row;
+    # rebuilding prevents an old inventory key from retaining a stale record.
+    assigned_inventory = {
+        int(record["inventory_index"]): record
+        for record in assigned_collectr.values()
+    }
 
     audit_rows: list[dict[str, Any]] = []
     for collectr_idx, collectr_row in collectr_work.iterrows():
@@ -1267,7 +1346,7 @@ def _reconcile_collectr(
         if candidate is None or candidate["score"] < REVIEW_MATCH_THRESHOLD:
             status = "NO RELIABLE MATCH"
         elif candidate["score"] >= auto_match_threshold and candidate["inventory_index"] in assigned_inventory:
-            status = "UNMATCHED COPY - INVENTORY MATCH ALREADY USED"
+            status = "UNMATCHED COPY - ALL COMPATIBLE INVENTORY COPIES USED"
         else:
             status = "REVIEW SUGGESTION"
 
@@ -1468,7 +1547,11 @@ def _assignment_state_key(
     )
     fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:10]
     policy = _compact(duplicate_policy)[:12]
-    return f"collectr_review_{batch_id}_{int(threshold)}_{policy}_{fingerprint}"
+    engine = _compact(MATCHING_ENGINE_VERSION)[:24]
+    return (
+        f"collectr_review_{engine}_{batch_id}_{int(threshold)}_"
+        f"{policy}_{fingerprint}"
+    )
 
 
 def _set_review_assignment(
