@@ -3154,6 +3154,364 @@ def _recent_ebay_order_item_ids(
     }
 
 
+
+# =========================================================
+# TCGPlayer persistent editor and manual sale helpers
+# =========================================================
+
+TCGPLAYER_LISTING_DRAFT_KEY = "tcgplayer_listing_draft_by_inventory_id"
+TCGPLAYER_LISTING_EDITOR_KEY = "tcgplayer_listing_editor"
+TCGPLAYER_LISTING_VISIBLE_IDS_KEY = "tcgplayer_listing_editor_visible_ids"
+
+TCGPLAYER_SALE_DRAFT_KEY = "tcgplayer_sale_draft_by_inventory_id"
+TCGPLAYER_SALE_EDITOR_KEY = "tcgplayer_active_sale_editor"
+TCGPLAYER_SALE_VISIBLE_IDS_KEY = "tcgplayer_sale_editor_visible_ids"
+
+
+def _capture_data_editor_draft_changes(
+    draft_key: str,
+    editor_key: str,
+    visible_ids_key: str,
+    editable_columns: list[str],
+) -> None:
+    """
+    Persist the previous visible data-editor edits by inventory ID.
+
+    Streamlit stores data-editor changes by visible row position. Saving the
+    visible inventory-ID order lets the app transfer those edits into a durable
+    draft before a search/filter changes the rows shown in the editor.
+    """
+    widget_state = st.session_state.get(editor_key)
+    visible_ids = st.session_state.get(visible_ids_key, [])
+
+    if not isinstance(widget_state, dict) or not isinstance(visible_ids, list):
+        return
+
+    edited_rows = widget_state.get("edited_rows", {}) or {}
+    if not isinstance(edited_rows, dict):
+        return
+
+    draft = st.session_state.get(draft_key, {})
+    if not isinstance(draft, dict):
+        draft = {}
+
+    for row_position, changes in edited_rows.items():
+        try:
+            position = int(row_position)
+        except (TypeError, ValueError):
+            continue
+
+        if position < 0 or position >= len(visible_ids):
+            continue
+
+        inventory_id = clean_text(visible_ids[position])
+        if not inventory_id or not isinstance(changes, dict):
+            continue
+
+        draft_row = dict(draft.get(inventory_id, {}))
+        draft_row["inventory_id"] = inventory_id
+
+        for column_name in editable_columns:
+            if column_name in changes:
+                draft_row[column_name] = changes[column_name]
+
+        draft[inventory_id] = draft_row
+
+    st.session_state[draft_key] = draft
+
+    # Remove the old row-position state before rendering a different filtered
+    # row set under the same widget key.
+    st.session_state.pop(editor_key, None)
+
+
+def _initialize_inventory_id_draft(
+    source_df: pd.DataFrame,
+    draft_key: str,
+    editable_columns: list[str],
+) -> dict[str, dict]:
+    """Refresh read-only values while preserving unsynced editable values."""
+    existing_draft = st.session_state.get(draft_key, {})
+    if not isinstance(existing_draft, dict):
+        existing_draft = {}
+
+    refreshed_draft: dict[str, dict] = {}
+
+    for _, source_row in source_df.iterrows():
+        inventory_id = clean_text(source_row.get("inventory_id"))
+        if not inventory_id:
+            continue
+
+        source_values = source_row.to_dict()
+        previous_values = existing_draft.get(inventory_id, {})
+        merged_values = dict(source_values)
+
+        if isinstance(previous_values, dict):
+            for column_name in editable_columns:
+                if column_name in previous_values:
+                    merged_values[column_name] = previous_values[column_name]
+
+        merged_values["inventory_id"] = inventory_id
+        refreshed_draft[inventory_id] = merged_values
+
+    st.session_state[draft_key] = refreshed_draft
+    return refreshed_draft
+
+
+def _draft_dataframe_in_source_order(
+    source_df: pd.DataFrame,
+    draft_key: str,
+) -> pd.DataFrame:
+    draft = st.session_state.get(draft_key, {})
+    if source_df.empty or not isinstance(draft, dict):
+        return pd.DataFrame()
+
+    rows = []
+    for inventory_id in source_df["inventory_id"].astype(str).str.strip().tolist():
+        if inventory_id in draft:
+            rows.append(dict(draft[inventory_id]))
+
+    return pd.DataFrame(rows)
+
+
+def _active_tcgplayer_listing_df(inv_df: pd.DataFrame) -> pd.DataFrame:
+    if inv_df.empty:
+        return pd.DataFrame()
+
+    working = _ensure_cols(
+        inv_df,
+        [
+            "inventory_id",
+            "inventory_status",
+            "platform",
+            "card_name",
+            "set_name",
+            "card_number",
+            "variant",
+            "grading_company",
+            "grade",
+            "list_date",
+            "list_price",
+            "total_cost",
+            "notes",
+            "tcgplayer_listing_url",
+            "tcgplayer_listing_status",
+        ],
+    ).copy()
+
+    working["inventory_id"] = working["inventory_id"].astype(str).str.strip()
+    working["inventory_status"] = (
+        working["inventory_status"].astype(str).str.upper().str.strip()
+    )
+
+    working = working[
+        working["inventory_id"].ne("")
+        & working["inventory_status"].eq(STATUS_LISTED)
+        & working.apply(_row_has_tcgplayer_platform, axis=1)
+    ].copy()
+
+    if working.empty:
+        return working
+
+    working = working[~working["inventory_id"].duplicated(keep=False)].copy()
+
+    rows = []
+    for _, row in working.iterrows():
+        rows.append(
+            {
+                "inventory_id": clean_text(row.get("inventory_id")),
+                "card_name": clean_text(row.get("card_name")),
+                "set_name": clean_text(row.get("set_name")),
+                "card_number": clean_text(row.get("card_number")),
+                "variant": clean_text(row.get("variant")),
+                "grading_company": clean_text(row.get("grading_company")),
+                "grade": clean_text(row.get("grade")),
+                "list_date": clean_text(row.get("list_date")),
+                "list_price": _safe_money_round(row.get("list_price")),
+                "total_cost": _safe_money_round(row.get("total_cost")),
+                "tcgplayer_list_link": _extract_tcgplayer_listing_url(row),
+                "mark_sold": False,
+                "gross_sold_price": None,
+                "platform_fees": None,
+                "shipping_cost": None,
+                "tax_collected": None,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(
+            ["list_date", "card_name", "inventory_id"],
+            ascending=[False, True, True],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    return out
+
+
+def _add_tcgplayer_sale_calculations(sale_df: pd.DataFrame) -> pd.DataFrame:
+    if sale_df.empty:
+        return sale_df.copy()
+
+    out = sale_df.copy()
+    for column_name in [
+        "gross_sold_price",
+        "platform_fees",
+        "shipping_cost",
+        "tax_collected",
+        "total_cost",
+    ]:
+        if column_name not in out.columns:
+            out[column_name] = 0.0
+
+    out["total_sale_deductions"] = out.apply(
+        lambda row: round(
+            to_money(row.get("platform_fees"))
+            + to_money(row.get("shipping_cost"))
+            + to_money(row.get("tax_collected")),
+            2,
+        ),
+        axis=1,
+    )
+    out["net_proceeds_preview"] = out.apply(
+        lambda row: round(
+            to_money(row.get("gross_sold_price"))
+            - to_money(row.get("total_sale_deductions")),
+            2,
+        ),
+        axis=1,
+    )
+    out["profit_preview"] = out.apply(
+        lambda row: round(
+            to_money(row.get("net_proceeds_preview"))
+            - to_money(row.get("total_cost")),
+            2,
+        ),
+        axis=1,
+    )
+    return out
+
+
+def _sync_manual_tcgplayer_sales(
+    selected_sales: pd.DataFrame,
+    fresh_inv: pd.DataFrame,
+) -> tuple[int, pd.DataFrame]:
+    if selected_sales.empty or fresh_inv.empty:
+        return 0, pd.DataFrame()
+
+    fresh_working = _ensure_cols(fresh_inv, needed_inv_cols).copy()
+    fresh_working["inventory_id"] = (
+        fresh_working["inventory_id"].astype(str).str.strip()
+    )
+    fresh_working["inventory_status"] = (
+        fresh_working["inventory_status"].astype(str).str.upper().str.strip()
+    )
+    fresh_working = fresh_working[
+        fresh_working["inventory_id"].ne("")
+        & ~fresh_working["inventory_id"].duplicated(keep=False)
+    ].copy()
+    fresh_lookup = fresh_working.set_index("inventory_id", drop=False)
+
+    invalid_rows = []
+    updates_by_inventory_id = {}
+    sale_timestamp = now_iso()
+    sold_date = str(date.today())
+
+    for _, sale_row in selected_sales.iterrows():
+        inventory_id = clean_text(sale_row.get("inventory_id"))
+
+        if inventory_id not in fresh_lookup.index:
+            invalid_rows.append(
+                {
+                    "inventory_id": inventory_id,
+                    "reason": "Inventory ID is missing or duplicated in the latest database",
+                }
+            )
+            continue
+
+        fresh_row = fresh_lookup.loc[inventory_id]
+        is_active_tcgplayer = bool(
+            clean_text(fresh_row.get("inventory_status")).upper() == STATUS_LISTED
+            and _row_has_tcgplayer_platform(fresh_row)
+        )
+
+        if not is_active_tcgplayer:
+            invalid_rows.append(
+                {
+                    "inventory_id": inventory_id,
+                    "card_name": clean_text(fresh_row.get("card_name")),
+                    "reason": "The row is no longer an active TCGPlayer listing",
+                }
+            )
+            continue
+
+        gross_sold_price = _safe_money_round(sale_row.get("gross_sold_price"))
+        platform_fees = _safe_money_round(sale_row.get("platform_fees"))
+        shipping_cost = _safe_money_round(sale_row.get("shipping_cost"))
+        tax_collected = _safe_money_round(sale_row.get("tax_collected"))
+        total_cost = _safe_money_round(fresh_row.get("total_cost"))
+        total_deductions = round(
+            platform_fees + shipping_cost + tax_collected,
+            2,
+        )
+        net_proceeds = round(gross_sold_price - total_deductions, 2)
+        profit = round(net_proceeds - total_cost, 2)
+
+        update = {
+            "inventory_status": STATUS_SOLD,
+            "transaction_type": "TCGPlayer Sale",
+            "platform": TCGPLAYER_PLATFORM_NAME,
+            "sale_channel": TCGPLAYER_PLATFORM_NAME,
+            "sold_date": sold_date,
+            "sold_price": gross_sold_price,
+            "fees": platform_fees,
+            "fees_total": total_deductions,
+            "net_proceeds": net_proceeds,
+            "profit": profit,
+            "sale_notes": (
+                "Manually recorded TCGPlayer sale. "
+                f"Gross collected: ${gross_sold_price:.2f}; "
+                f"platform fees: ${platform_fees:.2f}; "
+                f"shipping cost: ${shipping_cost:.2f}; "
+                f"tax collected/remitted: ${tax_collected:.2f}."
+            ),
+            "sold_transaction_id": (
+                f"TCGPLAYER-MANUAL-{inventory_id}-{int(time.time())}"
+            ),
+            "sold_created_at": sale_timestamp,
+            "sold_updated_at": sale_timestamp,
+        }
+
+        if "tax_collected" in INVENTORY_COLUMNS:
+            update["tax_collected"] = tax_collected
+        if "tcgplayer_fees" in INVENTORY_COLUMNS:
+            update["tcgplayer_fees"] = platform_fees
+        if "tcgplayer_shipping_cost" in INVENTORY_COLUMNS:
+            update["tcgplayer_shipping_cost"] = shipping_cost
+        if "tcgplayer_tax_collected" in INVENTORY_COLUMNS:
+            update["tcgplayer_tax_collected"] = tax_collected
+        if "tcgplayer_listing_status" in INVENTORY_COLUMNS:
+            update["tcgplayer_listing_status"] = "Sold"
+        if "tcgplayer_last_sync_at" in INVENTORY_COLUMNS:
+            update["tcgplayer_last_sync_at"] = sale_timestamp
+
+        updates_by_inventory_id[inventory_id] = update
+
+    invalid_df = pd.DataFrame(invalid_rows)
+    if invalid_rows:
+        return 0, invalid_df
+
+    if not updates_by_inventory_id:
+        return 0, invalid_df
+
+    update_rows_by_key(
+        get_ws_name("inventory_worksheet", "inventory"),
+        INVENTORY_COLUMNS,
+        "inventory_id",
+        updates_by_inventory_id,
+    )
+
+    return len(updates_by_inventory_id), invalid_df
+
 # =========================================================
 # Load app data
 # =========================================================
@@ -3203,6 +3561,19 @@ needed_inv_cols = [
     "ebay_transaction_id",
     "ebay_payout_id",
     "ebay_last_sync_at",
+    "tcgplayer_listing_status",
+    "tcgplayer_last_sync_at",
+    "sold_date",
+    "sold_price",
+    "fees",
+    "fees_total",
+    "net_proceeds",
+    "profit",
+    "sale_notes",
+    "sold_transaction_id",
+    "sold_created_at",
+    "sold_updated_at",
+    "tax_collected",
 ]
 
 inv = _ensure_cols(inv, needed_inv_cols)
@@ -4892,6 +5263,19 @@ with tab_tcgplayer:
         icon="ℹ️",
     )
 
+    # Capture edits from the previously visible filtered rows before the
+    # current search value changes which inventory IDs are displayed.
+    _capture_data_editor_draft_changes(
+        draft_key=TCGPLAYER_LISTING_DRAFT_KEY,
+        editor_key=TCGPLAYER_LISTING_EDITOR_KEY,
+        visible_ids_key=TCGPLAYER_LISTING_VISIBLE_IDS_KEY,
+        editable_columns=[
+            "list_on_tcgplayer",
+            "tcgplayer_list_price",
+            "tcgplayer_list_link",
+        ],
+    )
+
     editor_source = _build_tcgplayer_editor_df(
         inv_df=inv,
         active_ebay_item_ids=cached_active_item_ids,
@@ -4904,7 +5288,17 @@ with tab_tcgplayer:
             "updated safely by inventory ID."
         )
     else:
-        filter_col, metrics_col = st.columns([2.2, 1.8])
+        _initialize_inventory_id_draft(
+            source_df=editor_source,
+            draft_key=TCGPLAYER_LISTING_DRAFT_KEY,
+            editable_columns=[
+                "list_on_tcgplayer",
+                "tcgplayer_list_price",
+                "tcgplayer_list_link",
+            ],
+        )
+
+        filter_col, metrics_col, reset_col = st.columns([2.1, 1.55, 0.85])
 
         with filter_col:
             tcgplayer_search = st.text_input(
@@ -4912,20 +5306,41 @@ with tab_tcgplayer:
                 key="tcgplayer_inventory_search",
             )
 
+        draft_all = _draft_dataframe_in_source_order(
+            source_df=editor_source,
+            draft_key=TCGPLAYER_LISTING_DRAFT_KEY,
+        )
+
         with metrics_col:
             listed_tcg_count = int(
-                editor_source["list_on_tcgplayer"].apply(_as_bool).sum()
-            )
+                draft_all["list_on_tcgplayer"].apply(_as_bool).sum()
+            ) if not draft_all.empty else 0
             listed_ebay_count = int(
                 editor_source["listed_on_ebay"].eq("Yes").sum()
             )
             st.caption(
-                f"{len(editor_source):,} saleable inventory rows · "
-                f"{listed_tcg_count:,} marked TCGPlayer · "
+                f"{len(editor_source):,} saleable rows · "
+                f"{listed_tcg_count:,} checked in current draft · "
                 f"{listed_ebay_count:,} shown active on eBay"
             )
 
-        editor_display = editor_source.copy()
+        with reset_col:
+            st.write("")
+            if st.button(
+                "Discard draft",
+                key="discard_tcgplayer_listing_draft",
+                use_container_width=True,
+                help="Remove all unsynced checkbox, price, and link changes.",
+            ):
+                for state_key in [
+                    TCGPLAYER_LISTING_DRAFT_KEY,
+                    TCGPLAYER_LISTING_EDITOR_KEY,
+                    TCGPLAYER_LISTING_VISIBLE_IDS_KEY,
+                ]:
+                    st.session_state.pop(state_key, None)
+                st.rerun()
+
+        editor_display = draft_all.copy()
 
         if tcgplayer_search.strip():
             query = tcgplayer_search.lower().strip()
@@ -4954,9 +5369,14 @@ with tab_tcgplayer:
             "checked. Unchecking one removes its internal TCGPlayer assignment."
         )
 
-        edited_tcgplayer = st.data_editor(
+        editor_display = editor_display.reset_index(drop=True)
+        st.session_state[TCGPLAYER_LISTING_VISIBLE_IDS_KEY] = (
+            editor_display["inventory_id"].astype(str).str.strip().tolist()
+        )
+
+        st.data_editor(
             editor_display,
-            key="tcgplayer_listing_editor",
+            key=TCGPLAYER_LISTING_EDITOR_KEY,
             use_container_width=True,
             hide_index=True,
             height=700,
@@ -5074,11 +5494,14 @@ with tab_tcgplayer:
         )
 
         if sync_tcgplayer_changes:
-            if edited_tcgplayer.empty:
-                st.warning("No inventory rows are visible to sync.")
-                st.stop()
+            pending = _draft_dataframe_in_source_order(
+                source_df=editor_source,
+                draft_key=TCGPLAYER_LISTING_DRAFT_KEY,
+            )
 
-            pending = edited_tcgplayer.copy()
+            if pending.empty:
+                st.warning("No inventory rows are available to sync.")
+                st.stop()
             pending["inventory_id"] = (
                 pending["inventory_id"].astype(str).str.strip()
             )
@@ -5605,11 +6028,317 @@ with tab_tcgplayer:
             )
 
             refresh_database_cache()
-            st.session_state.pop("tcgplayer_listing_editor", None)
+            for state_key in [
+                TCGPLAYER_LISTING_DRAFT_KEY,
+                TCGPLAYER_LISTING_EDITOR_KEY,
+                TCGPLAYER_LISTING_VISIBLE_IDS_KEY,
+            ]:
+                st.session_state.pop(state_key, None)
             st.session_state["tcgplayer_sync_message"] = (
                 f"Synced {len(updates_by_inventory_id):,} inventory row(s). "
                 "TCGPlayer assignments were saved by inventory ID, and any "
                 "confirmed-ended eBay assignment fields were cleared."
+            )
+            st.rerun()
+
+
+    st.markdown("---")
+    st.markdown("### Active TCGPlayer listings and manual sale entry")
+    st.caption(
+        "Mark active TCGPlayer inventory IDs as sold and enter the complete "
+        "order economics. **Gross Sold Price** should be the total collected "
+        "from the buyer, including item price, buyer-paid shipping, and tax. "
+        "Net proceeds are calculated as gross minus platform fees, actual "
+        "shipping cost, and tax. The sold date is the date you click the button."
+    )
+
+    _capture_data_editor_draft_changes(
+        draft_key=TCGPLAYER_SALE_DRAFT_KEY,
+        editor_key=TCGPLAYER_SALE_EDITOR_KEY,
+        visible_ids_key=TCGPLAYER_SALE_VISIBLE_IDS_KEY,
+        editable_columns=[
+            "mark_sold",
+            "gross_sold_price",
+            "platform_fees",
+            "shipping_cost",
+            "tax_collected",
+        ],
+    )
+
+    active_tcgplayer_source = _active_tcgplayer_listing_df(inv)
+
+    if active_tcgplayer_source.empty:
+        st.info("No inventory rows are currently marked as active TCGPlayer listings.")
+        for state_key in [
+            TCGPLAYER_SALE_DRAFT_KEY,
+            TCGPLAYER_SALE_EDITOR_KEY,
+            TCGPLAYER_SALE_VISIBLE_IDS_KEY,
+        ]:
+            st.session_state.pop(state_key, None)
+    else:
+        _initialize_inventory_id_draft(
+            source_df=active_tcgplayer_source,
+            draft_key=TCGPLAYER_SALE_DRAFT_KEY,
+            editable_columns=[
+                "mark_sold",
+                "gross_sold_price",
+                "platform_fees",
+                "shipping_cost",
+                "tax_collected",
+            ],
+        )
+
+        sale_filter_col, sale_metric_col, sale_reset_col = st.columns(
+            [2.1, 1.55, 0.85]
+        )
+
+        with sale_filter_col:
+            tcgplayer_sale_search = st.text_input(
+                "Search active TCGPlayer listings",
+                key="tcgplayer_active_sale_search",
+            )
+
+        sale_draft_all = _draft_dataframe_in_source_order(
+            source_df=active_tcgplayer_source,
+            draft_key=TCGPLAYER_SALE_DRAFT_KEY,
+        )
+        sale_draft_all = _add_tcgplayer_sale_calculations(sale_draft_all)
+
+        with sale_metric_col:
+            selected_sale_count = int(
+                sale_draft_all["mark_sold"].apply(_as_bool).sum()
+            ) if not sale_draft_all.empty else 0
+            st.caption(
+                f"{len(active_tcgplayer_source):,} active TCGPlayer listings · "
+                f"{selected_sale_count:,} selected to mark sold"
+            )
+
+        with sale_reset_col:
+            st.write("")
+            if st.button(
+                "Discard sales",
+                key="discard_tcgplayer_sale_draft",
+                use_container_width=True,
+                help="Clear all unsaved sale checkboxes and amounts.",
+            ):
+                for state_key in [
+                    TCGPLAYER_SALE_DRAFT_KEY,
+                    TCGPLAYER_SALE_EDITOR_KEY,
+                    TCGPLAYER_SALE_VISIBLE_IDS_KEY,
+                ]:
+                    st.session_state.pop(state_key, None)
+                st.rerun()
+
+        sale_display = sale_draft_all.copy()
+
+        if tcgplayer_sale_search.strip():
+            sale_query = tcgplayer_sale_search.lower().strip()
+
+            def _tcgplayer_sale_search_match(row: pd.Series) -> bool:
+                values = [
+                    row.get("inventory_id", ""),
+                    row.get("card_name", ""),
+                    row.get("set_name", ""),
+                    row.get("card_number", ""),
+                    row.get("variant", ""),
+                    row.get("grading_company", ""),
+                    row.get("grade", ""),
+                ]
+                return sale_query in " ".join(
+                    str(value).lower() for value in values
+                )
+
+            sale_display = sale_display[
+                sale_display.apply(_tcgplayer_sale_search_match, axis=1)
+            ].copy()
+
+        sale_display = sale_display.reset_index(drop=True)
+        st.session_state[TCGPLAYER_SALE_VISIBLE_IDS_KEY] = (
+            sale_display["inventory_id"].astype(str).str.strip().tolist()
+        )
+
+        st.data_editor(
+            sale_display,
+            key=TCGPLAYER_SALE_EDITOR_KEY,
+            use_container_width=True,
+            hide_index=True,
+            height=520,
+            column_order=[
+                "inventory_id",
+                "card_name",
+                "set_name",
+                "card_number",
+                "variant",
+                "grade",
+                "list_date",
+                "list_price",
+                "tcgplayer_list_link",
+                "total_cost",
+                "mark_sold",
+                "gross_sold_price",
+                "platform_fees",
+                "shipping_cost",
+                "tax_collected",
+                "total_sale_deductions",
+                "net_proceeds_preview",
+                "profit_preview",
+            ],
+            column_config={
+                "inventory_id": st.column_config.TextColumn(
+                    "Inventory ID", disabled=True
+                ),
+                "card_name": st.column_config.TextColumn(
+                    "Card Name", disabled=True, width="large"
+                ),
+                "set_name": st.column_config.TextColumn("Set", disabled=True),
+                "card_number": st.column_config.TextColumn("Card #", disabled=True),
+                "variant": st.column_config.TextColumn("Variant", disabled=True),
+                "grade": st.column_config.TextColumn("Grade", disabled=True),
+                "list_date": st.column_config.TextColumn("Listed Date", disabled=True),
+                "list_price": st.column_config.NumberColumn(
+                    "List Price", format="$%.2f", disabled=True
+                ),
+                "tcgplayer_list_link": st.column_config.LinkColumn(
+                    "TCGPlayer Link", disabled=True
+                ),
+                "total_cost": st.column_config.NumberColumn(
+                    "Total Cost", format="$%.2f", disabled=True
+                ),
+                "mark_sold": st.column_config.CheckboxColumn(
+                    "Mark Sold",
+                    help="Checked rows will be marked SOLD when the button is clicked.",
+                ),
+                "gross_sold_price": st.column_config.NumberColumn(
+                    "Gross Sold Price",
+                    min_value=0.0,
+                    step=0.01,
+                    format="$%.2f",
+                    help="Total collected, including buyer shipping and tax.",
+                ),
+                "platform_fees": st.column_config.NumberColumn(
+                    "TCGPlayer Fees",
+                    min_value=0.0,
+                    step=0.01,
+                    format="$%.2f",
+                ),
+                "shipping_cost": st.column_config.NumberColumn(
+                    "Shipping Cost",
+                    min_value=0.0,
+                    step=0.01,
+                    format="$%.2f",
+                    help="Your actual postage/label cost.",
+                ),
+                "tax_collected": st.column_config.NumberColumn(
+                    "Tax",
+                    min_value=0.0,
+                    step=0.01,
+                    format="$%.2f",
+                    help="Tax included in the gross amount and remitted by TCGPlayer.",
+                ),
+                "total_sale_deductions": st.column_config.NumberColumn(
+                    "Total Deductions", format="$%.2f", disabled=True
+                ),
+                "net_proceeds_preview": st.column_config.NumberColumn(
+                    "Net Proceeds", format="$%.2f", disabled=True
+                ),
+                "profit_preview": st.column_config.NumberColumn(
+                    "Profit", format="$%.2f", disabled=True
+                ),
+            },
+            disabled=[
+                "inventory_id",
+                "card_name",
+                "set_name",
+                "card_number",
+                "variant",
+                "grade",
+                "list_date",
+                "list_price",
+                "tcgplayer_list_link",
+                "total_cost",
+                "total_sale_deductions",
+                "net_proceeds_preview",
+                "profit_preview",
+            ],
+        )
+
+        mark_tcgplayer_sold = st.button(
+            "Mark selected TCGPlayer listings sold",
+            type="primary",
+            use_container_width=True,
+            key="mark_selected_tcgplayer_listings_sold",
+        )
+
+        if mark_tcgplayer_sold:
+            sale_pending = _draft_dataframe_in_source_order(
+                source_df=active_tcgplayer_source,
+                draft_key=TCGPLAYER_SALE_DRAFT_KEY,
+            )
+            sale_pending["mark_sold"] = sale_pending["mark_sold"].apply(_as_bool)
+            selected_sales = sale_pending[sale_pending["mark_sold"].eq(True)].copy()
+
+            if selected_sales.empty:
+                st.warning("No active TCGPlayer listings are checked to mark sold.")
+                st.stop()
+
+            missing_gross = selected_sales[
+                selected_sales["gross_sold_price"].apply(to_money).le(0)
+            ].copy()
+
+            if not missing_gross.empty:
+                st.error(
+                    "Every checked sale must have a Gross Sold Price greater than $0."
+                )
+                st.dataframe(
+                    missing_gross[
+                        ["inventory_id", "card_name", "list_price", "gross_sold_price"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "list_price": st.column_config.NumberColumn(
+                            "List Price", format="$%.2f"
+                        ),
+                        "gross_sold_price": st.column_config.NumberColumn(
+                            "Gross Sold Price", format="$%.2f"
+                        ),
+                    },
+                )
+                st.stop()
+
+            fresh_sale_data = load_data()
+            fresh_sale_inv = _safe_df(fresh_sale_data.inventory)
+            changed, invalid_sales = _sync_manual_tcgplayer_sales(
+                selected_sales=selected_sales,
+                fresh_inv=fresh_sale_inv,
+            )
+
+            if not invalid_sales.empty:
+                st.error(
+                    "One or more selected rows changed in the database, so no sales "
+                    "were written. Refresh and review these inventory IDs."
+                )
+                st.dataframe(
+                    invalid_sales,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.stop()
+
+            refresh_database_cache()
+            for state_key in [
+                TCGPLAYER_SALE_DRAFT_KEY,
+                TCGPLAYER_SALE_EDITOR_KEY,
+                TCGPLAYER_SALE_VISIBLE_IDS_KEY,
+                TCGPLAYER_LISTING_DRAFT_KEY,
+                TCGPLAYER_LISTING_EDITOR_KEY,
+                TCGPLAYER_LISTING_VISIBLE_IDS_KEY,
+            ]:
+                st.session_state.pop(state_key, None)
+
+            st.session_state["tcgplayer_sync_message"] = (
+                f"Marked {changed:,} TCGPlayer inventory row(s) SOLD using "
+                f"{str(date.today())} as the sold date."
             )
             st.rerun()
 
