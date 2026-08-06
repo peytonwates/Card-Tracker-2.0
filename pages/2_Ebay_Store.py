@@ -2808,6 +2808,351 @@ def _display_order_cols() -> list[str]:
         "payment_status",
     ]
 
+# =========================================================
+# TCGPlayer internal listing helpers
+# =========================================================
+
+TCGPLAYER_PLATFORM_NAME = "TCGPlayer"
+TCGPLAYER_URL_NOTE_PREFIX = "[TCGPLAYER_LISTING_URL="
+TCGPLAYER_URL_NOTE_PATTERN = re.compile(
+    r"\s*\[TCGPLAYER_LISTING_URL=([^\]]*)\]\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def _platform_contains(platform_value, platform_name: str) -> bool:
+    normalized_value = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        clean_text(platform_value).lower(),
+    )
+    normalized_name = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        clean_text(platform_name).lower(),
+    )
+    return bool(normalized_name and normalized_name in normalized_value)
+
+
+def _row_has_tcgplayer_platform(row: pd.Series) -> bool:
+    return _platform_contains(row.get("platform"), TCGPLAYER_PLATFORM_NAME)
+
+
+def _row_has_ebay_platform(row: pd.Series) -> bool:
+    return _platform_contains(row.get("platform"), "eBay")
+
+
+def _row_has_ebay_assignment(row: pd.Series) -> bool:
+    return bool(
+        clean_text(row.get("ebay_item_id"))
+        or clean_text(row.get("ebay_listing_id"))
+        or _row_has_ebay_platform(row)
+    )
+
+
+def _database_says_ebay_active(row: pd.Series) -> bool:
+    if not _row_has_ebay_assignment(row):
+        return False
+
+    listing_status = clean_text(row.get("ebay_listing_status")).lower()
+    inventory_status = clean_text(row.get("inventory_status")).upper()
+
+    inactive_words = {
+        "ended",
+        "inactive",
+        "completed",
+        "sold",
+        "cancelled",
+        "canceled",
+    }
+    if listing_status in inactive_words:
+        return False
+
+    if listing_status in {"active", "listed", "listing"}:
+        return True
+
+    return inventory_status == STATUS_LISTED and _row_has_ebay_platform(row)
+
+
+def _ebay_active_for_row(
+    row: pd.Series,
+    active_ebay_item_ids: set[str] | None,
+) -> bool:
+    ebay_item_id = _primary_ebay_assignment_key(row)
+
+    if active_ebay_item_ids is not None:
+        return bool(ebay_item_id and ebay_item_id in active_ebay_item_ids)
+
+    return _database_says_ebay_active(row)
+
+
+def _tcgplayer_url_storage_column() -> str:
+    """
+    Prefer a dedicated or generic listing-link column when the inventory schema
+    already has one. Otherwise preserve the URL inside notes using a tagged value.
+    """
+    for column_name in [
+        "tcgplayer_listing_url",
+        "list_link",
+        "listing_url",
+    ]:
+        if column_name in INVENTORY_COLUMNS:
+            return column_name
+
+    return ""
+
+
+def _extract_tcgplayer_listing_url(row: pd.Series) -> str:
+    storage_column = _tcgplayer_url_storage_column()
+
+    if storage_column:
+        stored_url = clean_text(row.get(storage_column))
+        if stored_url:
+            return stored_url
+
+    notes = clean_text(row.get("notes"))
+    match = TCGPLAYER_URL_NOTE_PATTERN.search(notes)
+    return clean_text(match.group(1)) if match else ""
+
+
+def _notes_with_tcgplayer_listing_url(notes_value, listing_url: str) -> str:
+    notes = clean_text(notes_value)
+    notes_without_old_tag = TCGPLAYER_URL_NOTE_PATTERN.sub(" ", notes)
+    notes_without_old_tag = re.sub(r"\s{2,}", " ", notes_without_old_tag).strip()
+
+    listing_url = clean_text(listing_url)
+    if not listing_url:
+        return notes_without_old_tag
+
+    tag = f"{TCGPLAYER_URL_NOTE_PREFIX}{listing_url}]"
+    return f"{notes_without_old_tag} {tag}".strip()
+
+
+def _apply_tcgplayer_url_to_update(
+    update: dict,
+    current_row: pd.Series,
+    listing_url: str,
+) -> None:
+    storage_column = _tcgplayer_url_storage_column()
+
+    if storage_column:
+        update[storage_column] = clean_text(listing_url)
+        return
+
+    if "notes" in INVENTORY_COLUMNS:
+        update["notes"] = _notes_with_tcgplayer_listing_url(
+            current_row.get("notes"),
+            listing_url,
+        )
+
+
+def _saleable_inventory_for_tcgplayer(inv_df: pd.DataFrame) -> pd.DataFrame:
+    if inv_df.empty:
+        return pd.DataFrame()
+
+    working = _ensure_cols(
+        inv_df,
+        [
+            "inventory_id",
+            "inventory_status",
+            "platform",
+            "card_name",
+            "card_number",
+            "set_name",
+            "variant",
+            "grading_company",
+            "grade",
+            "list_price",
+            "list_date",
+            "notes",
+            "ebay_item_id",
+            "ebay_listing_id",
+            "ebay_listing_url",
+            "ebay_listing_status",
+        ],
+    ).copy()
+
+    working["inventory_id"] = (
+        working["inventory_id"].astype(str).str.strip()
+    )
+    working["inventory_status"] = (
+        working["inventory_status"].astype(str).str.upper().str.strip()
+    )
+
+    working = working[
+        working["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])
+        & working["inventory_id"].ne("")
+    ].copy()
+
+    if working.empty:
+        return working
+
+    # Updating by inventory_id is unsafe when that key is duplicated.
+    safe_id_mask = ~working["inventory_id"].duplicated(keep=False)
+    return working[safe_id_mask].copy()
+
+
+def _build_tcgplayer_editor_df(
+    inv_df: pd.DataFrame,
+    active_ebay_item_ids: set[str] | None,
+) -> pd.DataFrame:
+    working = _saleable_inventory_for_tcgplayer(inv_df)
+
+    if working.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for _, row in working.iterrows():
+        listed_on_tcgplayer = _row_has_tcgplayer_platform(row)
+        ebay_active = _ebay_active_for_row(row, active_ebay_item_ids)
+
+        rows.append(
+            {
+                "inventory_id": clean_text(row.get("inventory_id")),
+                "inventory_status": clean_text(row.get("inventory_status")),
+                "platform": clean_text(row.get("platform")),
+                "card_name": clean_text(row.get("card_name")),
+                "set_name": clean_text(row.get("set_name")),
+                "card_number": clean_text(row.get("card_number")),
+                "variant": clean_text(row.get("variant")),
+                "grade": clean_text(row.get("grade")),
+                "listed_on_ebay": "Yes" if ebay_active else "No",
+                "ebay_list_price": (
+                    _safe_money_round(row.get("list_price"))
+                    if ebay_active
+                    else None
+                ),
+                "ebay_list_link": (
+                    clean_text(row.get("ebay_listing_url"))
+                    if ebay_active
+                    else ""
+                ),
+                "list_on_tcgplayer": listed_on_tcgplayer,
+                "tcgplayer_list_price": (
+                    _safe_money_round(row.get("list_price"))
+                    if listed_on_tcgplayer
+                    else None
+                ),
+                "tcgplayer_list_link": _extract_tcgplayer_listing_url(row),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+
+    if not out.empty:
+        out = out.sort_values(
+            ["list_on_tcgplayer", "listed_on_ebay", "card_name", "inventory_id"],
+            ascending=[False, False, True, True],
+        ).reset_index(drop=True)
+
+    return out
+
+
+def _build_cross_platform_conflict_df(
+    inv_df: pd.DataFrame,
+    active_ebay_item_ids: set[str] | None,
+) -> pd.DataFrame:
+    if inv_df.empty:
+        return pd.DataFrame()
+
+    working = _ensure_cols(
+        inv_df,
+        [
+            "inventory_id",
+            "inventory_status",
+            "platform",
+            "card_name",
+            "card_number",
+            "set_name",
+            "list_price",
+            "ebay_item_id",
+            "ebay_listing_id",
+            "ebay_listing_url",
+            "ebay_listing_status",
+        ],
+    ).copy()
+
+    conflicts = []
+
+    for _, row in working.iterrows():
+        tcgplayer_marked = _row_has_tcgplayer_platform(row)
+        ebay_assignment = _row_has_ebay_assignment(row)
+        ebay_active = _ebay_active_for_row(row, active_ebay_item_ids)
+
+        # Show both true live conflicts and stale eBay fields attached to a
+        # TCGPlayer row. A successful TCGPlayer sync clears confirmed-ended
+        # eBay assignments, so either condition deserves review.
+        if not tcgplayer_marked or not (ebay_assignment or ebay_active):
+            continue
+
+        conflicts.append(
+            {
+                "inventory_id": clean_text(row.get("inventory_id")),
+                "inventory_status": clean_text(row.get("inventory_status")),
+                "card_name": clean_text(row.get("card_name")),
+                "set_name": clean_text(row.get("set_name")),
+                "card_number": clean_text(row.get("card_number")),
+                "platform": clean_text(row.get("platform")),
+                "tcgplayer_marked": "Yes",
+                "ebay_active": "Yes" if ebay_active else "No",
+                "ebay_item_id": _primary_ebay_assignment_key(row),
+                "ebay_listing_status": clean_text(
+                    row.get("ebay_listing_status")
+                ),
+                "list_price": _safe_money_round(row.get("list_price")),
+                "ebay_listing_url": clean_text(
+                    row.get("ebay_listing_url")
+                ),
+                "reason": (
+                    "Active on eBay and marked TCGPlayer"
+                    if ebay_active
+                    else "TCGPlayer row still has eBay assignment data"
+                ),
+            }
+        )
+
+    return pd.DataFrame(conflicts)
+
+
+def _recent_ebay_order_item_ids(
+    access_token: str,
+    days_back: int = 90,
+    limit: int = 200,
+) -> tuple[set[str], pd.DataFrame, dict]:
+    status_code, payload, params = get_recent_orders(
+        access_token=access_token,
+        days_back=days_back,
+        limit=limit,
+    )
+
+    if status_code != 200:
+        return set(), pd.DataFrame(), {
+            "status_code": status_code,
+            "payload": payload,
+            "params": params,
+        }
+
+    orders_df = flatten_orders(payload)
+    sold_item_ids = set()
+
+    if not orders_df.empty and "ebay_item_id" in orders_df.columns:
+        sold_item_ids = set(
+            orders_df["ebay_item_id"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .tolist()
+        )
+
+    return sold_item_ids, orders_df, {
+        "status_code": status_code,
+        "payload": payload,
+        "params": params,
+    }
+
 
 # =========================================================
 # Load app data
@@ -2842,7 +3187,13 @@ needed_inv_cols = [
     "market_value",
     "sticker_price",
     "reference_link",
+    "platform",
+    "transaction_type",
+    "sale_channel",
+    "list_date",
     "list_price",
+    "notes",
+    "tcgplayer_listing_url",
     "ebay_item_id",
     "ebay_listing_id",
     "ebay_listing_url",
@@ -3124,13 +3475,14 @@ with st.expander("eBay pricing estimator settings", expanded=True):
     )
 
 
-tab_connect, tab_pricing, tab_active, tab_assign, tab_orders, tab_audit = st.tabs(
+tab_connect, tab_pricing, tab_active, tab_assign, tab_orders, tab_tcgplayer, tab_audit = st.tabs(
     [
         "0. Connect eBay Account",
         "1. Active Inventory Pricing",
         "2. Pull Active Listings",
         "3. Assign Listings",
         "4. Sold Order Sync",
+        "5. TCGPlayer",
         "Audit / Raw Data",
     ]
 )
@@ -4491,9 +4843,814 @@ with tab_orders:
 
                 st.rerun()
 
+# =========================================================
+# Tab 5: TCGPlayer internal listing tracker
+# =========================================================
+
+with tab_tcgplayer:
+    st.subheader("TCGPlayer Listing Tracker")
+    st.caption(
+        "Manage which physical inventory IDs you list on TCGPlayer. This does "
+        "not create the listing on TCGPlayer; it records the listing in your "
+        "inventory database and prevents the same inventory ID from being "
+        "actively assigned to eBay and TCGPlayer at the same time."
+    )
+
+    sync_message = st.session_state.pop("tcgplayer_sync_message", "")
+    if sync_message:
+        st.success(sync_message)
+
+    cached_active_item_ids: set[str] | None = None
+    cached_listings_df = st.session_state.get(
+        "ebay_active_listings_df",
+        None,
+    )
+
+    if isinstance(cached_listings_df, pd.DataFrame):
+        cached_active_item_ids = set()
+        if (
+            not cached_listings_df.empty
+            and "ebay_item_id" in cached_listings_df.columns
+        ):
+            cached_active_item_ids = set(
+                cached_listings_df["ebay_item_id"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .tolist()
+            )
+
+    source_text = (
+        "latest eBay active-listing pull cached on this page"
+        if cached_active_item_ids is not None
+        else "database fields; the Sync button will perform a live eBay check"
+    )
+    st.info(
+        "The **Listed on eBay** column currently uses " + source_text + ".",
+        icon="ℹ️",
+    )
+
+    editor_source = _build_tcgplayer_editor_df(
+        inv_df=inv,
+        active_ebay_item_ids=cached_active_item_ids,
+    )
+
+    if editor_source.empty:
+        st.info(
+            "No safe ACTIVE or LISTED inventory rows are available. Blank or "
+            "duplicated inventory IDs are excluded because they cannot be "
+            "updated safely by inventory ID."
+        )
+    else:
+        filter_col, metrics_col = st.columns([2.2, 1.8])
+
+        with filter_col:
+            tcgplayer_search = st.text_input(
+                "Search inventory ID, card, set, number, variant, or grade",
+                key="tcgplayer_inventory_search",
+            )
+
+        with metrics_col:
+            listed_tcg_count = int(
+                editor_source["list_on_tcgplayer"].apply(_as_bool).sum()
+            )
+            listed_ebay_count = int(
+                editor_source["listed_on_ebay"].eq("Yes").sum()
+            )
+            st.caption(
+                f"{len(editor_source):,} saleable inventory rows · "
+                f"{listed_tcg_count:,} marked TCGPlayer · "
+                f"{listed_ebay_count:,} shown active on eBay"
+            )
+
+        editor_display = editor_source.copy()
+
+        if tcgplayer_search.strip():
+            query = tcgplayer_search.lower().strip()
+
+            def _tcgplayer_search_match(row: pd.Series) -> bool:
+                values = [
+                    row.get("inventory_id", ""),
+                    row.get("card_name", ""),
+                    row.get("set_name", ""),
+                    row.get("card_number", ""),
+                    row.get("variant", ""),
+                    row.get("grade", ""),
+                ]
+                return query in " ".join(
+                    str(value).lower() for value in values
+                )
+
+            editor_display = editor_display[
+                editor_display.apply(_tcgplayer_search_match, axis=1)
+            ].copy()
+
+        st.markdown("### Select TCGPlayer listings")
+        st.caption(
+            "Check **List on TCGPlayer** and enter a TCGPlayer list price. "
+            "The listing link is optional. Existing TCGPlayer rows start "
+            "checked. Unchecking one removes its internal TCGPlayer assignment."
+        )
+
+        edited_tcgplayer = st.data_editor(
+            editor_display,
+            key="tcgplayer_listing_editor",
+            use_container_width=True,
+            hide_index=True,
+            height=700,
+            column_order=[
+                "inventory_id",
+                "card_name",
+                "set_name",
+                "card_number",
+                "variant",
+                "grade",
+                "inventory_status",
+                "platform",
+                "listed_on_ebay",
+                "ebay_list_price",
+                "ebay_list_link",
+                "list_on_tcgplayer",
+                "tcgplayer_list_price",
+                "tcgplayer_list_link",
+            ],
+            column_config={
+                "inventory_id": st.column_config.TextColumn(
+                    "Inventory ID",
+                    disabled=True,
+                    width="medium",
+                ),
+                "card_name": st.column_config.TextColumn(
+                    "Card Name",
+                    disabled=True,
+                    width="large",
+                ),
+                "set_name": st.column_config.TextColumn(
+                    "Set",
+                    disabled=True,
+                    width="medium",
+                ),
+                "card_number": st.column_config.TextColumn(
+                    "Card #",
+                    disabled=True,
+                ),
+                "variant": st.column_config.TextColumn(
+                    "Variant",
+                    disabled=True,
+                ),
+                "grade": st.column_config.TextColumn(
+                    "Grade",
+                    disabled=True,
+                ),
+                "inventory_status": st.column_config.TextColumn(
+                    "Status",
+                    disabled=True,
+                ),
+                "platform": st.column_config.TextColumn(
+                    "Current Platform",
+                    disabled=True,
+                ),
+                "listed_on_ebay": st.column_config.TextColumn(
+                    "Listed on eBay",
+                    disabled=True,
+                ),
+                "ebay_list_price": st.column_config.NumberColumn(
+                    "eBay Price",
+                    format="$%.2f",
+                    disabled=True,
+                ),
+                "ebay_list_link": st.column_config.LinkColumn(
+                    "eBay Link",
+                    disabled=True,
+                ),
+                "list_on_tcgplayer": st.column_config.CheckboxColumn(
+                    "List on TCGPlayer",
+                    help=(
+                        "Checked rows will be marked LISTED with platform "
+                        "TCGPlayer after validation."
+                    ),
+                ),
+                "tcgplayer_list_price": st.column_config.NumberColumn(
+                    "TCGPlayer List Price",
+                    min_value=0.0,
+                    step=0.01,
+                    format="$%.2f",
+                ),
+                "tcgplayer_list_link": st.column_config.TextColumn(
+                    "TCGPlayer List Link",
+                    width="large",
+                    help="Optional direct link to the TCGPlayer listing/product page.",
+                ),
+            },
+            disabled=[
+                "inventory_id",
+                "card_name",
+                "set_name",
+                "card_number",
+                "variant",
+                "grade",
+                "inventory_status",
+                "platform",
+                "listed_on_ebay",
+                "ebay_list_price",
+                "ebay_list_link",
+            ],
+        )
+
+        st.warning(
+            "Checking an item that is still active on eBay will not be saved. "
+            "End the eBay listing first, then click the sync button. The app "
+            "will verify that it is inactive before clearing the eBay fields.",
+            icon="⚠️",
+        )
+
+        sync_tcgplayer_changes = st.button(
+            "Sync TCGPlayer listing changes",
+            type="primary",
+            use_container_width=True,
+            key="sync_tcgplayer_listing_changes",
+        )
+
+        if sync_tcgplayer_changes:
+            if edited_tcgplayer.empty:
+                st.warning("No inventory rows are visible to sync.")
+                st.stop()
+
+            pending = edited_tcgplayer.copy()
+            pending["inventory_id"] = (
+                pending["inventory_id"].astype(str).str.strip()
+            )
+            pending["list_on_tcgplayer"] = pending[
+                "list_on_tcgplayer"
+            ].apply(_as_bool)
+
+            checked_without_price = pending[
+                pending["list_on_tcgplayer"].eq(True)
+                & pending["tcgplayer_list_price"].apply(to_money).le(0)
+            ].copy()
+
+            if not checked_without_price.empty:
+                st.error(
+                    "Every checked TCGPlayer item must have a list price "
+                    "greater than $0."
+                )
+                st.dataframe(
+                    checked_without_price[
+                        [
+                            "inventory_id",
+                            "card_name",
+                            "set_name",
+                            "card_number",
+                            "tcgplayer_list_price",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "tcgplayer_list_price": (
+                            st.column_config.NumberColumn(
+                                "TCGPlayer List Price",
+                                format="$%.2f",
+                            )
+                        )
+                    },
+                )
+                st.stop()
+
+            duplicate_pending_ids = pending[
+                "inventory_id"
+            ].value_counts()
+            duplicate_pending_ids = duplicate_pending_ids[
+                duplicate_pending_ids > 1
+            ]
+
+            if not duplicate_pending_ids.empty:
+                st.error(
+                    "The editable table contains a duplicated inventory ID, "
+                    "so the changes cannot be applied safely."
+                )
+                st.write(duplicate_pending_ids)
+                st.stop()
+
+            fresh_data = load_data()
+            fresh_inv = _ensure_cols(
+                _safe_df(fresh_data.inventory),
+                needed_inv_cols,
+            )
+
+            if not fresh_inv.empty:
+                fresh_inv["inventory_id"] = (
+                    fresh_inv["inventory_id"].astype(str).str.strip()
+                )
+                fresh_inv["inventory_status"] = (
+                    fresh_inv["inventory_status"]
+                    .astype(str)
+                    .str.upper()
+                    .str.strip()
+                )
+
+            duplicate_fresh_ids = _duplicate_inventory_id_rows(fresh_inv)
+            unsafe_ids = set(
+                duplicate_fresh_ids.get(
+                    "inventory_id",
+                    pd.Series(dtype=str),
+                )
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .tolist()
+            )
+
+            fresh_lookup = fresh_inv[
+                fresh_inv["inventory_id"].ne("")
+            ].copy()
+            fresh_lookup = fresh_lookup[
+                ~fresh_lookup["inventory_id"].duplicated(keep=False)
+            ].copy()
+            fresh_lookup = fresh_lookup.set_index("inventory_id", drop=False)
+
+            missing_or_unsafe = pending[
+                ~pending["inventory_id"].isin(fresh_lookup.index)
+                | pending["inventory_id"].isin(unsafe_ids)
+            ].copy()
+
+            if not missing_or_unsafe.empty:
+                st.error(
+                    "One or more inventory IDs are missing or duplicated in "
+                    "the latest database. Refresh and fix those IDs first."
+                )
+                st.dataframe(
+                    missing_or_unsafe[
+                        ["inventory_id", "card_name", "set_name", "card_number"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.stop()
+
+            live_active_item_ids: set[str] | None = None
+            live_listings_df = pd.DataFrame()
+            access_token = ""
+
+            rows_with_ebay_assignment = []
+            for _, pending_row in pending.iterrows():
+                inv_id = clean_text(pending_row.get("inventory_id"))
+                if inv_id not in fresh_lookup.index:
+                    continue
+                fresh_row = fresh_lookup.loc[inv_id]
+                if _row_has_ebay_assignment(fresh_row):
+                    rows_with_ebay_assignment.append(inv_id)
+
+            if ebay_ready:
+                access_token = get_access_token_or_stop(ebay_config)
+
+                with st.spinner(
+                    "Checking live eBay listings before applying TCGPlayer changes..."
+                ):
+                    live_listings_df, live_audit = get_active_listings(
+                        access_token=access_token,
+                        entries_per_page=200,
+                        max_pages=25,
+                    )
+
+                successful_ack = any(
+                    ack in {"Success", "Warning"}
+                    for ack in live_audit.get("acks", [])
+                )
+                if live_audit.get("errors") and not successful_ack:
+                    st.error(
+                        "The live eBay listing check failed, so no TCGPlayer "
+                        "changes were written."
+                    )
+                    st.write(live_audit.get("errors"))
+                    st.stop()
+
+                live_active_item_ids = set()
+                if (
+                    not live_listings_df.empty
+                    and "ebay_item_id" in live_listings_df.columns
+                ):
+                    live_active_item_ids = set(
+                        live_listings_df["ebay_item_id"]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .replace("", pd.NA)
+                        .dropna()
+                        .tolist()
+                    )
+
+                st.session_state["ebay_active_listings_df"] = (
+                    live_listings_df
+                )
+                st.session_state["ebay_active_listings_audit"] = live_audit
+
+            elif rows_with_ebay_assignment:
+                st.error(
+                    "At least one edited row has eBay assignment data, but the "
+                    "eBay connection is not ready. The app cannot confirm that "
+                    "the eBay listing is inactive, so nothing was changed."
+                )
+                st.stop()
+
+            stale_ebay_candidates = []
+            active_ebay_conflicts = []
+            unverifiable_ebay_rows = []
+
+            for _, pending_row in pending.iterrows():
+                inv_id = clean_text(pending_row.get("inventory_id"))
+                fresh_row = fresh_lookup.loc[inv_id]
+                desired_tcgplayer = _as_bool(
+                    pending_row.get("list_on_tcgplayer")
+                )
+                currently_tcgplayer = _row_has_tcgplayer_platform(fresh_row)
+
+                # Rows that are neither being added to nor removed from
+                # TCGPlayer do not need cross-platform validation.
+                if not desired_tcgplayer and not currently_tcgplayer:
+                    continue
+
+                ebay_item_id = _primary_ebay_assignment_key(fresh_row)
+                has_ebay_assignment = _row_has_ebay_assignment(fresh_row)
+                ebay_is_active = _ebay_active_for_row(
+                    fresh_row,
+                    live_active_item_ids,
+                )
+
+                if desired_tcgplayer and ebay_is_active:
+                    active_ebay_conflicts.append(
+                        {
+                            "inventory_id": inv_id,
+                            "card_name": clean_text(
+                                fresh_row.get("card_name")
+                            ),
+                            "set_name": clean_text(
+                                fresh_row.get("set_name")
+                            ),
+                            "card_number": clean_text(
+                                fresh_row.get("card_number")
+                            ),
+                            "ebay_item_id": ebay_item_id,
+                            "ebay_listing_url": clean_text(
+                                fresh_row.get("ebay_listing_url")
+                            ),
+                            "requested_tcgplayer_price": _safe_money_round(
+                                pending_row.get("tcgplayer_list_price")
+                            ),
+                        }
+                    )
+                    continue
+
+                if has_ebay_assignment and not ebay_is_active:
+                    if not ebay_item_id:
+                        unverifiable_ebay_rows.append(
+                            {
+                                "inventory_id": inv_id,
+                                "card_name": clean_text(
+                                    fresh_row.get("card_name")
+                                ),
+                                "platform": clean_text(
+                                    fresh_row.get("platform")
+                                ),
+                                "reason": (
+                                    "Marked eBay but missing eBay item/listing ID"
+                                ),
+                            }
+                        )
+                    else:
+                        stale_ebay_candidates.append(
+                            {
+                                "inventory_id": inv_id,
+                                "ebay_item_id": ebay_item_id,
+                                "card_name": clean_text(
+                                    fresh_row.get("card_name")
+                                ),
+                                "set_name": clean_text(
+                                    fresh_row.get("set_name")
+                                ),
+                                "card_number": clean_text(
+                                    fresh_row.get("card_number")
+                                ),
+                            }
+                        )
+
+            if active_ebay_conflicts:
+                st.error(
+                    "These inventory IDs are still active on eBay. End each "
+                    "eBay listing first, then click Sync TCGPlayer listing "
+                    "changes again. No changes were written."
+                )
+                st.dataframe(
+                    pd.DataFrame(active_ebay_conflicts),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "ebay_listing_url": st.column_config.LinkColumn(
+                            "eBay Listing"
+                        ),
+                        "requested_tcgplayer_price": (
+                            st.column_config.NumberColumn(
+                                "Requested TCGPlayer Price",
+                                format="$%.2f",
+                            )
+                        ),
+                    },
+                )
+                st.stop()
+
+            if unverifiable_ebay_rows:
+                st.error(
+                    "These rows appear to be assigned to eBay but have no eBay "
+                    "item ID. They cannot be verified automatically. No changes "
+                    "were written."
+                )
+                st.dataframe(
+                    pd.DataFrame(unverifiable_ebay_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.stop()
+
+            recent_sold_item_ids: set[str] = set()
+            recent_orders_df = pd.DataFrame()
+
+            if stale_ebay_candidates:
+                with st.spinner(
+                    "Checking recent eBay orders so an ended listing is not "
+                    "mistaken for an unsynced sale..."
+                ):
+                    (
+                        recent_sold_item_ids,
+                        recent_orders_df,
+                        recent_order_audit,
+                    ) = _recent_ebay_order_item_ids(
+                        access_token=access_token,
+                        days_back=90,
+                        limit=200,
+                    )
+
+                if recent_order_audit.get("status_code") != 200:
+                    st.error(
+                        "The app could not verify recent eBay orders, so it "
+                        "will not clear inactive eBay assignments. No changes "
+                        "were written."
+                    )
+                    st.write(recent_order_audit)
+                    st.stop()
+
+                stale_sold_conflicts = [
+                    row
+                    for row in stale_ebay_candidates
+                    if clean_text(row.get("ebay_item_id"))
+                    in recent_sold_item_ids
+                ]
+
+                if stale_sold_conflicts:
+                    conflict_df = pd.DataFrame(stale_sold_conflicts)
+                    if not recent_orders_df.empty:
+                        order_details = recent_orders_df[
+                            recent_orders_df["ebay_item_id"]
+                            .astype(str)
+                            .str.strip()
+                            .isin(
+                                conflict_df["ebay_item_id"]
+                                .astype(str)
+                                .str.strip()
+                            )
+                        ].copy()
+                        order_details = order_details[
+                            [
+                                c
+                                for c in [
+                                    "ebay_item_id",
+                                    "ebay_order_id",
+                                    "sold_date",
+                                    "title",
+                                    "order_status",
+                                    "payment_status",
+                                ]
+                                if c in order_details.columns
+                            ]
+                        ].drop_duplicates()
+                        conflict_df = conflict_df.merge(
+                            order_details,
+                            on="ebay_item_id",
+                            how="left",
+                        )
+
+                    st.error(
+                        "These eBay listings are inactive because they appear "
+                        "in recent eBay orders. Sync the eBay sale instead of "
+                        "listing the same physical card on TCGPlayer. No changes "
+                        "were written."
+                    )
+                    st.dataframe(
+                        conflict_df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.stop()
+
+            active_listing_lookup = pd.DataFrame()
+            if not live_listings_df.empty:
+                active_listing_lookup = live_listings_df.copy()
+                active_listing_lookup["ebay_item_id"] = (
+                    active_listing_lookup["ebay_item_id"]
+                    .astype(str)
+                    .str.strip()
+                )
+                active_listing_lookup = active_listing_lookup.drop_duplicates(
+                    subset=["ebay_item_id"],
+                    keep="last",
+                ).set_index("ebay_item_id", drop=False)
+
+            updates_by_inventory_id = {}
+
+            for _, pending_row in pending.iterrows():
+                inv_id = clean_text(pending_row.get("inventory_id"))
+                fresh_row = fresh_lookup.loc[inv_id]
+                currently_tcgplayer = _row_has_tcgplayer_platform(fresh_row)
+                desired_tcgplayer = _as_bool(
+                    pending_row.get("list_on_tcgplayer")
+                )
+
+                if desired_tcgplayer:
+                    update = {}
+
+                    if _row_has_ebay_assignment(fresh_row):
+                        # The live checks above confirmed this eBay assignment
+                        # is no longer active and is not a recent order.
+                        update.update(
+                            _clear_ebay_assignment_update(
+                                fresh_row.get("inventory_status")
+                            )
+                        )
+
+                    update.update(
+                        {
+                            "inventory_status": STATUS_LISTED,
+                            "transaction_type": "TCGPlayer Listing",
+                            "platform": TCGPLAYER_PLATFORM_NAME,
+                            "sale_channel": "Online",
+                            "list_date": (
+                                clean_text(fresh_row.get("list_date"))
+                                if currently_tcgplayer
+                                else str(date.today())
+                            ),
+                            "list_price": _safe_money_round(
+                                pending_row.get("tcgplayer_list_price")
+                            ),
+                        }
+                    )
+
+                    if "tcgplayer_listing_status" in INVENTORY_COLUMNS:
+                        update["tcgplayer_listing_status"] = "Active"
+                    if "tcgplayer_last_sync_at" in INVENTORY_COLUMNS:
+                        update["tcgplayer_last_sync_at"] = now_iso()
+
+                    _apply_tcgplayer_url_to_update(
+                        update=update,
+                        current_row=fresh_row,
+                        listing_url=clean_text(
+                            pending_row.get("tcgplayer_list_link")
+                        ),
+                    )
+                    updates_by_inventory_id[inv_id] = update
+                    continue
+
+                if currently_tcgplayer:
+                    ebay_item_id = _primary_ebay_assignment_key(fresh_row)
+                    ebay_is_active = _ebay_active_for_row(
+                        fresh_row,
+                        live_active_item_ids,
+                    )
+
+                    if ebay_is_active:
+                        listing = (
+                            active_listing_lookup.loc[ebay_item_id]
+                            if (
+                                not active_listing_lookup.empty
+                                and ebay_item_id in active_listing_lookup.index
+                            )
+                            else pd.Series(dtype=object)
+                        )
+                        update = {
+                            "inventory_status": STATUS_LISTED,
+                            "transaction_type": (
+                                clean_text(listing.get("listing_type"))
+                                or "eBay Listing"
+                            ),
+                            "platform": "eBay",
+                            "sale_channel": "Online",
+                            "list_price": _safe_money_round(
+                                listing.get("current_price")
+                                or fresh_row.get("list_price")
+                            ),
+                            "ebay_listing_status": (
+                                clean_text(listing.get("listing_status"))
+                                or "Active"
+                            ),
+                            "ebay_last_sync_at": now_iso(),
+                        }
+                    else:
+                        if _row_has_ebay_assignment(fresh_row):
+                            update = _clear_ebay_assignment_update(
+                                fresh_row.get("inventory_status")
+                            )
+                            update.update(
+                                {
+                                    "inventory_status": STATUS_ACTIVE,
+                                    "transaction_type": "",
+                                    "platform": "",
+                                    "sale_channel": "",
+                                    "list_date": "",
+                                    "list_price": "",
+                                }
+                            )
+                        else:
+                            update = {
+                                "inventory_status": STATUS_ACTIVE,
+                                "transaction_type": "",
+                                "platform": "",
+                                "sale_channel": "",
+                                "list_date": "",
+                                "list_price": "",
+                            }
+
+                    if "tcgplayer_listing_status" in INVENTORY_COLUMNS:
+                        update["tcgplayer_listing_status"] = ""
+                    if "tcgplayer_last_sync_at" in INVENTORY_COLUMNS:
+                        update["tcgplayer_last_sync_at"] = now_iso()
+
+                    _apply_tcgplayer_url_to_update(
+                        update=update,
+                        current_row=fresh_row,
+                        listing_url="",
+                    )
+                    updates_by_inventory_id[inv_id] = update
+
+            if not updates_by_inventory_id:
+                st.info("No TCGPlayer listing changes were detected.")
+                st.stop()
+
+            update_rows_by_key(
+                get_ws_name("inventory_worksheet", "inventory"),
+                INVENTORY_COLUMNS,
+                "inventory_id",
+                updates_by_inventory_id,
+            )
+
+            refresh_database_cache()
+            st.session_state.pop("tcgplayer_listing_editor", None)
+            st.session_state["tcgplayer_sync_message"] = (
+                f"Synced {len(updates_by_inventory_id):,} inventory row(s). "
+                "TCGPlayer assignments were saved by inventory ID, and any "
+                "confirmed-ended eBay assignment fields were cleared."
+            )
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("### Items assigned to more than one platform")
+    st.caption(
+        "This check is performed by inventory ID. Separate copies of the same "
+        "card are allowed on different platforms as long as each copy has its "
+        "own unique inventory ID."
+    )
+
+    conflict_df = _build_cross_platform_conflict_df(
+        inv_df=inv,
+        active_ebay_item_ids=cached_active_item_ids,
+    )
+
+    if conflict_df.empty:
+        st.success("No cross-platform inventory-ID conflicts were found.")
+    else:
+        st.error(
+            f"Found {len(conflict_df):,} inventory row(s) with both TCGPlayer "
+            "and eBay assignment data."
+        )
+        st.dataframe(
+            conflict_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "list_price": st.column_config.NumberColumn(
+                    "List Price",
+                    format="$%.2f",
+                ),
+                "ebay_listing_url": st.column_config.LinkColumn(
+                    "eBay Listing"
+                ),
+            },
+        )
+
 
 # =========================================================
-# Tab 5: Audit / Raw Data
+# Tab 6: Audit / Raw Data
 # =========================================================
 
 with tab_audit:
