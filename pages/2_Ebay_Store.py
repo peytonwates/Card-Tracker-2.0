@@ -3168,6 +3168,204 @@ TCGPLAYER_SALE_EDITOR_KEY = "tcgplayer_active_sale_editor"
 TCGPLAYER_SALE_VISIBLE_IDS_KEY = "tcgplayer_sale_editor_visible_ids"
 
 
+# Current TCGplayer domestic marketplace fee presets. Direct is intentionally
+# excluded because its item-based reimbursement fee structure is materially
+# different from ordinary seller-fulfilled Marketplace orders.
+TCGPLAYER_FEE_PLAN_PRESETS = {
+    "Marketplace Level 1-4 — 10.75% + 2.5% + $0.30": {
+        "marketplace_pct": 10.75,
+        "pro_pct": 0.00,
+        "transaction_pct": 2.50,
+        "fixed_order_fee": 0.30,
+        "provider_fee_note": "",
+    },
+    "Marketplace Pro, non-Direct — 9.25% + 2.5% Pro + 2.5% + $0.30": {
+        "marketplace_pct": 9.25,
+        "pro_pct": 2.50,
+        "transaction_pct": 2.50,
+        "fixed_order_fee": 0.30,
+        "provider_fee_note": "",
+    },
+    "Marketplace Sync account — 9.25% + 2.5% + $0.30": {
+        "marketplace_pct": 9.25,
+        "pro_pct": 0.00,
+        "transaction_pct": 2.50,
+        "fixed_order_fee": 0.30,
+        "provider_fee_note": (
+            "The third-party sync-provider fee is not included automatically. "
+            "Enter it in Additional assumed fee ($)."
+        ),
+    },
+    "Custom fee plan": None,
+}
+
+
+def _build_tcgplayer_estimator_assumptions(
+    fee_plan_label: str,
+    assumed_shipping_charge: float,
+    assumed_tax_pct: float,
+    additional_fee_dollars: float = 0.0,
+    custom_marketplace_pct: float = 10.75,
+    custom_pro_pct: float = 0.0,
+    custom_transaction_pct: float = 2.5,
+    custom_fixed_order_fee: float = 0.30,
+) -> dict:
+    preset = TCGPLAYER_FEE_PLAN_PRESETS.get(fee_plan_label)
+
+    if preset is None:
+        marketplace_pct = max(to_money(custom_marketplace_pct), 0.0)
+        pro_pct = max(to_money(custom_pro_pct), 0.0)
+        transaction_pct = max(to_money(custom_transaction_pct), 0.0)
+        fixed_order_fee = max(to_money(custom_fixed_order_fee), 0.0)
+        provider_fee_note = "Custom fee settings are being used."
+    else:
+        marketplace_pct = max(to_money(preset.get("marketplace_pct")), 0.0)
+        pro_pct = max(to_money(preset.get("pro_pct")), 0.0)
+        transaction_pct = max(to_money(preset.get("transaction_pct")), 0.0)
+        fixed_order_fee = max(to_money(preset.get("fixed_order_fee")), 0.0)
+        provider_fee_note = clean_text(preset.get("provider_fee_note"))
+
+    return {
+        "fee_plan_label": fee_plan_label,
+        "marketplace_pct": marketplace_pct,
+        "pro_pct": pro_pct,
+        "transaction_pct": transaction_pct,
+        "fixed_order_fee": round(fixed_order_fee, 2),
+        "assumed_shipping_charge": max(
+            _safe_money_round(assumed_shipping_charge),
+            0.0,
+        ),
+        "assumed_label_cost": max(
+            _safe_money_round(assumed_shipping_charge),
+            0.0,
+        ),
+        "assumed_tax_pct": max(to_money(assumed_tax_pct), 0.0),
+        "additional_fee_dollars": max(
+            _safe_money_round(additional_fee_dollars),
+            0.0,
+        ),
+        "marketplace_item_fee_cap": 75.00,
+        "pro_item_fee_cap": 75.00,
+        "provider_fee_note": provider_fee_note,
+    }
+
+
+def _estimate_tcgplayer_listing_economics(
+    list_price: float,
+    total_cost: float,
+    assumptions: dict,
+) -> dict:
+    """Estimate one seller-fulfilled domestic TCGplayer marketplace sale.
+
+    The entered shipping amount is modeled twice:
+    - collected from the buyer as shipping revenue; and
+    - spent by the seller as the estimated label/postage cost.
+
+    The manual sold-entry fields remain authoritative after the sale, so the
+    seller can replace these assumptions with actual fees, tax, and postage.
+    """
+    item_price = max(_safe_money_round(list_price), 0.0)
+    total_cost = max(_safe_money_round(total_cost), 0.0)
+    buyer_shipping = max(
+        _safe_money_round(assumptions.get("assumed_shipping_charge")),
+        0.0,
+    )
+    assumed_label_cost = max(
+        _safe_money_round(assumptions.get("assumed_label_cost")),
+        0.0,
+    )
+
+    marketplace_rate = max(
+        to_money(assumptions.get("marketplace_pct")),
+        0.0,
+    ) / 100.0
+    pro_rate = max(
+        to_money(assumptions.get("pro_pct")),
+        0.0,
+    ) / 100.0
+    transaction_rate = max(
+        to_money(assumptions.get("transaction_pct")),
+        0.0,
+    ) / 100.0
+    tax_rate = max(
+        to_money(assumptions.get("assumed_tax_pct")),
+        0.0,
+    ) / 100.0
+
+    marketplace_item_cap = max(
+        _safe_money_round(assumptions.get("marketplace_item_fee_cap", 75.00)),
+        0.0,
+    )
+    pro_item_cap = max(
+        _safe_money_round(assumptions.get("pro_item_fee_cap", 75.00)),
+        0.0,
+    )
+
+    order_subtotal = round(item_price + buyer_shipping, 2)
+    estimated_tax = round(order_subtotal * tax_rate, 2)
+    estimated_buyer_total = round(order_subtotal + estimated_tax, 2)
+
+    marketplace_item_fee = round(
+        min(item_price * marketplace_rate, marketplace_item_cap),
+        2,
+    )
+    marketplace_shipping_fee = round(buyer_shipping * marketplace_rate, 2)
+    marketplace_fee = round(
+        marketplace_item_fee + marketplace_shipping_fee,
+        2,
+    )
+
+    pro_item_fee = round(min(item_price * pro_rate, pro_item_cap), 2)
+    pro_shipping_fee = round(buyer_shipping * pro_rate, 2)
+    pro_fee = round(pro_item_fee + pro_shipping_fee, 2)
+
+    transaction_fee = round(
+        (estimated_buyer_total * transaction_rate)
+        + max(_safe_money_round(assumptions.get("fixed_order_fee")), 0.0),
+        2,
+    )
+    additional_fee = max(
+        _safe_money_round(assumptions.get("additional_fee_dollars")),
+        0.0,
+    )
+
+    estimated_tcgplayer_fees = round(
+        marketplace_fee + pro_fee + transaction_fee + additional_fee,
+        2,
+    )
+    estimated_net_proceeds = round(
+        estimated_buyer_total
+        - estimated_tax
+        - estimated_tcgplayer_fees
+        - assumed_label_cost,
+        2,
+    )
+    estimated_profit_loss = round(estimated_net_proceeds - total_cost, 2)
+
+    if total_cost > 0:
+        estimated_margin_pct = round(
+            (estimated_profit_loss / total_cost) * 100,
+            2,
+        )
+    else:
+        estimated_margin_pct = None
+
+    return {
+        "estimated_buyer_shipping": buyer_shipping,
+        "estimated_label_cost": assumed_label_cost,
+        "estimated_tax": estimated_tax,
+        "estimated_buyer_total": estimated_buyer_total,
+        "estimated_marketplace_fee": marketplace_fee,
+        "estimated_pro_fee": pro_fee,
+        "estimated_transaction_fee": transaction_fee,
+        "estimated_additional_fee": additional_fee,
+        "estimated_tcgplayer_fees": estimated_tcgplayer_fees,
+        "estimated_net_proceeds": estimated_net_proceeds,
+        "estimated_profit_loss": estimated_profit_loss,
+        "estimated_margin_pct": estimated_margin_pct,
+    }
+
+
 def _capture_data_editor_draft_changes(
     draft_key: str,
     editor_key: str,
@@ -3348,7 +3546,10 @@ def _active_tcgplayer_listing_df(inv_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _add_tcgplayer_sale_calculations(sale_df: pd.DataFrame) -> pd.DataFrame:
+def _add_tcgplayer_sale_calculations(
+    sale_df: pd.DataFrame,
+    estimator_assumptions: dict | None = None,
+) -> pd.DataFrame:
     if sale_df.empty:
         return sale_df.copy()
 
@@ -3359,6 +3560,7 @@ def _add_tcgplayer_sale_calculations(sale_df: pd.DataFrame) -> pd.DataFrame:
         "shipping_cost",
         "tax_collected",
         "total_cost",
+        "list_price",
     ]:
         if column_name not in out.columns:
             out[column_name] = 0.0
@@ -3388,6 +3590,20 @@ def _add_tcgplayer_sale_calculations(sale_df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1,
     )
+
+    if estimator_assumptions:
+        estimate_rows = out.apply(
+            lambda row: _estimate_tcgplayer_listing_economics(
+                list_price=row.get("list_price"),
+                total_cost=row.get("total_cost"),
+                assumptions=estimator_assumptions,
+            ),
+            axis=1,
+        )
+        estimate_df = pd.DataFrame(estimate_rows.tolist(), index=out.index)
+        for column_name in estimate_df.columns:
+            out[column_name] = estimate_df[column_name]
+
     return out
 
 
@@ -6045,11 +6261,12 @@ with tab_tcgplayer:
     st.markdown("---")
     st.markdown("### Active TCGPlayer listings and manual sale entry")
     st.caption(
-        "Mark active TCGPlayer inventory IDs as sold and enter the complete "
-        "order economics. **Gross Sold Price** should be the total collected "
-        "from the buyer, including item price, buyer-paid shipping, and tax. "
-        "Net proceeds are calculated as gross minus platform fees, actual "
-        "shipping cost, and tax. The sold date is the date you click the button."
+        "Review estimated profit at each current list price, then mark active "
+        "TCGPlayer inventory IDs as sold and enter the actual order economics. "
+        "**Gross Sold Price** should be the total collected from the buyer, "
+        "including item price, buyer-paid shipping, and tax. Actual net proceeds "
+        "are gross minus the platform fees, postage, and tax you enter. The sold "
+        "date is the date you click the button."
     )
 
     _capture_data_editor_draft_changes(
@@ -6088,9 +6305,14 @@ with tab_tcgplayer:
             ],
         )
 
-        sale_filter_col, sale_metric_col, sale_reset_col = st.columns(
-            [2.1, 1.55, 0.85]
-        )
+        (
+            sale_filter_col,
+            sale_fee_plan_col,
+            sale_shipping_col,
+            sale_tax_col,
+            sale_extra_fee_col,
+            sale_reset_col,
+        ) = st.columns([2.15, 2.35, 1.25, 1.0, 1.1, 0.85])
 
         with sale_filter_col:
             tcgplayer_sale_search = st.text_input(
@@ -6098,19 +6320,60 @@ with tab_tcgplayer:
                 key="tcgplayer_active_sale_search",
             )
 
-        sale_draft_all = _draft_dataframe_in_source_order(
-            source_df=active_tcgplayer_source,
-            draft_key=TCGPLAYER_SALE_DRAFT_KEY,
-        )
-        sale_draft_all = _add_tcgplayer_sale_calculations(sale_draft_all)
+        with sale_fee_plan_col:
+            tcgplayer_fee_plan = st.selectbox(
+                "Estimated fee plan",
+                options=list(TCGPLAYER_FEE_PLAN_PRESETS.keys()),
+                index=0,
+                key="tcgplayer_estimator_fee_plan",
+                help=(
+                    "Choose the seller type used for estimated fees. Actual fees "
+                    "are still entered manually when the card sells."
+                ),
+            )
 
-        with sale_metric_col:
-            selected_sale_count = int(
-                sale_draft_all["mark_sold"].apply(_as_bool).sum()
-            ) if not sale_draft_all.empty else 0
-            st.caption(
-                f"{len(active_tcgplayer_source):,} active TCGPlayer listings · "
-                f"{selected_sale_count:,} selected to mark sold"
+        with sale_shipping_col:
+            assumed_tcgplayer_shipping = st.number_input(
+                "Buyer shipping / label",
+                min_value=0.0,
+                value=1.49,
+                step=0.01,
+                format="%.2f",
+                key="tcgplayer_estimator_shipping",
+                help=(
+                    "Estimated shipping charged to the buyer. The estimator also "
+                    "uses the same amount as the assumed label/postage expense. "
+                    "Enter the actual postage later when recording the sale."
+                ),
+            )
+
+        with sale_tax_col:
+            assumed_tcgplayer_tax_pct = st.number_input(
+                "Buyer tax %",
+                min_value=0.0,
+                max_value=25.0,
+                value=9.0,
+                step=0.25,
+                format="%.2f",
+                key="tcgplayer_estimator_tax_pct",
+                help=(
+                    "Used only to estimate the transaction-fee basis. Tax is "
+                    "removed from estimated net proceeds."
+                ),
+            )
+
+        with sale_extra_fee_col:
+            tcgplayer_additional_fee = st.number_input(
+                "Extra fee ($)",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                format="%.2f",
+                key="tcgplayer_estimator_extra_fee",
+                help=(
+                    "Optional additional assumed fee per sale, such as a sync "
+                    "provider fee not included in the selected preset."
+                ),
             )
 
         with sale_reset_col:
@@ -6128,6 +6391,124 @@ with tab_tcgplayer:
                 ]:
                     st.session_state.pop(state_key, None)
                 st.rerun()
+
+        custom_marketplace_pct = 10.75
+        custom_pro_pct = 0.0
+        custom_transaction_pct = 2.5
+        custom_fixed_order_fee = 0.30
+
+        if tcgplayer_fee_plan == "Custom fee plan":
+            custom_col1, custom_col2, custom_col3, custom_col4 = st.columns(4)
+            with custom_col1:
+                custom_marketplace_pct = st.number_input(
+                    "Custom marketplace fee %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=10.75,
+                    step=0.05,
+                    format="%.2f",
+                    key="tcgplayer_custom_marketplace_pct",
+                )
+            with custom_col2:
+                custom_pro_pct = st.number_input(
+                    "Custom Pro/add-on fee %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.05,
+                    format="%.2f",
+                    key="tcgplayer_custom_pro_pct",
+                )
+            with custom_col3:
+                custom_transaction_pct = st.number_input(
+                    "Custom transaction fee %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=2.5,
+                    step=0.05,
+                    format="%.2f",
+                    key="tcgplayer_custom_transaction_pct",
+                )
+            with custom_col4:
+                custom_fixed_order_fee = st.number_input(
+                    "Custom fixed fee ($)",
+                    min_value=0.0,
+                    value=0.30,
+                    step=0.01,
+                    format="%.2f",
+                    key="tcgplayer_custom_fixed_fee",
+                )
+
+        tcgplayer_estimator_assumptions = _build_tcgplayer_estimator_assumptions(
+            fee_plan_label=tcgplayer_fee_plan,
+            assumed_shipping_charge=assumed_tcgplayer_shipping,
+            assumed_tax_pct=assumed_tcgplayer_tax_pct,
+            additional_fee_dollars=tcgplayer_additional_fee,
+            custom_marketplace_pct=custom_marketplace_pct,
+            custom_pro_pct=custom_pro_pct,
+            custom_transaction_pct=custom_transaction_pct,
+            custom_fixed_order_fee=custom_fixed_order_fee,
+        )
+
+        sale_draft_all = _draft_dataframe_in_source_order(
+            source_df=active_tcgplayer_source,
+            draft_key=TCGPLAYER_SALE_DRAFT_KEY,
+        )
+        sale_draft_all = _add_tcgplayer_sale_calculations(
+            sale_draft_all,
+            estimator_assumptions=tcgplayer_estimator_assumptions,
+        )
+
+        selected_sale_count = int(
+            sale_draft_all["mark_sold"].apply(_as_bool).sum()
+        ) if not sale_draft_all.empty else 0
+        st.caption(
+            f"{len(active_tcgplayer_source):,} active TCGPlayer listings · "
+            f"{selected_sale_count:,} selected to mark sold · "
+            "Estimated margin is profit divided by total card cost."
+        )
+
+        provider_fee_note = clean_text(
+            tcgplayer_estimator_assumptions.get("provider_fee_note")
+        )
+        if provider_fee_note:
+            st.info(provider_fee_note, icon="ℹ️")
+
+        with st.expander("Estimated TCGPlayer profit assumptions", expanded=False):
+            st.write(
+                {
+                    "Fee plan": tcgplayer_estimator_assumptions["fee_plan_label"],
+                    "Marketplace commission": (
+                        f'{tcgplayer_estimator_assumptions["marketplace_pct"]:.2f}%'
+                    ),
+                    "Pro/add-on percentage": (
+                        f'{tcgplayer_estimator_assumptions["pro_pct"]:.2f}%'
+                    ),
+                    "Transaction fee": (
+                        f'{tcgplayer_estimator_assumptions["transaction_pct"]:.2f}% '
+                        f'+ ${tcgplayer_estimator_assumptions["fixed_order_fee"]:.2f}'
+                    ),
+                    "Buyer shipping collected": money_fmt(
+                        tcgplayer_estimator_assumptions["assumed_shipping_charge"]
+                    ),
+                    "Estimated label/postage expense": money_fmt(
+                        tcgplayer_estimator_assumptions["assumed_label_cost"]
+                    ),
+                    "Assumed buyer tax": (
+                        f'{tcgplayer_estimator_assumptions["assumed_tax_pct"]:.2f}%'
+                    ),
+                    "Additional assumed fee": money_fmt(
+                        tcgplayer_estimator_assumptions["additional_fee_dollars"]
+                    ),
+                }
+            )
+            st.caption(
+                "Commission is estimated on item price plus buyer shipping. "
+                "The transaction percentage is estimated on item price, shipping, "
+                "and tax. The $75 per-product cap is applied to the item portion "
+                "of marketplace and Pro commission. Actual sale entries below "
+                "always override these estimates."
+            )
 
         sale_display = sale_draft_all.copy()
 
@@ -6174,6 +6555,11 @@ with tab_tcgplayer:
                 "list_price",
                 "tcgplayer_list_link",
                 "total_cost",
+                "estimated_buyer_shipping",
+                "estimated_tcgplayer_fees",
+                "estimated_net_proceeds",
+                "estimated_profit_loss",
+                "estimated_margin_pct",
                 "mark_sold",
                 "gross_sold_price",
                 "platform_fees",
@@ -6203,6 +6589,36 @@ with tab_tcgplayer:
                 ),
                 "total_cost": st.column_config.NumberColumn(
                     "Total Cost", format="$%.2f", disabled=True
+                ),
+                "estimated_buyer_shipping": st.column_config.NumberColumn(
+                    "Assumed Shipping",
+                    format="$%.2f",
+                    disabled=True,
+                    help=(
+                        "Buyer shipping collected and the estimated label/postage "
+                        "expense used by the profit estimate."
+                    ),
+                ),
+                "estimated_tcgplayer_fees": st.column_config.NumberColumn(
+                    "Est. TCG Fees",
+                    format="$%.2f",
+                    disabled=True,
+                ),
+                "estimated_net_proceeds": st.column_config.NumberColumn(
+                    "Est. Net",
+                    format="$%.2f",
+                    disabled=True,
+                ),
+                "estimated_profit_loss": st.column_config.NumberColumn(
+                    "Est. Profit/Loss",
+                    format="$%.2f",
+                    disabled=True,
+                ),
+                "estimated_margin_pct": st.column_config.NumberColumn(
+                    "Est. Margin %",
+                    format="%.2f%%",
+                    disabled=True,
+                    help="Estimated profit divided by the inventory row's total cost.",
                 ),
                 "mark_sold": st.column_config.CheckboxColumn(
                     "Mark Sold",
@@ -6256,6 +6672,11 @@ with tab_tcgplayer:
                 "list_price",
                 "tcgplayer_list_link",
                 "total_cost",
+                "estimated_buyer_shipping",
+                "estimated_tcgplayer_fees",
+                "estimated_net_proceeds",
+                "estimated_profit_loss",
+                "estimated_margin_pct",
                 "total_sale_deductions",
                 "net_proceeds_preview",
                 "profit_preview",
