@@ -2070,22 +2070,65 @@ def _choose_sale_transaction(finance_payload: dict, order_id: str) -> dict:
     return transactions[0] if transactions else {}
 
 
-def _finance_negative_adjustments(finance_payload: dict) -> float:
+def _finance_signed_account_effect(tx: dict) -> float:
+    """
+    Return the transaction's effect on the seller account.
+
+    eBay Finances commonly returns a positive numeric amount and uses
+    bookingEntry=DEBIT/CREDIT to tell us the direction. Relying only on a
+    negative numeric value misses real charges such as SHIPPING_LABEL debits.
+    """
+    raw_amount = _amount_value(tx.get("amount"))
+    amount = abs(raw_amount)
+    booking_entry = clean_text(tx.get("bookingEntry")).upper()
+
+    if booking_entry == "DEBIT":
+        return -amount
+    if booking_entry == "CREDIT":
+        return amount
+
+    # Defensive fallback for older/unusual payloads that encode the sign
+    # directly in amount instead of bookingEntry.
+    return raw_amount
+
+
+def _finance_order_adjustment_breakdown(finance_payload: dict) -> dict:
+    """
+    Pull order-level seller debits that happen outside the SALE transaction.
+
+    SHIPPING_LABEL is postage bought through eBay. NON_SALE_CHARGE can contain
+    order-related transactional fees that eBay bills separately rather than
+    netting from the SALE transaction. ADJUSTMENT is included only when it is a
+    debit tied to this order. Refund/dispute transactions are intentionally not
+    treated as postage or ordinary selling fees here.
+    """
     transactions = finance_payload.get("transactions", []) or []
-    total = 0.0
+
+    shipping_label_effect = 0.0
+    non_sale_charge_effect = 0.0
+    adjustment_effect = 0.0
 
     for tx in transactions:
         tx_type = clean_text(tx.get("transactionType")).upper()
-
         if tx_type == "SALE":
             continue
 
-        amount = _amount_value(tx.get("amount"))
+        effect = _finance_signed_account_effect(tx)
 
-        if amount < 0:
-            total += abs(amount)
+        if tx_type == "SHIPPING_LABEL":
+            shipping_label_effect += effect
+        elif tx_type == "NON_SALE_CHARGE":
+            non_sale_charge_effect += effect
+        elif tx_type == "ADJUSTMENT":
+            adjustment_effect += effect
 
-    return round(total, 2)
+    return {
+        # A debit is negative account effect, so convert it to a positive cost.
+        # Label refunds/credits naturally offset label debits before max(0).
+        "shipping_label_cost": round(max(-shipping_label_effect, 0.0), 2),
+        "non_sale_charge_cost": round(max(-non_sale_charge_effect, 0.0), 2),
+        "adjustment_debit_cost": round(max(-adjustment_effect, 0.0), 2),
+    }
 
 
 def _line_finance_basis_from_transaction(sale_tx: dict, line_item_id: str) -> tuple[float, float]:
@@ -2139,6 +2182,7 @@ def _finance_values_for_order_line(order_row: pd.Series, finance_payload: dict) 
             "finance_fees": 0.0,
             "finance_fee_source": "fallback_order_no_finance",
             "finance_label_cost": 0.0,
+            "finance_other_order_debits": 0.0,
             "finance_tax_or_basis_extra": to_money(order_row.get("tax_collected")),
         }
 
@@ -2151,7 +2195,15 @@ def _finance_values_for_order_line(order_row: pd.Series, finance_payload: dict) 
     sale_amount_net_before_adjustments = abs(_amount_value(sale_tx.get("amount")))
     sale_total_fee_basis = _amount_value(sale_tx.get("totalFeeBasisAmount"))
 
-    order_negative_adjustments = _finance_negative_adjustments(finance_payload)
+    adjustment_breakdown = _finance_order_adjustment_breakdown(finance_payload)
+    finance_shipping_label_cost = to_money(
+        adjustment_breakdown.get("shipping_label_cost")
+    )
+    finance_other_order_debits = round(
+        to_money(adjustment_breakdown.get("non_sale_charge_cost"))
+        + to_money(adjustment_breakdown.get("adjustment_debit_cost")),
+        2,
+    )
 
     # Sold price = buyer-paid gross. This should be item + shipping + tax for single-line orders.
     order_gross = max(
@@ -2160,23 +2212,34 @@ def _finance_values_for_order_line(order_row: pd.Series, finance_payload: dict) 
         to_money(sale_total_fee_basis),
     )
 
-    if order_negative_adjustments > 0:
-        order_label_or_adjustment_cost = order_negative_adjustments
-        adjustment_source = "finance_negative_transactions"
+    if finance_shipping_label_cost > 0:
+        order_label_cost = finance_shipping_label_cost
+        adjustment_source = "finance_shipping_label"
     else:
-        # If label transaction is not yet returned with this order, use buyer shipping as practical label fallback.
-        # This matches your Quaxly example: finance net before label - $1.32 shipping = final net proceeds.
-        order_label_or_adjustment_cost = row_shipping_charged
+        # The label transaction may not exist yet (for example, before the
+        # seller buys postage). Until then, use buyer-paid shipping as an
+        # estimate so profit is not overstated.
+        order_label_cost = row_shipping_charged
         adjustment_source = "fallback_shipping_charged_as_label_cost"
 
-    order_net_after_adjustments = round(sale_amount_net_before_adjustments - order_label_or_adjustment_cost, 2)
+    order_total_post_sale_cost = round(
+        order_label_cost + finance_other_order_debits,
+        2,
+    )
 
-    if order_net_after_adjustments < 0:
-        order_net_after_adjustments = sale_amount_net_before_adjustments
+    # IMPORTANT: negative net proceeds are legitimate. An auction can sell so
+    # cheaply that eBay fees + postage exceed the seller's SALE credit. Do not
+    # clamp/reset a negative result; doing so is what caused $5.03 profit to be
+    # shown on a sale that actually lost money.
+    order_net_after_adjustments = round(
+        sale_amount_net_before_adjustments - order_total_post_sale_cost,
+        2,
+    )
 
     if line_count <= 1:
         line_gross = order_gross
-        line_label_or_adjustment_cost = order_label_or_adjustment_cost
+        line_label_or_adjustment_cost = order_label_cost
+        line_other_order_debits = finance_other_order_debits
         line_net = order_net_after_adjustments
         line_fees = round(line_gross - line_net, 2)
     else:
@@ -2188,17 +2251,20 @@ def _finance_values_for_order_line(order_row: pd.Series, finance_payload: dict) 
         else:
             ratio = 1 / max(line_count, 1)
 
-        line_label_or_adjustment_cost = round(order_label_or_adjustment_cost * ratio, 2)
+        line_label_or_adjustment_cost = round(order_label_cost * ratio, 2)
+        line_other_order_debits = round(finance_other_order_debits * ratio, 2)
 
         if sale_amount_net_before_adjustments > 0:
             line_net_before_adjustments = round(sale_amount_net_before_adjustments * ratio, 2)
         else:
             line_net_before_adjustments = round(line_gross - line_fee_direct, 2)
 
-        line_net = round(line_net_before_adjustments - line_label_or_adjustment_cost, 2)
-
-        if line_net < 0:
-            line_net = max(0.0, line_net_before_adjustments)
+        line_net = round(
+            line_net_before_adjustments
+            - line_label_or_adjustment_cost
+            - line_other_order_debits,
+            2,
+        )
 
         line_fees = round(line_gross - line_net, 2)
 
@@ -2219,6 +2285,7 @@ def _finance_values_for_order_line(order_row: pd.Series, finance_payload: dict) 
         "finance_fees": line_fees,
         "finance_fee_source": f"sold_price_minus_net__{adjustment_source}",
         "finance_label_cost": round(line_label_or_adjustment_cost, 2),
+        "finance_other_order_debits": round(line_other_order_debits, 2),
         "finance_tax_or_basis_extra": tax_or_basis_extra,
     }
 
@@ -2800,6 +2867,7 @@ def _display_order_cols() -> list[str]:
         "tax_collected",
         "finance_tax_or_basis_extra",
         "finance_label_cost",
+        "finance_other_order_debits",
         "sync_sold_price",
         "sync_fees",
         "sync_net_proceeds",
@@ -5087,9 +5155,10 @@ with tab_orders:
                 "shipping_charged": st.column_config.NumberColumn("Shipping Charged", format="$%.2f"),
                 "tax_collected": st.column_config.NumberColumn("Tax Collected", format="$%.2f"),
                 "finance_tax_or_basis_extra": st.column_config.NumberColumn("Tax/Basis Extra", format="$%.2f"),
-                "finance_label_cost": st.column_config.NumberColumn("Label Cost/Adjustment", format="$%.2f"),
+                "finance_label_cost": st.column_config.NumberColumn("Label Cost", format="$%.2f"),
+                "finance_other_order_debits": st.column_config.NumberColumn("Other eBay Debits", format="$%.2f"),
                 "sync_sold_price": st.column_config.NumberColumn("Sold Price to Write", format="$%.2f"),
-                "sync_fees": st.column_config.NumberColumn("Fees to Write", format="$%.2f"),
+                "sync_fees": st.column_config.NumberColumn("Total Deductions to Write", format="$%.2f"),
                 "sync_net_proceeds": st.column_config.NumberColumn("Net Proceeds to Write", format="$%.2f"),
                 "sync_profit": st.column_config.NumberColumn("Profit to Write", format="$%.2f"),
             },
