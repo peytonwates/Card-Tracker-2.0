@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import re
+import unicodedata
 import uuid
 from datetime import date
+from difflib import SequenceMatcher
+from typing import Any
 from urllib.parse import urlparse, urljoin, unquote
 
 import pandas as pd
@@ -537,6 +542,7 @@ def _make_inventory_row(
     image_url: str = "",
     grading_fee: float = 0.0,
     market_value: float = 0.0,
+    notes: str = "",
 ) -> dict:
     purchase_price = _money_value(purchase_price)
     shipping = _money_value(shipping)
@@ -582,6 +588,7 @@ def _make_inventory_row(
             "market_value": market_value,
             "market_price_updated_at": now_iso() if market_value > 0 else "",
             "sticker_price": sticker_price,
+            "notes": _clean_or_blank(notes),
         }
     )
     return row
@@ -1294,6 +1301,1462 @@ def _validate_bulk_preview(preview_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
     )
 
 
+
+
+# =========================================================
+# Collectr Bulk Add reconciliation helpers
+# =========================================================
+
+TRUTHY_VALUES = {"1", "true", "yes", "y", "x", "sold", "add", "process"}
+FALSEY_VALUES = {"0", "false", "no", "n", "", "skip", "ignore"}
+
+COLLECTR_ALIASES = {
+    "portfolio_name": ["portfolio_name", "portfolio"],
+    "category": ["category", "game", "brand_or_league"],
+    "set_name": ["set", "set_name"],
+    "card_name": ["product_name", "card_name", "name"],
+    "card_number": ["card_number", "number", "card_no"],
+    "rarity": ["rarity", "card_subtype"],
+    "variant": ["variance", "variant", "finish"],
+    "grade": ["grade"],
+    "condition": ["card_condition", "condition"],
+    "average_cost_paid": ["average_cost_paid", "cost_paid"],
+    "quantity": ["quantity", "qty"],
+    "market_value": ["market_price", "market_value", "price"],
+    "price_override": ["price_override"],
+    "date_added": ["date_added"],
+    "notes": ["notes"],
+}
+
+AUTO_MATCH_THRESHOLD_DEFAULT = 80.0
+REVIEW_MATCH_THRESHOLD = 60.0
+MATCHING_ENGINE_VERSION = "v6-availability-aware"
+
+SEALED_COLLECTR_TERMS = {
+    "booster box",
+    "booster bundle",
+    "booster pack",
+    "elite trainer box",
+    "etb",
+    "collection box",
+    "trainer toolkit",
+    "theme deck",
+    "battle deck",
+    "tin",
+}
+
+MATCH_AUDIT_COLUMNS = [
+    "match_status",
+    "match_confidence",
+    "match_score",
+    "match_method",
+    "score_details",
+    "name_score_pct",
+    "number_score_pct",
+    "set_score_pct",
+    "grade_score_pct",
+    "condition_score_pct",
+    "next_best_score",
+    "score_gap",
+    "candidate_count",
+    "collectr_row_id",
+    "collectr_source_row",
+    "collectr_source_copy",
+    "collectr_source_quantity",
+    "collectr_set_name",
+    "collectr_card_name",
+    "collectr_card_number",
+    "collectr_rarity",
+    "collectr_variant",
+    "collectr_condition",
+    "collectr_grading_company",
+    "collectr_grade",
+    "collectr_market_value",
+    "inventory_id",
+    "inventory_status",
+    "inventory_set_name",
+    "inventory_card_name",
+    "inventory_card_number",
+    "inventory_reference_link",
+    "inventory_reference_set",
+    "inventory_reference_name",
+    "inventory_reference_number",
+    "inventory_variant",
+    "inventory_card_subtype",
+    "inventory_condition",
+    "inventory_grading_company",
+    "inventory_grade",
+    "inventory_purchase_date",
+    "inventory_purchased_from",
+    "inventory_total_cost",
+    "inventory_market_value",
+    "inventory_sticker_price",
+]
+
+
+def _series(df: pd.DataFrame, col: str, default: Any = "") -> pd.Series:
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _clean_column_name(value: Any) -> str:
+    text = clean_text(value).replace("\ufeff", "").lower()
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text
+
+
+def _text(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return clean_text(value)
+
+
+def _norm(value: Any) -> str:
+    text = _text(value)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower().replace("pokémon", "pokemon")
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _compact(value: Any) -> str:
+    return _norm(value).replace(" ", "")
+
+
+def _normalized_card_name(value: Any) -> str:
+    text = _norm(value)
+    text = re.sub(r"\b(alternate full art|full art|illustration rare|special illustration rare|secret rare)\b", "", text)
+    return " ".join(text.split())
+
+
+def _normalized_set(value: Any) -> str:
+    text = _norm(value)
+    text = re.sub(r"\bpokemon\b", " ", text)
+    text = re.sub(r"\bjapanese\b", " ", text)
+    text = re.sub(r"\btcg\b", " ", text)
+    text = " ".join(text.split()).replace("promos", "promo")
+
+    replacements = {
+        "sv 151": "151",
+        "scarlet violet 151": "151",
+        "scarlet and violet 151": "151",
+        "scarlet violet base set": "scarlet violet",
+        "scarlet violet base": "scarlet violet",
+        "scarlet and violet base set": "scarlet violet",
+        "scarlet and violet base": "scarlet violet",
+        "crown zenith galarian gallery": "crown zenith",
+        "brilliant stars trainer gallery": "brilliant stars",
+        "silver tempest trainer gallery": "silver tempest",
+        "astral radiance trainer gallery": "astral radiance",
+        "generations radiant collection": "generations",
+        "paldea fates": "paldean fates",
+        "ascended heros": "ascended heroes",
+        "mega evolutions": "mega evolution",
+        "mega evoltuon": "mega evolution",
+        "mega evolutions promo": "mega evolution promo",
+        "mega evolution promos": "mega evolution promo",
+        "mega evolutions promos": "mega evolution promo",
+        "scarlet violet promo": "promo",
+        "scarlet and violet promo": "promo",
+        "wotc promo": "promo",
+        "xy promo": "promo",
+        "xy base set": "xy",
+        "world championships 2007": "world championship 2007",
+        "base set unlimited": "base set",
+    }
+    return replacements.get(text, text)
+
+
+def _normalized_card_number(value: Any) -> str:
+    """Normalize the numerator while preserving prefixes such as TG, GG, RC, and SWSH.
+
+    Collectr exports numbers such as 182/167. The former implementation normalized
+    punctuation before splitting, which converted that value into 182167 and caused
+    most otherwise-obvious matches to fail.
+    """
+    raw = _text(value)
+    raw = unicodedata.normalize("NFKD", raw)
+    raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
+    raw = raw.upper().replace("#", "")
+    raw = re.sub(r"[^A-Z0-9/]+", "", raw)
+    if not raw:
+        return ""
+
+    numerator = raw.split("/", 1)[0]
+    match = re.fullmatch(r"([A-Z]*)(\d+)([A-Z]*)", numerator)
+    if not match:
+        return numerator
+
+    prefix, digits, suffix = match.groups()
+    return f"{prefix}{int(digits)}{suffix}"
+
+
+def _card_number_parts(value: Any) -> tuple[str, str, str]:
+    normalized = _normalized_card_number(value)
+    if not normalized:
+        return "", "", ""
+    match = re.fullmatch(r"([A-Z]*)(\d+)([A-Z]*)", normalized)
+    if not match:
+        return "", normalized, ""
+    prefix, digits, suffix = match.groups()
+    return prefix, str(int(digits)), suffix
+
+
+def _normalized_variant(value: Any) -> str:
+    text = _norm(value)
+    aliases = {
+        "holo": "holofoil",
+        "reverse holo": "reverse holofoil",
+        "normal foil": "holofoil",
+        "non holo": "normal",
+        "non holofoil": "normal",
+    }
+    return aliases.get(text, text)
+
+
+def _normalized_condition(value: Any) -> str:
+    text = _norm(value)
+    aliases = {
+        "nm": "near mint",
+        "lp": "lightly played",
+        "mp": "moderately played",
+        "hp": "heavily played",
+        "dmg": "damaged",
+    }
+    return aliases.get(text, text)
+
+
+def _truthy(value: Any, default: bool = False) -> bool:
+    text = _norm(value)
+    if text in TRUTHY_VALUES:
+        return True
+    if text in FALSEY_VALUES:
+        return False
+    return default
+
+
+def _has_value(value: Any) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    return bool(_text(value))
+
+
+def _file_bytes(uploaded_file) -> bytes:
+    if hasattr(uploaded_file, "getvalue"):
+        return uploaded_file.getvalue()
+    current_position = uploaded_file.tell()
+    uploaded_file.seek(0)
+    data = uploaded_file.read()
+    uploaded_file.seek(current_position)
+    return data
+
+
+def _read_csv_or_excel(uploaded_file) -> pd.DataFrame:
+    filename = _text(getattr(uploaded_file, "name", "")).lower()
+    raw = _file_bytes(uploaded_file)
+
+    if filename.endswith(".xlsx") or filename.endswith(".xls"):
+        return pd.read_excel(io.BytesIO(raw), dtype=str)
+
+    # utf-8-sig handles Excel-generated CSVs with a BOM. Fall back to latin-1
+    # for older exports that contain non-UTF characters.
+    try:
+        return pd.read_csv(
+            io.BytesIO(raw), dtype=str, keep_default_na=False, encoding="utf-8-sig"
+        )
+    except UnicodeDecodeError:
+        return pd.read_csv(
+            io.BytesIO(raw), dtype=str, keep_default_na=False, encoding="latin-1"
+        )
+
+
+def _parse_collectr_grade(value: Any) -> tuple[str, str]:
+    text = _text(value)
+    normalized = _norm(text)
+    if not normalized or normalized in {"ungraded", "raw", "none", "na"}:
+        return "", ""
+
+    # Collectr commonly exports values such as "PSA 10.0 GEM - MT".
+    match = re.search(
+        r"\b(psa|bgs|cgc|sgc|ace)\b.*?(\d+(?:\.\d+)?)",
+        normalized,
+    )
+    if match:
+        return match.group(1).upper(), f"{float(match.group(2)):g}"
+
+    numeric = pd.to_numeric(text, errors="coerce")
+    if pd.notna(numeric):
+        return "", f"{float(numeric):g}"
+
+    return "", text
+
+
+def _contains_whole_term(value: Any, term: str) -> bool:
+    """
+    Match a normalized word or phrase without treating a partial card-name
+    substring as a product type.
+
+    Example:
+      - "Pokemon Tin" matches the sealed term "tin".
+      - "Tinkatink" does NOT match the sealed term "tin".
+    """
+    normalized_value = _norm(value)
+    normalized_term = _norm(term)
+    if not normalized_value or not normalized_term:
+        return False
+
+    pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])"
+    return re.search(pattern, normalized_value) is not None
+
+
+def _collectr_is_sealed_or_non_card(row: pd.Series) -> bool:
+    product_name = _norm(row.get("card_name"))
+    rarity = _norm(row.get("rarity"))
+
+    if any(
+        _contains_whole_term(product_name, term)
+        for term in SEALED_COLLECTR_TERMS
+    ):
+        return True
+
+    if _contains_whole_term(rarity, "sealed"):
+        return True
+
+    return False
+
+
+def _parse_collectr(uploaded_file) -> tuple[pd.DataFrame, dict[str, int]]:
+    raw = _read_csv_or_excel(uploaded_file)
+    raw.columns = [_text(col) for col in raw.columns]
+
+    canonical = pd.DataFrame(index=raw.index)
+    for target, aliases in COLLECTR_ALIASES.items():
+        source = _find_collectr_source_column(raw.columns.tolist(), aliases)
+        canonical[target] = raw[source] if source else ""
+    # Excel/CSV row number including the header row, useful when reviewing the audit.
+    canonical["__source_row_number"] = range(2, len(canonical) + 2)
+
+    canonical["category"] = canonical["category"].astype(str).str.strip()
+    pokemon_mask = canonical["category"].apply(lambda value: "pokemon" in _norm(value))
+
+    stats = {
+        "source_rows": int(len(canonical)),
+        "pokemon_rows": int(pokemon_mask.sum()),
+        "non_pokemon_rows_ignored": int((~pokemon_mask).sum()),
+    }
+
+    canonical = canonical[pokemon_mask].copy()
+    canonical = canonical[
+        canonical["card_name"].astype(str).str.strip().ne("")
+    ].copy()
+
+    sealed_mask = canonical.apply(_collectr_is_sealed_or_non_card, axis=1)
+    stats["sealed_rows_ignored"] = int(sealed_mask.sum())
+    canonical = canonical[~sealed_mask].copy()
+
+    expanded_rows: list[dict[str, Any]] = []
+    for _, row in canonical.iterrows():
+        source_position = int(row.get("__source_row_number", 0) or 0)
+        quantity_number = pd.to_numeric(row.get("quantity"), errors="coerce")
+        quantity = int(quantity_number) if pd.notna(quantity_number) else 1
+        quantity = max(1, min(quantity, 500))
+
+        grading_company, grade = _parse_collectr_grade(row.get("grade"))
+        market_value = to_money(row.get("market_value"))
+        price_override = to_money(row.get("price_override"))
+        if price_override > 0:
+            market_value = price_override
+
+        for copy_number in range(1, quantity + 1):
+            expanded_rows.append(
+                {
+                    "collectr_row_id": f"C{source_position:04d}-{copy_number:03d}",
+                    "source_row_number": source_position,
+                    "portfolio_name": _text(row.get("portfolio_name")),
+                    "category": "Pokemon",
+                    "set_name": _text(row.get("set_name")),
+                    "card_name": _text(row.get("card_name")),
+                    "card_number": _text(row.get("card_number")),
+                    "card_subtype": _text(row.get("rarity")),
+                    "variant": _text(row.get("variant")),
+                    "grading_company": grading_company,
+                    "grade": grade,
+                    "condition": _text(row.get("condition")),
+                    "average_cost_paid": to_money(row.get("average_cost_paid")),
+                    "market_value": market_value,
+                    "date_added": _text(row.get("date_added")),
+                    "collectr_notes": _text(row.get("notes")),
+                    "source_quantity": quantity,
+                    "source_copy_number": copy_number,
+                }
+            )
+
+    expanded = pd.DataFrame(expanded_rows)
+    stats["individual_cards"] = int(len(expanded))
+    return expanded, stats
+
+
+def _normalized_grade(value: Any) -> str:
+    text = _text(value)
+    normalized = _norm(text)
+    if not normalized or normalized in {"ungraded", "raw", "none", "na"}:
+        return ""
+
+    numeric = pd.to_numeric(text, errors="coerce")
+    if pd.notna(numeric):
+        return f"{float(numeric):g}"
+    return normalized
+
+
+def _grade_signature(row: pd.Series, *, collectr_row: bool = False) -> str:
+    company = _norm(row.get("grading_company"))
+    grade = _normalized_grade(row.get("grade"))
+
+    if not grade:
+        if not collectr_row:
+            type_text = " ".join(
+                _norm(row.get(col))
+                for col in ["product_type", "card_type", "condition"]
+            )
+            if "graded" in type_text:
+                return "graded:unknown"
+        return "raw"
+
+    match = re.search(
+        r"\b(psa|bgs|cgc|sgc|ace)\b.*?(\d+(?:\.\d+)?)",
+        f"{company} {grade}",
+    )
+    if match:
+        return f"{match.group(1)}:{float(match.group(2)):g}"
+    return f"{company}:{grade}" if company else grade
+
+
+def _reference_parts(value: Any) -> dict[str, str]:
+    link = _text(value)
+    if not link:
+        return {"set": "", "name": "", "number": ""}
+
+    try:
+        path = unquote(urlparse(link).path)
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 2:
+            return {"set": "", "name": "", "number": ""}
+
+        reference_set = _normalized_set(parts[-2].replace("-", " "))
+        item_slug = parts[-1].split("?", 1)[0]
+        tokens = item_slug.split("-")
+        reference_number = ""
+        if tokens and re.fullmatch(r"[A-Za-z]*\d+[A-Za-z]*", tokens[-1]):
+            reference_number = _normalized_card_number(tokens[-1])
+            tokens = tokens[:-1]
+
+        reference_name = _norm(" ".join(tokens))
+        return {
+            "set": reference_set,
+            "name": reference_name,
+            "number": reference_number,
+        }
+    except Exception:
+        return {"set": "", "name": "", "number": ""}
+
+
+def _dedupe_text(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _name_candidates(row: pd.Series, *, include_reference: bool) -> dict[str, list[str]]:
+    direct = _text(row.get("card_name"))
+    number_candidates = {
+        _normalized_card_number(row.get("card_number")),
+    }
+    reference = _reference_parts(row.get("reference_link")) if include_reference else {
+        "name": "",
+        "number": "",
+        "set": "",
+    }
+    if reference["number"]:
+        number_candidates.add(reference["number"])
+
+    descriptor_terms = {
+        "secret",
+        "full",
+        "art",
+        "alternate",
+        "illustration",
+        "special",
+        "rare",
+        "holo",
+        "holofoil",
+        "foil",
+        "stamped",
+        "metal",
+        "card",
+        "radiant",
+    }
+
+    def clean_candidate(value: str) -> str:
+        normalized = _norm(value)
+        tokens = normalized.split()
+        number_digit_cores = {
+            _card_number_parts(number)[1]
+            for number in number_candidates
+            if _card_number_parts(number)[1]
+        }
+        while tokens:
+            token_number = _normalized_card_number(tokens[-1])
+            _, token_digits, _ = _card_number_parts(token_number)
+            if token_number and (
+                token_number in number_candidates
+                or (token_digits and token_digits in number_digit_cores)
+            ):
+                tokens.pop()
+            else:
+                break
+        return " ".join(tokens)
+
+    direct_candidates = [clean_candidate(direct)]
+    without_parenthetical = re.sub(r"[\(\[].*?[\)\]]", " ", direct)
+    direct_candidates.append(clean_candidate(without_parenthetical))
+
+    for candidate in list(direct_candidates):
+        direct_candidates.append(
+            " ".join(
+                token for token in candidate.split() if token not in descriptor_terms
+            )
+        )
+
+    variant = _norm(row.get("variant"))
+    if variant in {"ex", "v", "vmax", "vstar", "gx", "lv x", "lvx"}:
+        for candidate in list(direct_candidates):
+            if variant not in candidate.split():
+                direct_candidates.append(f"{candidate} {variant}".strip())
+
+    reference_candidates: list[str] = []
+    if reference["name"]:
+        reference_candidates.append(clean_candidate(reference["name"]))
+        reference_candidates.append(
+            " ".join(
+                token
+                for token in reference["name"].split()
+                if token not in descriptor_terms
+            )
+        )
+
+    return {
+        "direct": _dedupe_text(direct_candidates),
+        "reference": _dedupe_text(reference_candidates),
+        "all": _dedupe_text(direct_candidates + reference_candidates),
+    }
+
+
+def _set_candidates(row: pd.Series, *, include_reference: bool) -> dict[str, list[str]]:
+    direct = _normalized_set(row.get("set_name"))
+    direct_candidates = [direct] if direct else []
+
+    raw_set = _norm(row.get("set_name"))
+    for suffix in [" galarian gallery", " trainer gallery", " radiant collection"]:
+        if raw_set.endswith(suffix):
+            direct_candidates.append(_normalized_set(raw_set[: -len(suffix)]))
+
+    if "promo" in direct:
+        direct_candidates.append("promo")
+
+    reference = _reference_parts(row.get("reference_link")) if include_reference else {
+        "set": ""
+    }
+    reference_candidates = [reference["set"]] if reference.get("set") else []
+    if reference.get("set") and "promo" in reference["set"]:
+        reference_candidates.append("promo")
+
+    return {
+        "direct": _dedupe_text(direct_candidates),
+        "reference": _dedupe_text(reference_candidates),
+        "all": _dedupe_text(direct_candidates + reference_candidates),
+    }
+
+
+def _number_candidates(row: pd.Series, *, include_reference: bool) -> dict[str, list[str]]:
+    direct_candidates: list[str] = []
+    direct = _normalized_card_number(row.get("card_number"))
+    if direct:
+        direct_candidates.append(direct)
+
+    # Older inventory rows sometimes embedded the number in card_name.
+    if include_reference:
+        for token in re.findall(r"\b[A-Za-z]*\d+[A-Za-z]*\b", _text(row.get("card_name"))):
+            normalized = _normalized_card_number(token)
+            if normalized:
+                direct_candidates.append(normalized)
+
+    reference = _reference_parts(row.get("reference_link")) if include_reference else {
+        "number": ""
+    }
+    reference_candidates = [reference["number"]] if reference.get("number") else []
+
+    return {
+        "direct": _dedupe_text(direct_candidates),
+        "reference": _dedupe_text(reference_candidates),
+        "all": _dedupe_text(direct_candidates + reference_candidates),
+    }
+
+
+def _string_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    left_sorted = " ".join(sorted(left.split()))
+    right_sorted = " ".join(sorted(right.split()))
+    return max(
+        SequenceMatcher(None, left, right).ratio(),
+        SequenceMatcher(None, left_sorted, right_sorted).ratio(),
+    )
+
+
+def _best_similarity(left_values: list[str], right_values: list[str]) -> float:
+    return max(
+        (
+            _string_similarity(left, right)
+            for left in left_values
+            for right in right_values
+        ),
+        default=0.0,
+    )
+
+
+def _number_match(
+    collectr_numbers: list[str],
+    inventory_numbers: list[str],
+) -> tuple[float, str, bool]:
+    if not collectr_numbers and not inventory_numbers:
+        return 0.50, "both card numbers unavailable", True
+    if not collectr_numbers or not inventory_numbers:
+        return 0.40, "card number unavailable on one side", True
+    if set(collectr_numbers).intersection(inventory_numbers):
+        return 1.00, "exact card number", True
+
+    for collectr_number in collectr_numbers:
+        collectr_prefix, collectr_digits, collectr_suffix = _card_number_parts(
+            collectr_number
+        )
+        for inventory_number in inventory_numbers:
+            inventory_prefix, inventory_digits, inventory_suffix = _card_number_parts(
+                inventory_number
+            )
+            if (
+                collectr_digits
+                and collectr_digits == inventory_digits
+                and collectr_suffix == inventory_suffix
+                and (not collectr_prefix or not inventory_prefix)
+            ):
+                return 0.92, "numeric card number match; prefix omitted", True
+
+    return 0.0, "card number conflict", False
+
+
+def _score_candidate_pair(
+    collectr_row: pd.Series,
+    inventory_row: pd.Series,
+) -> dict[str, Any] | None:
+    collectr_grade = _grade_signature(collectr_row, collectr_row=True)
+    inventory_grade = _grade_signature(inventory_row, collectr_row=False)
+    if collectr_grade != inventory_grade:
+        return None
+
+    collectr_names = _name_candidates(collectr_row, include_reference=False)
+    inventory_names = _name_candidates(inventory_row, include_reference=True)
+    name_score = _best_similarity(collectr_names["all"], inventory_names["all"])
+    if name_score < 0.55:
+        return None
+
+    collectr_numbers = _number_candidates(collectr_row, include_reference=False)
+    inventory_numbers = _number_candidates(inventory_row, include_reference=True)
+    number_score, number_reason, number_compatible = _number_match(
+        collectr_numbers["all"], inventory_numbers["all"]
+    )
+    if not number_compatible:
+        return None
+
+    collectr_sets = _set_candidates(collectr_row, include_reference=False)
+    inventory_sets = _set_candidates(inventory_row, include_reference=True)
+    if collectr_sets["all"] and inventory_sets["all"]:
+        set_score = _best_similarity(collectr_sets["all"], inventory_sets["all"])
+    elif collectr_sets["all"] or inventory_sets["all"]:
+        set_score = 0.40
+    else:
+        set_score = 0.50
+
+    collectr_condition = _normalized_condition(collectr_row.get("condition"))
+    inventory_condition = _normalized_condition(inventory_row.get("condition"))
+    if inventory_condition == "graded":
+        condition_score = 0.50
+    elif collectr_condition and inventory_condition:
+        condition_score = 1.0 if collectr_condition == inventory_condition else 0.25
+    else:
+        condition_score = 0.50
+
+    grade_score = 1.0
+    score = round(
+        40.0 * name_score
+        + 30.0 * number_score
+        + 20.0 * set_score
+        + 8.0 * grade_score
+        + 2.0 * condition_score,
+        1,
+    )
+
+    reference_name_score = _best_similarity(
+        collectr_names["all"], inventory_names["reference"]
+    )
+    direct_name_score = _best_similarity(
+        collectr_names["all"], inventory_names["direct"]
+    )
+    reference_set_score = _best_similarity(
+        collectr_sets["all"], inventory_sets["reference"]
+    )
+    direct_set_score = _best_similarity(
+        collectr_sets["all"], inventory_sets["direct"]
+    )
+    reference_number_used = bool(
+        set(collectr_numbers["all"]).intersection(inventory_numbers["reference"])
+    )
+    reference_used = (
+        reference_name_score > direct_name_score + 0.001
+        or reference_set_score > direct_set_score + 0.001
+        or reference_number_used
+    )
+
+    exact_name = name_score >= 0.999
+    exact_set = set_score >= 0.999
+    exact_number = number_score >= 0.999
+
+    if exact_name and exact_set and exact_number:
+        method = "Exact identity"
+    elif reference_used and exact_number:
+        method = "Reference-link identity"
+    elif exact_number and exact_set:
+        method = "Number/set + name similarity"
+    elif exact_number and exact_name:
+        method = "Name/number + set similarity"
+    elif number_score < 0.60:
+        method = "Name/set match; number unavailable"
+    else:
+        method = "Weighted identity match"
+
+    score_details = (
+        f"Name {name_score * 100:.0f}% | Number {number_score * 100:.0f}% "
+        f"({number_reason}) | Set {set_score * 100:.0f}% | "
+        f"Grade {grade_score * 100:.0f}% | Condition {condition_score * 100:.0f}%"
+    )
+    if reference_used:
+        score_details += " | Inventory reference link improved the match"
+
+    return {
+        "score": score,
+        "match_method": method,
+        "score_details": score_details,
+        "name_score": name_score,
+        "number_score": number_score,
+        "set_score": set_score,
+        "grade_score": grade_score,
+        "condition_score": condition_score,
+        "exact_name": exact_name,
+        "exact_number": exact_number,
+        "exact_set": exact_set,
+        "reference_used": reference_used,
+    }
+
+
+def _confidence_label(score: float, matched: bool) -> str:
+    if not matched:
+        if score >= AUTO_MATCH_THRESHOLD_DEFAULT:
+            return "Strong candidate but unavailable"
+        if score >= REVIEW_MATCH_THRESHOLD:
+            return "Review"
+        return "No reliable candidate"
+    if score >= 95:
+        return "Excellent"
+    if score >= 88:
+        return "High"
+    if score >= 80:
+        return "Good"
+    return "Review"
+
+
+def _inventory_purchase_rank(row: pd.Series) -> int:
+    parsed = pd.to_datetime(row.get("purchase_date"), errors="coerce")
+    return int(parsed.value) if pd.notna(parsed) else -1
+
+
+def _audit_row(
+    collectr_row: pd.Series,
+    inventory_row: pd.Series | None,
+    candidate: dict[str, Any] | None,
+    *,
+    matched: bool,
+    match_status: str,
+    next_best_score: float | None,
+    candidate_count: int,
+) -> dict[str, Any]:
+    score = float(candidate.get("score", 0.0)) if candidate else 0.0
+    reference = (
+        _reference_parts(inventory_row.get("reference_link"))
+        if inventory_row is not None
+        else {"set": "", "name": "", "number": ""}
+    )
+    gap = (
+        round(score - next_best_score, 1)
+        if next_best_score is not None
+        else ""
+    )
+
+    return {
+        "match_status": match_status,
+        "match_confidence": _confidence_label(score, matched),
+        "match_score": score,
+        "match_method": candidate.get("match_method", "") if candidate else "",
+        "score_details": candidate.get("score_details", "") if candidate else "",
+        "name_score_pct": round(candidate.get("name_score", 0.0) * 100, 1) if candidate else 0.0,
+        "number_score_pct": round(candidate.get("number_score", 0.0) * 100, 1) if candidate else 0.0,
+        "set_score_pct": round(candidate.get("set_score", 0.0) * 100, 1) if candidate else 0.0,
+        "grade_score_pct": round(candidate.get("grade_score", 0.0) * 100, 1) if candidate else 0.0,
+        "condition_score_pct": round(candidate.get("condition_score", 0.0) * 100, 1) if candidate else 0.0,
+        "next_best_score": next_best_score if next_best_score is not None else "",
+        "score_gap": gap,
+        "candidate_count": candidate_count,
+        "collectr_row_id": _text(collectr_row.get("collectr_row_id")),
+        "collectr_source_row": collectr_row.get("source_row_number", ""),
+        "collectr_source_copy": collectr_row.get("source_copy_number", ""),
+        "collectr_source_quantity": collectr_row.get("source_quantity", ""),
+        "collectr_set_name": _text(collectr_row.get("set_name")),
+        "collectr_card_name": _text(collectr_row.get("card_name")),
+        "collectr_card_number": _text(collectr_row.get("card_number")),
+        "collectr_rarity": _text(collectr_row.get("card_subtype")),
+        "collectr_variant": _text(collectr_row.get("variant")),
+        "collectr_condition": _text(collectr_row.get("condition")),
+        "collectr_grading_company": _text(collectr_row.get("grading_company")),
+        "collectr_grade": _text(collectr_row.get("grade")),
+        "collectr_market_value": to_money(collectr_row.get("market_value")),
+        "inventory_id": _text(inventory_row.get("inventory_id")) if inventory_row is not None else "",
+        "inventory_status": _text(inventory_row.get("inventory_status")) if inventory_row is not None else "",
+        "inventory_set_name": _text(inventory_row.get("set_name")) if inventory_row is not None else "",
+        "inventory_card_name": _text(inventory_row.get("card_name")) if inventory_row is not None else "",
+        "inventory_card_number": _text(inventory_row.get("card_number")) if inventory_row is not None else "",
+        "inventory_reference_link": _text(inventory_row.get("reference_link")) if inventory_row is not None else "",
+        "inventory_reference_set": reference["set"],
+        "inventory_reference_name": reference["name"],
+        "inventory_reference_number": reference["number"],
+        "inventory_variant": _text(inventory_row.get("variant")) if inventory_row is not None else "",
+        "inventory_card_subtype": _text(inventory_row.get("card_subtype")) if inventory_row is not None else "",
+        "inventory_condition": _text(inventory_row.get("condition")) if inventory_row is not None else "",
+        "inventory_grading_company": _text(inventory_row.get("grading_company")) if inventory_row is not None else "",
+        "inventory_grade": _text(inventory_row.get("grade")) if inventory_row is not None else "",
+        "inventory_purchase_date": _text(inventory_row.get("purchase_date")) if inventory_row is not None else "",
+        "inventory_purchased_from": _text(inventory_row.get("purchased_from")) if inventory_row is not None else "",
+        "inventory_total_cost": to_money(inventory_row.get("total_cost")) if inventory_row is not None else "",
+        "inventory_market_value": to_money(inventory_row.get("market_value")) if inventory_row is not None else "",
+        "inventory_sticker_price": to_money(inventory_row.get("sticker_price")) if inventory_row is not None else "",
+    }
+
+
+def _reconcile_collectr(
+    collectr: pd.DataFrame,
+    eligible_inventory: pd.DataFrame,
+    *,
+    auto_match_threshold: float = AUTO_MATCH_THRESHOLD_DEFAULT,
+    duplicate_policy: str = "Keep newest eligible inventory",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    collectr_work = collectr.reset_index(drop=True).copy()
+    inventory_work = eligible_inventory.reset_index(drop=True).copy()
+
+    pair_records: list[dict[str, Any]] = []
+    pairs_by_collectr: dict[int, list[dict[str, Any]]] = {
+        idx: [] for idx in collectr_work.index
+    }
+    pairs_by_inventory: dict[int, list[dict[str, Any]]] = {
+        idx: [] for idx in inventory_work.index
+    }
+
+    for collectr_idx, collectr_row in collectr_work.iterrows():
+        for inventory_idx, inventory_row in inventory_work.iterrows():
+            scored = _score_candidate_pair(collectr_row, inventory_row)
+            if scored is None:
+                continue
+            record = {
+                **scored,
+                "collectr_index": int(collectr_idx),
+                "inventory_index": int(inventory_idx),
+                "purchase_rank": _inventory_purchase_rank(inventory_row),
+            }
+            pair_records.append(record)
+            pairs_by_collectr[int(collectr_idx)].append(record)
+            pairs_by_inventory[int(inventory_idx)].append(record)
+
+    keep_newest = duplicate_policy == "Keep newest eligible inventory"
+
+    def candidate_preference_key(record: dict[str, Any]) -> tuple[Any, ...]:
+        """Sort one Collectr row's candidates from strongest to weakest.
+
+        Purchase date is only a tie-breaker for genuinely identical copies. The
+        match score and exact identity fields always take priority.
+        """
+        purchase_preference = (
+            record["purchase_rank"]
+            if keep_newest
+            else -record["purchase_rank"]
+        )
+        return (
+            record["score"],
+            int(record["exact_number"]),
+            int(record["exact_name"]),
+            int(record["exact_set"]),
+            purchase_preference,
+            -record["inventory_index"],
+        )
+
+    qualifying_by_collectr: dict[int, list[dict[str, Any]]] = {}
+    for collectr_idx in collectr_work.index:
+        qualifying = [
+            record
+            for record in pairs_by_collectr.get(int(collectr_idx), [])
+            if record["score"] >= auto_match_threshold
+        ]
+        qualifying.sort(key=candidate_preference_key, reverse=True)
+        qualifying_by_collectr[int(collectr_idx)] = qualifying
+
+    # Match the most constrained Collectr copies first. Then use an augmenting
+    # path whenever the preferred inventory row is already occupied. This is
+    # the key duplicate fix: a second copy does not stop at the already-used
+    # best candidate; it can move the first copy to another valid inventory row
+    # and consume the remaining copy instead.
+    collectr_match_order = sorted(
+        [
+            int(collectr_idx)
+            for collectr_idx in collectr_work.index
+            if qualifying_by_collectr.get(int(collectr_idx))
+        ],
+        key=lambda collectr_idx: (
+            len(qualifying_by_collectr[collectr_idx]),
+            -qualifying_by_collectr[collectr_idx][0]["score"],
+            collectr_idx,
+        ),
+    )
+
+    assigned_collectr: dict[int, dict[str, Any]] = {}
+    assigned_inventory: dict[int, dict[str, Any]] = {}
+
+    def try_assign_collectr(
+        collectr_idx: int,
+        seen_collectr: set[int],
+        seen_inventory: set[int],
+    ) -> bool:
+        if collectr_idx in seen_collectr:
+            return False
+        seen_collectr.add(collectr_idx)
+
+        for record in qualifying_by_collectr.get(collectr_idx, []):
+            inventory_idx = int(record["inventory_index"])
+            if inventory_idx in seen_inventory:
+                continue
+            seen_inventory.add(inventory_idx)
+
+            existing = assigned_inventory.get(inventory_idx)
+            if existing is None:
+                assigned_collectr[collectr_idx] = record
+                assigned_inventory[inventory_idx] = record
+                return True
+
+            existing_collectr_idx = int(existing["collectr_index"])
+            if try_assign_collectr(
+                existing_collectr_idx,
+                seen_collectr,
+                seen_inventory,
+            ):
+                assigned_collectr[collectr_idx] = record
+                assigned_inventory[inventory_idx] = record
+                return True
+
+        return False
+
+    for collectr_idx in collectr_match_order:
+        try_assign_collectr(collectr_idx, set(), set())
+
+    # Rebuild the inventory-side map from the final Collectr assignments. During
+    # an augmenting path, a Collectr row can move to a different inventory row;
+    # rebuilding prevents an old inventory key from retaining a stale record.
+    assigned_inventory = {
+        int(record["inventory_index"]): record
+        for record in assigned_collectr.values()
+    }
+
+    audit_rows: list[dict[str, Any]] = []
+    for collectr_idx, collectr_row in collectr_work.iterrows():
+        candidates = sorted(
+            pairs_by_collectr.get(int(collectr_idx), []),
+            key=lambda record: record["score"],
+            reverse=True,
+        )
+        assigned = assigned_collectr.get(int(collectr_idx))
+
+        if assigned is not None:
+            candidate = assigned
+            inventory_row = inventory_work.loc[candidate["inventory_index"]]
+            next_scores = [
+                record["score"]
+                for record in candidates
+                if record["inventory_index"] != candidate["inventory_index"]
+            ]
+            next_best = max(next_scores) if next_scores else None
+            audit_rows.append(
+                _audit_row(
+                    collectr_row,
+                    inventory_row,
+                    candidate,
+                    matched=True,
+                    match_status="MATCHED",
+                    next_best_score=next_best,
+                    candidate_count=len(candidates),
+                )
+            )
+            continue
+
+        candidate = candidates[0] if candidates else None
+        inventory_row = (
+            inventory_work.loc[candidate["inventory_index"]]
+            if candidate is not None
+            else None
+        )
+        next_best = candidates[1]["score"] if len(candidates) > 1 else None
+
+        if candidate is None or candidate["score"] < REVIEW_MATCH_THRESHOLD:
+            status = "NO RELIABLE MATCH"
+        elif candidate["score"] >= auto_match_threshold and candidate["inventory_index"] in assigned_inventory:
+            status = "UNMATCHED COPY - ALL COMPATIBLE INVENTORY COPIES USED"
+        else:
+            status = "REVIEW SUGGESTION"
+
+        audit_rows.append(
+            _audit_row(
+                collectr_row,
+                inventory_row,
+                candidate,
+                matched=False,
+                match_status=status,
+                next_best_score=next_best,
+                candidate_count=len(candidates),
+            )
+        )
+
+    audit = pd.DataFrame(audit_rows)
+    for column in MATCH_AUDIT_COLUMNS:
+        if column not in audit.columns:
+            audit[column] = ""
+    audit = audit[MATCH_AUDIT_COLUMNS].copy()
+
+    matched = audit[audit["match_status"].eq("MATCHED")].copy()
+
+    unmatched_collectr_indexes = sorted(
+        set(collectr_work.index).difference(assigned_collectr)
+    )
+    new_cards = collectr_work.loc[unmatched_collectr_indexes].copy()
+    if not new_cards.empty:
+        audit_by_collectr = audit.set_index("collectr_row_id", drop=False)
+        new_cards["suggested_inventory_id"] = new_cards["collectr_row_id"].map(
+            audit_by_collectr["inventory_id"]
+        )
+        new_cards["suggested_inventory_reference_link"] = new_cards[
+            "collectr_row_id"
+        ].map(audit_by_collectr["inventory_reference_link"])
+        new_cards["suggested_match_score"] = new_cards["collectr_row_id"].map(
+            audit_by_collectr["match_score"]
+        )
+        new_cards["suggested_match_status"] = new_cards["collectr_row_id"].map(
+            audit_by_collectr["match_status"]
+        )
+        new_cards["reference_link"] = ""
+        new_cards["year"] = ""
+
+    unmatched_inventory_indexes = sorted(
+        set(inventory_work.index).difference(assigned_inventory)
+    )
+    missing_inventory = inventory_work.loc[unmatched_inventory_indexes].copy()
+    if not missing_inventory.empty:
+        best_collectr_rows: list[dict[str, Any]] = []
+        for inventory_idx in unmatched_inventory_indexes:
+            candidates = sorted(
+                pairs_by_inventory.get(int(inventory_idx), []),
+                key=lambda record: record["score"],
+                reverse=True,
+            )
+            candidate = candidates[0] if candidates else None
+            collectr_row = (
+                collectr_work.loc[candidate["collectr_index"]]
+                if candidate is not None
+                else None
+            )
+            score = candidate["score"] if candidate is not None else 0.0
+            if candidate is None or score < REVIEW_MATCH_THRESHOLD:
+                status = "No reliable Collectr candidate"
+            elif candidate["collectr_index"] in assigned_collectr:
+                status = "Collectr candidate already matched to another inventory copy"
+            else:
+                status = "Review possible mismatch before marking sold"
+            best_collectr_rows.append(
+                {
+                    "best_collectr_row_id": _text(collectr_row.get("collectr_row_id")) if collectr_row is not None else "",
+                    "best_collectr_card_name": _text(collectr_row.get("card_name")) if collectr_row is not None else "",
+                    "best_collectr_card_number": _text(collectr_row.get("card_number")) if collectr_row is not None else "",
+                    "best_collectr_set_name": _text(collectr_row.get("set_name")) if collectr_row is not None else "",
+                    "best_possible_match_score": score,
+                    "best_possible_match_status": status,
+                }
+            )
+        enrichment = pd.DataFrame(best_collectr_rows, index=missing_inventory.index)
+        for column in enrichment.columns:
+            missing_inventory[column] = enrichment[column]
+
+    return audit, matched, new_cards, missing_inventory
+
+
+def _bulk_collectr_inventory_scope(inventory: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Inventory records that should count as an already-owned copy during Bulk Add.
+
+    Unlike the Shows physical reconciliation, GRADING is included here. If a card is
+    already in your database and is currently at grading, a Collectr row for that card
+    should not create a second inventory record.
+
+    SOLD inventory is excluded because a newly acquired replacement copy should be
+    allowed to enter inventory even if an older copy of the same card was sold.
+    """
+    inv_scope = _safe_df(inventory)
+    if inv_scope.empty:
+        return inv_scope, pd.DataFrame(columns=["scope_reason", "count"])
+
+    for col in [
+        "inventory_id",
+        "inventory_status",
+        "inventory_type",
+        "product_type",
+        "card_type",
+        "brand_or_league",
+        "sealed_product_type",
+    ]:
+        if col not in inv_scope.columns:
+            inv_scope[col] = ""
+
+    inv_scope["inventory_id"] = inv_scope["inventory_id"].astype(str).str.strip()
+    inv_scope["inventory_status"] = (
+        inv_scope["inventory_status"].astype(str).str.upper().str.strip()
+    )
+
+    def scope_reason(row: pd.Series) -> str:
+        status = _text(row.get("inventory_status")).upper()
+        if status not in {STATUS_ACTIVE, STATUS_LISTED, STATUS_GRADING}:
+            return "Not currently owned"
+
+        ownership_text = " ".join(
+            _norm(row.get(col))
+            for col in [
+                "inventory_type",
+                "ownership_type",
+                "owner_type",
+                "inventory_owner",
+                "portfolio_name",
+            ]
+        )
+        if "consign" in ownership_text or _truthy(row.get("is_consignment"), default=False):
+            return "Consignment"
+        if "personal" in ownership_text or _truthy(row.get("is_personal"), default=False):
+            return "Personal inventory"
+
+        if _has_value(row.get("sealed_product_type")):
+            return "Sealed / non-card inventory"
+
+        product_text = " ".join(
+            _norm(row.get(col))
+            for col in ["product_type", "card_type", "inventory_type"]
+        )
+        if any(
+            _contains_whole_term(product_text, term)
+            for term in [
+                "sealed",
+                "booster box",
+                "booster bundle",
+                "elite trainer box",
+                "collection box",
+                "tin",
+            ]
+        ):
+            return "Sealed / non-card inventory"
+
+        pokemon_text = " ".join(
+            _norm(row.get(col))
+            for col in [
+                "brand_or_league",
+                "card_type",
+                "category",
+                "game",
+                "franchise",
+            ]
+        )
+        if "pokemon" not in pokemon_text:
+            return "Sports / non-Pokémon"
+
+        return "Existing owned Pokémon card"
+
+    inv_scope["__bulk_scope_reason"] = inv_scope.apply(scope_reason, axis=1)
+    eligible = inv_scope[
+        inv_scope["__bulk_scope_reason"].eq("Existing owned Pokémon card")
+    ].copy()
+
+    summary = (
+        inv_scope.groupby("__bulk_scope_reason", dropna=False)
+        .size()
+        .reset_index(name="count")
+        .rename(columns={"__bulk_scope_reason": "scope_reason"})
+        .sort_values("count", ascending=False)
+    )
+
+    return eligible, summary
+
+
+def _collectr_upload_fingerprint(uploaded_file, eligible_inventory: pd.DataFrame, threshold: float) -> str:
+    upload_hash = hashlib.sha256(_file_bytes(uploaded_file)).hexdigest()[:10]
+
+    if eligible_inventory.empty:
+        inventory_hash = "empty"
+    else:
+        fingerprint_source = "|".join(
+            sorted(
+                f"{_text(row.get('inventory_id'))}:"
+                f"{_text(row.get('inventory_status'))}:"
+                f"{_text(row.get('updated_at'))}"
+                for _, row in eligible_inventory.iterrows()
+            )
+        )
+        inventory_hash = hashlib.sha256(
+            fingerprint_source.encode("utf-8")
+        ).hexdigest()[:10]
+
+    return f"{upload_hash}_{inventory_hash}_{int(threshold)}"
+
+
+def _build_collectr_bulk_add_frame(
+    new_cards: pd.DataFrame,
+    *,
+    default_purchase_date,
+    default_purchased_from: str,
+    default_inventory_type: str,
+    prefill_collectr_cost: bool,
+) -> pd.DataFrame:
+    if new_cards.empty:
+        return pd.DataFrame()
+
+    frame = new_cards.copy()
+
+    frame["add_to_inventory"] = True
+    frame["purchase_date"] = str(default_purchase_date)
+    frame["purchased_from"] = _text(default_purchased_from)
+
+    if prefill_collectr_cost:
+        frame["purchase_price"] = frame["average_cost_paid"].apply(
+            lambda value: to_money(value) if to_money(value) > 0 else None
+        )
+    else:
+        frame["purchase_price"] = None
+
+    frame["shipping"] = 0.0
+    frame["tax"] = 0.0
+    frame["grading_fee"] = 0.0
+    frame["inventory_type"] = default_inventory_type
+    frame["product_type"] = frame.apply(
+        lambda row: "Graded Card"
+        if _text(row.get("grading_company")) or _text(row.get("grade"))
+        else "Card",
+        axis=1,
+    )
+    frame["brand_or_league"] = "Pokemon TCG"
+    frame["card_type"] = "Pokemon"
+    frame["reference_link"] = ""
+    frame["sticker_price"] = frame["market_value"].apply(to_money)
+    frame["notes"] = frame.apply(
+        lambda row: " | ".join(
+            part
+            for part in [
+                _text(row.get("collectr_notes")),
+                "Added from Collectr Bulk Add",
+            ]
+            if part
+        ),
+        axis=1,
+    )
+
+    frame["condition"] = frame.apply(
+        lambda row: (
+            "Graded"
+            if _text(row.get("grading_company")) or _text(row.get("grade"))
+            else (_text(row.get("condition")) or "Near Mint")
+        ),
+        axis=1,
+    )
+
+    columns = [
+        "add_to_inventory",
+        "collectr_row_id",
+        "source_row_number",
+        "source_copy_number",
+        "set_name",
+        "card_name",
+        "card_number",
+        "card_subtype",
+        "variant",
+        "condition",
+        "grading_company",
+        "grade",
+        "market_value",
+        "average_cost_paid",
+        "purchase_date",
+        "purchased_from",
+        "purchase_price",
+        "shipping",
+        "tax",
+        "grading_fee",
+        "inventory_type",
+        "product_type",
+        "reference_link",
+        "sticker_price",
+        "notes",
+        "suggested_inventory_id",
+        "suggested_inventory_reference_link",
+        "suggested_match_score",
+        "suggested_match_status",
+    ]
+    for col in columns:
+        if col not in frame.columns:
+            frame[col] = ""
+
+    return frame[columns].copy()
+
+
+def _validate_collectr_bulk_add_editor(
+    edited: pd.DataFrame,
+    current_inventory: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    if edited is None or edited.empty:
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(columns=["collectr_row_id", "card_name", "errors"]),
+            [],
+        )
+
+    selected = edited[
+        edited["add_to_inventory"].fillna(False).astype(bool)
+    ].copy()
+
+    if selected.empty:
+        return selected, pd.DataFrame(
+            columns=["collectr_row_id", "card_name", "errors"]
+        ), []
+
+    current_ids = set()
+    if not current_inventory.empty and "inventory_id" in current_inventory.columns:
+        current_ids = set(
+            current_inventory["inventory_id"].astype(str).str.strip().tolist()
+        )
+
+    validation_rows: list[dict[str, Any]] = []
+    rows_to_add: list[dict] = []
+
+    for _, row in selected.iterrows():
+        errors: list[str] = []
+
+        collectr_row_id = _text(row.get("collectr_row_id"))
+        card_name = _text(row.get("card_name"))
+        purchase_date_value = pd.to_datetime(
+            row.get("purchase_date"), errors="coerce"
+        )
+        purchased_from = _text(row.get("purchased_from"))
+        purchase_price_raw = row.get("purchase_price")
+
+        if not card_name:
+            errors.append("Missing card name")
+        if pd.isna(purchase_date_value):
+            errors.append("Invalid purchase date")
+        if not purchased_from:
+            errors.append("Purchased from is required")
+        if purchase_price_raw is None or (
+            isinstance(purchase_price_raw, float) and pd.isna(purchase_price_raw)
+        ) or _text(purchase_price_raw) == "":
+            errors.append("Purchase price is required")
+
+        inventory_type = _normalize_inventory_type_value(
+            row.get("inventory_type")
+        )
+        if inventory_type not in INVENTORY_TYPE_OPTIONS:
+            errors.append(
+                f"Invalid inventory type: {inventory_type or 'blank'}"
+            )
+
+        product_type = _normalize_product_type_value(row.get("product_type"))
+        if product_type not in PRODUCT_TYPE_OPTIONS:
+            errors.append(
+                f"Invalid product type: {product_type or 'blank'}"
+            )
+
+        validation_rows.append(
+            {
+                "collectr_row_id": collectr_row_id,
+                "card_name": card_name,
+                "status": "READY" if not errors else "ERROR",
+                "errors": "; ".join(errors),
+            }
+        )
+
+        if errors:
+            continue
+
+        new_inventory_row = _make_inventory_row(
+            inventory_type=inventory_type,
+            product_type=product_type,
+            card_type="Pokemon",
+            brand_or_league="Pokemon TCG",
+            set_name=_text(row.get("set_name")),
+            year="",
+            card_name=card_name,
+            card_number=_text(row.get("card_number")),
+            variant=_text(row.get("variant")),
+            card_subtype=_text(row.get("card_subtype")),
+            grading_company=_text(row.get("grading_company")),
+            grade=_text(row.get("grade")),
+            reference_link=_text(row.get("reference_link")),
+            purchase_date_value=str(purchase_date_value.date()),
+            purchased_from=purchased_from,
+            purchase_price=to_money(row.get("purchase_price")),
+            shipping=to_money(row.get("shipping")),
+            tax=to_money(row.get("tax")),
+            sticker_price=to_money(row.get("sticker_price")),
+            condition=_text(row.get("condition")),
+            grading_fee=to_money(row.get("grading_fee")),
+            market_value=to_money(row.get("market_value")),
+            notes=_text(row.get("notes")),
+        )
+
+        # Defensive check: IDs generated here must not collide with current inventory.
+        while new_inventory_row["inventory_id"] in current_ids:
+            new_inventory_row["inventory_id"] = str(uuid.uuid4())[:8]
+        current_ids.add(new_inventory_row["inventory_id"])
+
+        rows_to_add.append(new_inventory_row)
+
+    validation = pd.DataFrame(validation_rows)
+    return selected, validation, rows_to_add
+
+
 # =========================================================
 # Top actions
 # =========================================================
@@ -1694,286 +3157,566 @@ with tab_add:
 # =========================================================
 
 with tab_bulk:
-    st.subheader("Bulk Add Inventory")
-
-    st.caption(
-        "Upload a CSV or Excel file. The page stages the rows first, validates them, and only writes to Google Sheets after you review and confirm."
+    st.subheader("Bulk Add from Collectr")
+    st.write(
+        "Upload a Collectr export. The app compares each Pokémon card copy against "
+        "your current ACTIVE, LISTED, and GRADING business inventory using the same "
+        "duplicate-aware matching logic as the Shows page. Only Collectr copies that "
+        "do not have an existing inventory match are staged for adding."
+    )
+    st.info(
+        "This tab only adds inventory. It does not identify missing cards or mark "
+        "anything SOLD. SOLD inventory is intentionally excluded from matching so a "
+        "newly acquired replacement copy can be added.",
+        icon="ℹ️",
     )
 
-    template = get_upload_template_df()
+    bulk_existing_inventory, bulk_scope_summary = _bulk_collectr_inventory_scope(inv)
 
-    t1, t2 = st.columns([1, 1])
+    scope_metrics = st.columns(3)
+    scope_metrics[0].metric("All inventory rows", f"{len(inv):,}")
+    scope_metrics[1].metric(
+        "Existing owned Pokémon cards compared",
+        f"{len(bulk_existing_inventory):,}",
+    )
+    scope_metrics[2].metric(
+        "SOLD / excluded rows",
+        f"{max(0, len(inv) - len(bulk_existing_inventory)):,}",
+    )
 
-    with t1:
-        st.download_button(
-            "Download bulk template CSV",
-            data=template.to_csv(index=False),
-            file_name="inventory_upload_template.csv",
-            mime="text/csv",
+    with st.expander("See Bulk Add comparison scope", expanded=False):
+        st.dataframe(
+            bulk_scope_summary,
             use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "ACTIVE, LISTED, and GRADING business-owned Pokémon single cards count "
+            "as existing inventory. SOLD, consignment, personal, sealed, sports, and "
+            "non-Pokémon records do not."
         )
 
-    with t2:
-        st.download_button(
-            "Download bulk template Excel",
-            data=template.to_csv(index=False),
-            file_name="inventory_upload_template.csv",
-            mime="text/csv",
-            use_container_width=True,
-            help="CSV is safest for Streamlit Cloud. Open it in Excel if needed.",
+    option_cols = st.columns([1, 1, 1, 1])
+
+    with option_cols[0]:
+        bulk_match_threshold = st.slider(
+            "Automatic match score",
+            min_value=70,
+            max_value=95,
+            value=int(AUTO_MATCH_THRESHOLD_DEFAULT),
+            step=1,
+            key="inventory_bulk_collectr_match_threshold",
+            help=(
+                "Higher values are stricter and can produce more 'new' rows. "
+                "80 matches the Shows page default."
+            ),
         )
 
-    uploaded = st.file_uploader(
-        "Upload inventory CSV/XLSX",
+    with option_cols[1]:
+        bulk_default_purchase_date = st.date_input(
+            "Default purchase date",
+            value=date.today(),
+            key="inventory_bulk_collectr_purchase_date",
+        )
+
+    with option_cols[2]:
+        bulk_default_purchased_from = st.text_input(
+            "Default purchased from",
+            value="",
+            key="inventory_bulk_collectr_purchased_from",
+        )
+
+    with option_cols[3]:
+        bulk_default_inventory_type = st.selectbox(
+            "Default inventory type",
+            INVENTORY_TYPE_OPTIONS,
+            index=_option_index(INVENTORY_TYPE_OPTIONS, "Show Inventory"),
+            key="inventory_bulk_collectr_inventory_type",
+        )
+
+    bulk_prefill_collectr_cost = st.checkbox(
+        "Prefill Purchase Price from Collectr Average Cost Paid when available",
+        value=True,
+        key="inventory_bulk_collectr_prefill_cost",
+        help=(
+            "You can still change every Purchase Price in the table before adding."
+        ),
+    )
+
+    collectr_bulk_file = st.file_uploader(
+        "Upload Collectr CSV/XLSX",
         type=["csv", "xlsx", "xls"],
-        help="Each row becomes one inventory item unless you add Quantity. Transaction/sale/eBay columns are ignored on purpose.",
+        key="inventory_collectr_bulk_upload",
     )
 
-    if uploaded is not None:
+    if collectr_bulk_file is not None:
         try:
-            raw = _read_upload_file(uploaded)
-
-            st.markdown("#### Raw upload preview")
-            st.dataframe(raw.head(50), use_container_width=True, hide_index=True)
-
-            ignored_cols = _ignored_present_columns(raw)
-            unexpected_cols = _unexpected_upload_columns(raw)
-
-            if ignored_cols:
-                st.warning(
-                    "These database/sale/eBay columns were found in the upload and will be ignored so new inventory does not get created as sold/listed by accident: "
-                    + ", ".join(ignored_cols[:20])
-                    + ("..." if len(ignored_cols) > 20 else "")
-                )
-
-            if unexpected_cols:
-                st.info(
-                    "These columns are not recognized by the bulk uploader and will be ignored: "
-                    + ", ".join(unexpected_cols[:20])
-                    + ("..." if len(unexpected_cols) > 20 else ""),
-                    icon="ℹ️",
-                )
-
-            st.markdown("#### Defaults for blank upload fields")
-
-            d1, d2, d3, d4 = st.columns(4)
-
-            with d1:
-                default_inventory_type = st.selectbox(
-                    "Default inventory type",
-                    INVENTORY_TYPE_OPTIONS,
-                    index=_option_index(INVENTORY_TYPE_OPTIONS, "Show Inventory"),
-                    key="bulk_default_inventory_type",
-                )
-
-            with d2:
-                default_product_type = st.selectbox(
-                    "Default product type",
-                    PRODUCT_TYPE_OPTIONS,
-                    index=_option_index(PRODUCT_TYPE_OPTIONS, "Card"),
-                    key="bulk_default_product_type",
-                )
-
-            with d3:
-                default_card_type = st.selectbox(
-                    "Default card type",
-                    CARD_TYPE_OPTIONS,
-                    index=_option_index(CARD_TYPE_OPTIONS, "Pokemon"),
-                    key="bulk_default_card_type",
-                )
-
-            with d4:
-                default_condition = st.selectbox(
-                    "Default condition",
-                    _condition_options(),
-                    index=_option_index(_condition_options(), "Near Mint"),
-                    key="bulk_default_condition",
-                )
-
-            d5, d6, d7 = st.columns(3)
-
-            with d5:
-                default_brand_or_league = st.text_input(
-                    "Default brand / league",
-                    value="Pokemon TCG",
-                    key="bulk_default_brand",
-                )
-
-            with d6:
-                default_purchase_date = st.date_input(
-                    "Default purchase date",
-                    value=date.today(),
-                    key="bulk_default_purchase_date",
-                )
-
-            with d7:
-                default_purchased_from = st.text_input(
-                    "Default purchased from",
-                    value="",
-                    key="bulk_default_purchased_from",
-                )
-
-            normalized = normalize_uploaded_inventory_df(
-                raw,
-                default_inventory_type=default_inventory_type,
-                default_product_type=default_product_type,
-                default_card_type=default_card_type,
-                default_condition=default_condition,
-                default_brand_or_league=default_brand_or_league,
-                default_purchase_date=default_purchase_date,
-                default_purchased_from=default_purchased_from,
+            collectr_cards, collectr_stats = _parse_collectr(
+                collectr_bulk_file
             )
 
-            if normalized.empty:
-                st.warning("The uploaded file does not have any data rows to process.")
+            if collectr_cards.empty:
+                st.error(
+                    "No Pokémon single-card rows were found in this Collectr file. "
+                    "Confirm the export contains Pokémon cards and a Category column."
+                )
             else:
-                st.markdown("#### Staged rows — review/edit before upload")
-
-                st.caption(
-                    "This table is what the app will use. Fix anything wrong here before confirming."
+                (
+                    bulk_match_audit,
+                    bulk_matched,
+                    bulk_new_cards,
+                    _,
+                ) = _reconcile_collectr(
+                    collectr_cards,
+                    bulk_existing_inventory,
+                    auto_match_threshold=float(bulk_match_threshold),
+                    duplicate_policy="Keep newest eligible inventory",
                 )
 
-                editable_cols = ["source_row"] + BULK_INPUT_COLUMNS
-
-                edited = st.data_editor(
-                    normalized[editable_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                    height=430,
-                    column_config={
-                        "source_row": st.column_config.NumberColumn("Source row", disabled=True),
-                        "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
-                        "shipping": st.column_config.NumberColumn("Shipping", format="$%.2f"),
-                        "tax": st.column_config.NumberColumn("Tax", format="$%.2f"),
-                        "grading_fee": st.column_config.NumberColumn("Grading Fee", format="$%.2f"),
-                        "sticker_price": st.column_config.NumberColumn("Sticker Price", format="$%.2f"),
-                        "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
-                        "quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1),
-                        "reference_link": st.column_config.LinkColumn("Reference Link"),
-                        "image_url": st.column_config.LinkColumn("Image URL"),
-                    },
-                    disabled=["source_row"],
-                    key="bulk_staged_editor",
+                bulk_fingerprint = _collectr_upload_fingerprint(
+                    collectr_bulk_file,
+                    bulk_existing_inventory,
+                    float(bulk_match_threshold),
                 )
 
-                validated, error_df, warning_df, rows_to_insert = _validate_bulk_preview(edited)
+                metrics = st.columns(5)
+                metrics[0].metric(
+                    "Collectr source rows",
+                    f"{collectr_stats['source_rows']:,}",
+                )
+                metrics[1].metric(
+                    "Collectr card copies",
+                    f"{collectr_stats['individual_cards']:,}",
+                )
+                metrics[2].metric(
+                    "Matched to inventory",
+                    f"{len(bulk_matched):,}",
+                )
+                metrics[3].metric(
+                    "New copies to review",
+                    f"{len(bulk_new_cards):,}",
+                )
+                metrics[4].metric(
+                    "Ignored non-card/non-Pokémon rows",
+                    f"{collectr_stats['non_pokemon_rows_ignored'] + collectr_stats.get('sealed_rows_ignored', 0):,}",
+                )
 
-                if validated.empty:
-                    st.warning("No valid staged rows.")
-                else:
-                    ready_rows = validated[validated["row_status"].eq("Ready")].copy()
-                    blocked_rows = validated[validated["row_status"].eq("Blocked")].copy()
-
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Upload rows", f"{len(validated):,}")
-                    m2.metric("Rows blocked", f"{len(blocked_rows):,}")
-                    m3.metric("Inventory items to create", f"{len(rows_to_insert):,}")
-                    m4.metric("Total cost to add", money_fmt(validated["total_cost"].sum()))
-                    m5.metric("Sticker total", money_fmt(validated["sticker_price"].sum()))
-
-                    summary = (
-                        validated.groupby(["inventory_type", "product_type", "card_type"], dropna=False)
-                        .agg(
-                            upload_rows=("source_row", "count"),
-                            quantity=("quantity", "sum"),
-                            total_cost=("total_cost", "sum"),
-                            sticker_price=("sticker_price", "sum"),
-                            market_value=("market_value", "sum"),
-                        )
-                        .reset_index()
-                    )
-
-                    st.markdown("##### Upload summary")
-                    st.dataframe(
-                        summary.style.format(
-                            {
-                                "total_cost": "${:,.2f}",
-                                "sticker_price": "${:,.2f}",
-                                "market_value": "${:,.2f}",
-                            }
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    st.markdown("##### Validation result")
-                    validation_cols = [
-                        "source_row",
-                        "row_status",
-                        "errors",
-                        "warnings",
-                        "quantity",
-                        "inventory_type",
-                        "product_type",
-                        "card_type",
-                        "set_name",
-                        "card_name",
-                        "card_number",
-                        "variant",
-                        "purchase_date",
-                        "purchased_from",
-                        "purchase_price",
-                        "shipping",
-                        "tax",
-                        "total_price",
-                        "grading_fee",
-                        "total_cost",
-                        "condition",
-                        "reference_link",
+                result_tabs = st.tabs(
+                    [
+                        f"New in Collectr ({len(bulk_new_cards):,})",
+                        f"Matched Existing ({len(bulk_matched):,})",
+                        "Match Audit",
                     ]
+                )
 
+                with result_tabs[0]:
+                    if bulk_new_cards.empty:
+                        st.success(
+                            "Every Pokémon card copy in this Collectr file already has "
+                            "a matching current inventory record. There is nothing new "
+                            "to add."
+                        )
+                    else:
+                        st.caption(
+                            "These are the Collectr copies that were not matched to current "
+                            "inventory. Leave Add checked for real new purchases. Uncheck any "
+                            "row you do not want to add. Enter Purchase Date, Purchased From, "
+                            "Purchase Price, and any shipping/tax/grading costs directly here."
+                        )
+
+                        bulk_editor_base = _build_collectr_bulk_add_frame(
+                            bulk_new_cards,
+                            default_purchase_date=bulk_default_purchase_date,
+                            default_purchased_from=bulk_default_purchased_from,
+                            default_inventory_type=bulk_default_inventory_type,
+                            prefill_collectr_cost=bulk_prefill_collectr_cost,
+                        )
+
+                        bulk_editor_key = (
+                            f"inventory_collectr_bulk_editor_{bulk_fingerprint}_"
+                            f"{int(bulk_prefill_collectr_cost)}_"
+                            f"{hashlib.sha256((_text(bulk_default_purchased_from) + str(bulk_default_purchase_date) + _text(bulk_default_inventory_type)).encode('utf-8')).hexdigest()[:8]}"
+                        )
+
+                        edited_bulk = st.data_editor(
+                            bulk_editor_base,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=650,
+                            key=bulk_editor_key,
+                            column_config={
+                                "add_to_inventory": st.column_config.CheckboxColumn(
+                                    "Add",
+                                    default=True,
+                                    width="small",
+                                ),
+                                "collectr_row_id": st.column_config.TextColumn(
+                                    "Collectr Row",
+                                    disabled=True,
+                                ),
+                                "source_row_number": st.column_config.NumberColumn(
+                                    "Source Row",
+                                    disabled=True,
+                                ),
+                                "source_copy_number": st.column_config.NumberColumn(
+                                    "Copy",
+                                    disabled=True,
+                                ),
+                                "set_name": st.column_config.TextColumn(
+                                    "Set",
+                                    disabled=True,
+                                ),
+                                "card_name": st.column_config.TextColumn(
+                                    "Card",
+                                    disabled=True,
+                                    width="medium",
+                                ),
+                                "card_number": st.column_config.TextColumn(
+                                    "Card #",
+                                    disabled=True,
+                                ),
+                                "card_subtype": st.column_config.TextColumn(
+                                    "Rarity / Subtype",
+                                    disabled=True,
+                                ),
+                                "variant": st.column_config.TextColumn(
+                                    "Variant",
+                                    disabled=True,
+                                ),
+                                "grading_company": st.column_config.TextColumn(
+                                    "Grader",
+                                    disabled=True,
+                                ),
+                                "grade": st.column_config.TextColumn(
+                                    "Grade",
+                                    disabled=True,
+                                ),
+                                "market_value": st.column_config.NumberColumn(
+                                    "Collectr Market",
+                                    format="$%.2f",
+                                    disabled=True,
+                                ),
+                                "average_cost_paid": st.column_config.NumberColumn(
+                                    "Collectr Avg Cost",
+                                    format="$%.2f",
+                                    disabled=True,
+                                ),
+                                "purchase_price": st.column_config.NumberColumn(
+                                    "Purchase Price*",
+                                    min_value=0.0,
+                                    format="$%.2f",
+                                ),
+                                "shipping": st.column_config.NumberColumn(
+                                    "Shipping",
+                                    min_value=0.0,
+                                    format="$%.2f",
+                                ),
+                                "tax": st.column_config.NumberColumn(
+                                    "Tax",
+                                    min_value=0.0,
+                                    format="$%.2f",
+                                ),
+                                "grading_fee": st.column_config.NumberColumn(
+                                    "Grading Fee",
+                                    min_value=0.0,
+                                    format="$%.2f",
+                                ),
+                                "inventory_type": st.column_config.SelectboxColumn(
+                                    "Inventory Type",
+                                    options=INVENTORY_TYPE_OPTIONS,
+                                    required=True,
+                                ),
+                                "product_type": st.column_config.SelectboxColumn(
+                                    "Product Type",
+                                    options=PRODUCT_TYPE_OPTIONS,
+                                    required=True,
+                                ),
+                                "reference_link": st.column_config.LinkColumn(
+                                    "Reference Link",
+                                ),
+                                "sticker_price": st.column_config.NumberColumn(
+                                    "Sticker Price",
+                                    min_value=0.0,
+                                    format="$%.2f",
+                                ),
+                                "suggested_inventory_reference_link": st.column_config.LinkColumn(
+                                    "Suggested Existing Link",
+                                    disabled=True,
+                                ),
+                                "suggested_match_score": st.column_config.NumberColumn(
+                                    "Best Match Score",
+                                    format="%.1f",
+                                    disabled=True,
+                                ),
+                            },
+                            disabled=[
+                                "collectr_row_id",
+                                "source_row_number",
+                                "source_copy_number",
+                                "set_name",
+                                "card_name",
+                                "card_number",
+                                "card_subtype",
+                                "variant",
+                                "grading_company",
+                                "grade",
+                                "market_value",
+                                "average_cost_paid",
+                                "suggested_inventory_id",
+                                "suggested_inventory_reference_link",
+                                "suggested_match_score",
+                                "suggested_match_status",
+                            ],
+                        )
+
+                        (
+                            selected_bulk_rows,
+                            bulk_validation,
+                            bulk_rows_to_add,
+                        ) = _validate_collectr_bulk_add_editor(
+                            edited_bulk,
+                            inv,
+                        )
+
+                        selected_count = len(selected_bulk_rows)
+                        error_count = (
+                            int(bulk_validation["status"].eq("ERROR").sum())
+                            if not bulk_validation.empty
+                            else 0
+                        )
+                        total_cost_to_add = 0.0
+                        total_market_to_add = 0.0
+
+                        if bulk_rows_to_add:
+                            total_cost_to_add = sum(
+                                to_money(row.get("total_cost"))
+                                for row in bulk_rows_to_add
+                            )
+                            total_market_to_add = sum(
+                                to_money(row.get("market_value"))
+                                for row in bulk_rows_to_add
+                            )
+
+                        add_metrics = st.columns(4)
+                        add_metrics[0].metric(
+                            "Selected to add",
+                            f"{selected_count:,}",
+                        )
+                        add_metrics[1].metric(
+                            "Validation errors",
+                            f"{error_count:,}",
+                        )
+                        add_metrics[2].metric(
+                            "Total cost",
+                            money_fmt(total_cost_to_add),
+                        )
+                        add_metrics[3].metric(
+                            "Collectr market value",
+                            money_fmt(total_market_to_add),
+                        )
+
+                        if not bulk_validation.empty:
+                            error_rows = bulk_validation[
+                                bulk_validation["status"].eq("ERROR")
+                            ].copy()
+                            if not error_rows.empty:
+                                st.error(
+                                    "Fix the selected rows below before adding inventory."
+                                )
+                                st.dataframe(
+                                    error_rows,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                        confirm_bulk_add = st.checkbox(
+                            f"I reviewed the Collectr matches and want to add "
+                            f"{len(bulk_rows_to_add):,} new inventory record(s).",
+                            value=False,
+                            disabled=(
+                                not bulk_rows_to_add
+                                or error_count > 0
+                            ),
+                            key=f"confirm_collectr_bulk_add_{bulk_fingerprint}",
+                        )
+
+                        if st.button(
+                            "Add selected Collectr cards to inventory",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=(
+                                not confirm_bulk_add
+                                or not bulk_rows_to_add
+                                or error_count > 0
+                            ),
+                            key=f"process_collectr_bulk_add_{bulk_fingerprint}",
+                        ):
+                            # Reload the database immediately before writing so a
+                            # duplicate cannot be created if inventory changed after
+                            # the preview.
+                            latest_data = load_data(force_refresh=True)
+                            latest_inv = _safe_df(latest_data.inventory)
+                            latest_existing, _ = _bulk_collectr_inventory_scope(
+                                latest_inv
+                            )
+
+                            (
+                                _latest_audit,
+                                _latest_matched,
+                                latest_new_cards,
+                                _latest_missing,
+                            ) = _reconcile_collectr(
+                                collectr_cards,
+                                latest_existing,
+                                auto_match_threshold=float(
+                                    bulk_match_threshold
+                                ),
+                                duplicate_policy="Keep newest eligible inventory",
+                            )
+
+                            latest_new_ids = set(
+                                latest_new_cards["collectr_row_id"]
+                                .astype(str)
+                                .str.strip()
+                                .tolist()
+                            )
+
+                            selected_editor_ids = set(
+                                selected_bulk_rows["collectr_row_id"]
+                                .astype(str)
+                                .str.strip()
+                                .tolist()
+                            )
+
+                            no_longer_new = sorted(
+                                selected_editor_ids.difference(
+                                    latest_new_ids
+                                )
+                            )
+
+                            if no_longer_new:
+                                st.error(
+                                    "Inventory changed after the preview and one or "
+                                    "more selected Collectr copies now match an existing "
+                                    "inventory record. Refresh/review before adding: "
+                                    + ", ".join(no_longer_new[:20])
+                                    + (
+                                        "..."
+                                        if len(no_longer_new) > 20
+                                        else ""
+                                    )
+                                )
+                            else:
+                                _append_inventory_rows(
+                                    bulk_rows_to_add
+                                )
+                                refresh_database_cache()
+                                st.success(
+                                    f"Added {len(bulk_rows_to_add):,} new "
+                                    "inventory record(s) from Collectr."
+                                )
+                                st.rerun()
+
+                with result_tabs[1]:
+                    if bulk_matched.empty:
+                        st.info(
+                            "No Collectr cards were matched to current inventory."
+                        )
+                    else:
+                        matched_cols = [
+                            "collectr_row_id",
+                            "collectr_set_name",
+                            "collectr_card_name",
+                            "collectr_card_number",
+                            "collectr_condition",
+                            "collectr_grading_company",
+                            "collectr_grade",
+                            "collectr_market_value",
+                            "inventory_id",
+                            "inventory_status",
+                            "inventory_set_name",
+                            "inventory_card_name",
+                            "inventory_card_number",
+                            "inventory_condition",
+                            "inventory_grading_company",
+                            "inventory_grade",
+                            "inventory_total_cost",
+                            "match_score",
+                            "match_method",
+                            "inventory_reference_link",
+                        ]
+                        st.dataframe(
+                            bulk_matched[
+                                [
+                                    col
+                                    for col in matched_cols
+                                    if col in bulk_matched.columns
+                                ]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "collectr_market_value": st.column_config.NumberColumn(
+                                    "Collectr Market",
+                                    format="$%.2f",
+                                ),
+                                "inventory_total_cost": st.column_config.NumberColumn(
+                                    "Inventory Cost",
+                                    format="$%.2f",
+                                ),
+                                "match_score": st.column_config.NumberColumn(
+                                    "Match Score",
+                                    format="%.1f",
+                                ),
+                                "inventory_reference_link": st.column_config.LinkColumn(
+                                    "Reference Link"
+                                ),
+                            },
+                        )
+
+                with result_tabs[2]:
+                    st.caption(
+                        "Use this audit when a card appears unexpectedly as new. "
+                        "It shows the best candidate, score components, and whether "
+                        "the candidate was already consumed by another Collectr copy."
+                    )
                     st.dataframe(
-                        validated[[c for c in validation_cols if c in validated.columns]].style.format(
-                            {
-                                "purchase_price": "${:,.2f}",
-                                "shipping": "${:,.2f}",
-                                "tax": "${:,.2f}",
-                                "total_price": "${:,.2f}",
-                                "grading_fee": "${:,.2f}",
-                                "total_cost": "${:,.2f}",
-                            }
-                        ),
+                        bulk_match_audit,
                         use_container_width=True,
                         hide_index=True,
                         column_config={
-                            "reference_link": st.column_config.LinkColumn("Reference Link"),
+                            "match_score": st.column_config.NumberColumn(
+                                "Match Score",
+                                format="%.1f",
+                            ),
+                            "collectr_market_value": st.column_config.NumberColumn(
+                                "Collectr Market",
+                                format="$%.2f",
+                            ),
+                            "inventory_total_cost": st.column_config.NumberColumn(
+                                "Inventory Cost",
+                                format="$%.2f",
+                            ),
+                            "inventory_reference_link": st.column_config.LinkColumn(
+                                "Inventory Reference Link"
+                            ),
                         },
                     )
 
-                    if not error_df.empty:
-                        st.error("Nothing can upload until the blocked rows below are fixed.")
-                        st.dataframe(error_df, use_container_width=True, hide_index=True)
-
-                    if not warning_df.empty:
-                        with st.expander("Warnings to review", expanded=True):
-                            st.dataframe(warning_df, use_container_width=True, hide_index=True)
-
                     st.download_button(
-                        "Download staged validation CSV",
-                        data=validated.to_csv(index=False),
-                        file_name="bulk_inventory_validation_preview.csv",
+                        "Download Bulk Add match audit CSV",
+                        data=bulk_match_audit.to_csv(index=False).encode(
+                            "utf-8-sig"
+                        ),
+                        file_name="inventory_collectr_bulk_add_match_audit.csv",
                         mime="text/csv",
-                    )
-
-                    confirm = st.checkbox(
-                        "I reviewed the staged rows and want to add the ready rows to inventory.",
-                        value=False,
-                        disabled=not error_df.empty or not rows_to_insert,
-                    )
-
-                    if st.button(
-                        "Add ready rows to inventory",
-                        type="primary",
-                        disabled=(not confirm or not error_df.empty or not rows_to_insert),
                         use_container_width=True,
-                    ):
-                        _append_inventory_rows(rows_to_insert)
-                        refresh_database_cache()
-                        st.success(f"Added {len(rows_to_insert):,} inventory item(s).")
-                        st.rerun()
+                    )
 
         except Exception as exc:
-            st.error(f"Could not process upload: {exc}")
+            st.exception(exc)
+
+
 
 
 # =========================================================
