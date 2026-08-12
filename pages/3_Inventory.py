@@ -2853,6 +2853,160 @@ def _build_collectr_purchase_export_form(
     return form[COLLECTR_PURCHASE_FORM_COLUMNS].copy()
 
 
+
+COLLECTR_PURCHASE_UPLOAD_ALIASES = {
+    "process_row": ["process_row", "Process Row", "Process", "Add", "Add to Inventory"],
+    "inventory_id": ["inventory_id", "Inventory ID", "Inventory Id", "ID"],
+    "collectr_row_id": ["collectr_row_id", "Collectr Row ID", "Collectr Row", "Collectr ID"],
+    "source_row_number": ["source_row_number", "Source Row Number", "Source Row"],
+    "source_copy_number": ["source_copy_number", "Source Copy Number", "Source Copy", "Copy"],
+    "purchase_date": ["purchase_date", "Purchase Date", "Date Purchased", "Purchased Date"],
+    "purchased_from": ["purchased_from", "Purchased From", "Purchase Source", "Seller", "Source", "Vendor"],
+    "purchase_price": ["purchase_price", "Purchase Price", "Price Paid", "Cost", "My Cost", "Buy Price"],
+    "shipping": ["shipping", "Shipping", "Shipping Cost"],
+    "tax": ["tax", "Tax", "Sales Tax"],
+    "grading_fee": ["grading_fee", "Grading Fee", "Grading Cost"],
+    "inventory_type": ["inventory_type", "Inventory Type"],
+    "product_type": ["product_type", "Product Type"],
+    "brand_or_league": ["brand_or_league", "Brand/League", "Brand / League"],
+    "card_type": ["card_type", "Card Type"],
+    "set_name": ["set_name", "Set Name", "Set"],
+    "year": ["year", "Year"],
+    "card_name": ["card_name", "Card Name", "Product Name", "Name", "Card"],
+    "card_number": ["card_number", "Card Number", "Card #", "Number"],
+    "variant": ["variant", "Variant", "Variance", "Finish"],
+    "card_subtype": ["card_subtype", "Card Subtype", "Rarity"],
+    "grading_company": ["grading_company", "Grading Company", "Grader"],
+    "grade": ["grade", "Grade"],
+    "condition": ["condition", "Condition", "Card Condition"],
+    "reference_link": ["reference_link", "Reference Link", "Link", "URL"],
+    "market_value": ["market_value", "Market Value", "Market Price"],
+    "average_cost_paid": ["average_cost_paid", "Average Cost Paid", "Cost Paid"],
+    "sticker_price": ["sticker_price", "Sticker Price", "List Price", "Asking Price"],
+    "notes": ["notes", "Notes"],
+    "suggested_inventory_id": ["suggested_inventory_id", "Suggested Inventory ID"],
+    "suggested_inventory_reference_link": ["suggested_inventory_reference_link", "Suggested Inventory Reference Link"],
+    "suggested_match_score": ["suggested_match_score", "Suggested Match Score"],
+    "suggested_match_status": ["suggested_match_status", "Suggested Match Status"],
+}
+
+
+def _canonicalize_collectr_purchase_form_upload(upload: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a completed purchase form even after common Excel/CSV edits.
+
+    This accepts snake_case or human-readable headers, removes fully blank rows/columns,
+    can promote a shifted header row, reconstructs collectr_row_id from source row/copy
+    when possible, and creates inventory IDs when the ID column was removed.
+    """
+    if upload is None or upload.empty:
+        return pd.DataFrame()
+
+    out = upload.copy()
+    out = out.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if out.empty:
+        return out
+
+    alias_lookup: dict[str, str] = {}
+    for canonical, aliases in COLLECTR_PURCHASE_UPLOAD_ALIASES.items():
+        for alias in [canonical, *aliases]:
+            alias_lookup[_clean_column_name(alias)] = canonical
+
+    def recognized_header_count(columns) -> int:
+        return sum(_clean_column_name(col) in alias_lookup for col in columns)
+
+    # If Excel inserted a title/blank row above the real headers, look through the
+    # first few rows and promote the row that contains the most recognizable fields.
+    if recognized_header_count(out.columns) < 2:
+        best_idx = None
+        best_count = 0
+        for idx in list(out.index[:8]):
+            values = [_text(v) for v in out.loc[idx].tolist()]
+            count = sum(_clean_column_name(v) in alias_lookup for v in values if v)
+            if count > best_count:
+                best_idx = idx
+                best_count = count
+        if best_idx is not None and best_count >= 2:
+            new_headers = [
+                _text(v) or f"unnamed_{i}"
+                for i, v in enumerate(out.loc[best_idx].tolist())
+            ]
+            out = out.loc[out.index > best_idx].copy()
+            out.columns = new_headers
+
+    rename_map = {}
+    for col in out.columns:
+        normalized_col = _clean_column_name(col)
+        canonical = alias_lookup.get(normalized_col)
+        if canonical and canonical not in rename_map.values():
+            rename_map[col] = canonical
+    out = out.rename(columns=rename_map)
+
+    # Helpful diagnosis for the most common mistake: re-uploading the original
+    # Collectr snapshot rather than the form downloaded from New in Collectr.
+    normalized_cols = {_clean_column_name(col) for col in out.columns}
+    looks_like_original_collectr = (
+        "collectr_row_id" not in out.columns
+        and (
+            "portfolio_name" in normalized_cols
+            or "product_name" in normalized_cols
+            or "quantity" in normalized_cols
+        )
+        and ("set" in normalized_cols or "card_number" in normalized_cols)
+    )
+    if looks_like_original_collectr:
+        raise ValueError(
+            "This looks like the original Collectr export, not the completed New in "
+            "Collectr purchase form. In New in Collectr, click 'Download New in "
+            "Collectr purchase form', enter the purchase details in that downloaded "
+            "file, then upload that completed file here."
+        )
+
+    # Reconstruct the stable Collectr row ID if the explicit column was removed but
+    # the source-row and copy columns survived.
+    if "collectr_row_id" not in out.columns and {"source_row_number", "source_copy_number"}.issubset(out.columns):
+        def build_collectr_id(row) -> str:
+            source = pd.to_numeric(row.get("source_row_number"), errors="coerce")
+            copy = pd.to_numeric(row.get("source_copy_number"), errors="coerce")
+            if pd.isna(source) or pd.isna(copy):
+                return ""
+            return f"C{int(source):04d}-{int(copy):03d}"
+        out["collectr_row_id"] = out.apply(build_collectr_id, axis=1)
+
+    # These fields can safely be restored instead of treating a deleted column as
+    # a fatal file-format error. Row validation below will still require values.
+    defaults = {
+        "process_row": "YES",
+        "inventory_id": "",
+        "purchase_date": "",
+        "purchased_from": "",
+        "purchase_price": "",
+        "shipping": 0.0,
+        "tax": 0.0,
+        "grading_fee": 0.0,
+        "inventory_type": "Show Inventory",
+        "product_type": "",
+        "brand_or_league": "Pokemon TCG",
+        "card_type": "Pokemon",
+        "year": "",
+        "reference_link": "",
+        "sticker_price": "",
+        "notes": "",
+    }
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+
+    if "card_name" not in out.columns:
+        out["card_name"] = ""
+
+    # Inventory IDs are app metadata; regenerate any that were blank/deleted.
+    out["inventory_id"] = out["inventory_id"].apply(_text)
+    for idx in out.index:
+        if not _text(out.at[idx, "inventory_id"]):
+            out.at[idx, "inventory_id"] = str(uuid.uuid4())[:8]
+
+    return out.reset_index(drop=True)
+
 def _validate_collectr_purchase_form_upload(
     upload: pd.DataFrame,
     current_inventory: pd.DataFrame,
@@ -2866,24 +3020,17 @@ def _validate_collectr_purchase_form_upload(
             [],
         )
 
-    normalized = upload.copy()
-    normalized.columns = [_clean_column_name(col) for col in normalized.columns]
+    normalized = _canonicalize_collectr_purchase_form_upload(upload)
 
-    required = {
-        "process_row",
-        "inventory_id",
-        "collectr_row_id",
-        "card_name",
-        "purchase_date",
-        "purchased_from",
-        "purchase_price",
-    }
-    missing_columns = sorted(required.difference(normalized.columns))
-    if missing_columns:
+    # collectr_row_id is the only structural field we cannot safely invent unless
+    # source_row_number/source_copy_number were available to reconstruct it. All
+    # purchase-entry fields are handled as row-level validation instead of crashing.
+    if "collectr_row_id" not in normalized.columns:
         raise ValueError(
-            "The completed New in Collectr purchase form is missing required column(s): "
-            + ", ".join(missing_columns)
-            + ". Download a fresh form from this tab and use that file as the template."
+            "I could not identify the Collectr Row ID in this completed form. "
+            "Download a fresh 'New in Collectr purchase form' from this same "
+            "reconciliation, keep the Collectr Row / Source Row / Copy columns, "
+            "and reupload it. Purchase columns may be renamed or reordered."
         )
 
     selected = normalized[
@@ -3849,8 +3996,10 @@ with tab_bulk:
                                         )
                                         st.rerun()
 
+                            except ValueError as exc:
+                                st.error(str(exc))
                             except Exception as exc:
-                                st.exception(exc)
+                                st.error(f"Could not process the completed purchase form: {exc}")
 
                         st.divider()
                         st.markdown("### Or enter purchase details directly here")
