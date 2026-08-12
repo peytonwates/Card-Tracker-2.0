@@ -353,6 +353,45 @@ def _has_value(value: Any) -> bool:
     return bool(_text(value))
 
 
+def _inventory_id_integrity_errors(inventory: pd.DataFrame) -> list[str]:
+    """Return blocking inventory-ID problems before any database write."""
+    if inventory is None or inventory.empty:
+        return []
+    if "inventory_id" not in inventory.columns:
+        return ["The live inventory table has no inventory_id column."]
+
+    ids = inventory["inventory_id"].fillna("").astype(str).str.strip()
+    errors: list[str] = []
+
+    blank_count = int(ids.eq("").sum())
+    if blank_count:
+        errors.append(f"{blank_count:,} existing inventory row(s) have a blank inventory_id")
+
+    nonblank = ids[ids.ne("")]
+    duplicate_values = sorted(nonblank[nonblank.duplicated(keep=False)].unique().tolist())
+    if duplicate_values:
+        sample = ", ".join(duplicate_values[:12])
+        errors.append(
+            f"{len(duplicate_values):,} duplicate inventory_id value(s) exist"
+            + (f": {sample}" if sample else "")
+            + ("..." if len(duplicate_values) > 12 else "")
+        )
+
+    return errors
+
+
+def _stop_for_inventory_id_integrity(inventory: pd.DataFrame, action: str) -> None:
+    errors = _inventory_id_integrity_errors(inventory)
+    if not errors:
+        return
+    st.error(
+        f"Blocked {action}. The live inventory database has inventory-ID integrity problems: "
+        + "; ".join(errors)
+        + ". Fix these before writing anything to inventory. No database changes were made."
+    )
+    st.stop()
+
+
 def _date_sort(df: pd.DataFrame, col: str, ascending: bool = False) -> pd.DataFrame:
     if df.empty or col not in df.columns:
         return df
@@ -2801,6 +2840,9 @@ with tab_add:
                             hide_index=True,
                         )
                     else:
+                        _stop_for_inventory_id_integrity(
+                            latest_inventory, "adding new show inventory"
+                        )
                         rows_to_add = [
                             _inventory_row_from_purchase_upload(row)
                             for _, row in final_valid.iterrows()
@@ -2972,6 +3014,9 @@ with tab_sales:
                             hide_index=True,
                         )
                     else:
+                        _stop_for_inventory_id_integrity(
+                            latest_inventory, "updating show sales"
+                        )
                         latest_by_id = {
                             _text(row.get("inventory_id")): row
                             for _, row in latest_inventory.iterrows()

@@ -594,7 +594,72 @@ def _make_inventory_row(
     return row
 
 
+def _inventory_id_integrity_errors(inventory: pd.DataFrame) -> list[str]:
+    if inventory is None or inventory.empty:
+        return []
+    if "inventory_id" not in inventory.columns:
+        return ["The live inventory table has no inventory_id column"]
+
+    ids = inventory["inventory_id"].fillna("").astype(str).str.strip()
+    errors: list[str] = []
+
+    blank_count = int(ids.eq("").sum())
+    if blank_count:
+        errors.append(f"{blank_count:,} existing inventory row(s) have a blank inventory_id")
+
+    nonblank = ids[ids.ne("")]
+    duplicate_values = sorted(nonblank[nonblank.duplicated(keep=False)].unique().tolist())
+    if duplicate_values:
+        sample = ", ".join(duplicate_values[:12])
+        errors.append(
+            f"{len(duplicate_values):,} duplicate inventory_id value(s) exist"
+            + (f": {sample}" if sample else "")
+            + ("..." if len(duplicate_values) > 12 else "")
+        )
+    return errors
+
+
 def _append_inventory_rows(rows: list[dict]) -> None:
+    if not rows:
+        return
+
+    latest = load_data(force_refresh=True)
+    current_inventory = _safe_df(latest.inventory)
+    integrity_errors = _inventory_id_integrity_errors(current_inventory)
+    if integrity_errors:
+        raise ValueError(
+            "Blocked inventory add because the live inventory database has ID integrity problems: "
+            + "; ".join(integrity_errors)
+            + ". No rows were added."
+        )
+
+    new_ids = [str(row.get("inventory_id", "") or "").strip() for row in rows]
+    if any(not inventory_id for inventory_id in new_ids):
+        raise ValueError("One or more new rows has a blank inventory_id. No rows were added.")
+
+    duplicate_new_ids = sorted({x for x in new_ids if new_ids.count(x) > 1})
+    if duplicate_new_ids:
+        raise ValueError(
+            "The rows being added contain duplicate inventory_id values: "
+            + ", ".join(duplicate_new_ids[:20])
+            + ". No rows were added."
+        )
+
+    existing_ids = set(
+        current_inventory.get("inventory_id", pd.Series(dtype=str))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .tolist()
+    )
+    collisions = sorted(set(new_ids).intersection(existing_ids))
+    if collisions:
+        raise ValueError(
+            "One or more new inventory IDs already exist in the live database: "
+            + ", ".join(collisions[:20])
+            + ". No rows were added."
+        )
+
     append_rows(
         get_ws_name("inventory_worksheet", "inventory"),
         INVENTORY_COLUMNS,
