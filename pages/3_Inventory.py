@@ -1574,6 +1574,31 @@ def _read_csv_or_excel(uploaded_file) -> pd.DataFrame:
         )
 
 
+def _find_collectr_source_column(columns: list[str], aliases: list[str]) -> str | None:
+    """Find a Collectr export column using normalized exact/prefix aliases.
+
+    Prefix matching is required for headers such as
+    ``Market Price (As of 2026-08-12)`` which normalize to ``market_price``
+    after the parenthetical date is removed.
+    """
+    normalized = {_clean_column_name(col): col for col in columns}
+
+    # Prefer exact normalized aliases first.
+    for alias in aliases:
+        normalized_alias = _clean_column_name(alias)
+        if normalized_alias in normalized:
+            return normalized[normalized_alias]
+
+    # Collectr sometimes appends dates/details to a heading.
+    for alias in aliases:
+        normalized_alias = _clean_column_name(alias)
+        for normalized_name, original_name in normalized.items():
+            if normalized_name.startswith(normalized_alias):
+                return original_name
+
+    return None
+
+
 def _parse_collectr_grade(value: Any) -> tuple[str, str]:
     text = _text(value)
     normalized = _norm(text)
