@@ -2782,6 +2782,250 @@ def _validate_collectr_bulk_add_editor(
     return selected, validation, rows_to_add
 
 
+COLLECTR_PURCHASE_FORM_COLUMNS = [
+    "process_row",
+    "inventory_id",
+    "collectr_row_id",
+    "source_row_number",
+    "source_copy_number",
+    "purchase_date",
+    "purchased_from",
+    "purchase_price",
+    "shipping",
+    "tax",
+    "grading_fee",
+    "inventory_type",
+    "product_type",
+    "brand_or_league",
+    "card_type",
+    "set_name",
+    "year",
+    "card_name",
+    "card_number",
+    "variant",
+    "card_subtype",
+    "grading_company",
+    "grade",
+    "condition",
+    "reference_link",
+    "market_value",
+    "average_cost_paid",
+    "sticker_price",
+    "notes",
+    "suggested_inventory_id",
+    "suggested_inventory_reference_link",
+    "suggested_match_score",
+    "suggested_match_status",
+]
+
+
+def _build_collectr_purchase_export_form(
+    new_cards: pd.DataFrame,
+    *,
+    default_purchase_date,
+    default_purchased_from: str,
+    default_inventory_type: str,
+    prefill_collectr_cost: bool,
+) -> pd.DataFrame:
+    """Build the downloadable/reuploadable purchase form for New in Collectr."""
+    if new_cards.empty:
+        return pd.DataFrame(columns=COLLECTR_PURCHASE_FORM_COLUMNS)
+
+    form = _build_collectr_bulk_add_frame(
+        new_cards,
+        default_purchase_date=default_purchase_date,
+        default_purchased_from=default_purchased_from,
+        default_inventory_type=default_inventory_type,
+        prefill_collectr_cost=prefill_collectr_cost,
+    ).copy()
+
+    form["process_row"] = "YES"
+    form["inventory_id"] = [str(uuid.uuid4())[:8] for _ in range(len(form))]
+    form["brand_or_league"] = "Pokemon TCG"
+    form["card_type"] = "Pokemon"
+    form["year"] = ""
+
+    # Put the purchase-entry fields first so the form is quick to complete in Excel.
+    for col in COLLECTR_PURCHASE_FORM_COLUMNS:
+        if col not in form.columns:
+            form[col] = ""
+
+    return form[COLLECTR_PURCHASE_FORM_COLUMNS].copy()
+
+
+def _validate_collectr_purchase_form_upload(
+    upload: pd.DataFrame,
+    current_inventory: pd.DataFrame,
+    current_new_collectr_ids: set[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """Validate a completed New in Collectr purchase form and build inventory rows."""
+    if upload is None or upload.empty:
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(columns=["inventory_id", "collectr_row_id", "card_name", "status", "errors"]),
+            [],
+        )
+
+    normalized = upload.copy()
+    normalized.columns = [_clean_column_name(col) for col in normalized.columns]
+
+    required = {
+        "process_row",
+        "inventory_id",
+        "collectr_row_id",
+        "card_name",
+        "purchase_date",
+        "purchased_from",
+        "purchase_price",
+    }
+    missing_columns = sorted(required.difference(normalized.columns))
+    if missing_columns:
+        raise ValueError(
+            "The completed New in Collectr purchase form is missing required column(s): "
+            + ", ".join(missing_columns)
+            + ". Download a fresh form from this tab and use that file as the template."
+        )
+
+    selected = normalized[
+        normalized["process_row"].apply(lambda value: _truthy(value, default=False))
+    ].copy()
+
+    if selected.empty:
+        return (
+            selected,
+            pd.DataFrame(columns=["inventory_id", "collectr_row_id", "card_name", "status", "errors"]),
+            [],
+        )
+
+    existing_inventory_ids = set()
+    if not current_inventory.empty and "inventory_id" in current_inventory.columns:
+        existing_inventory_ids = set(
+            current_inventory["inventory_id"].astype(str).str.strip().tolist()
+        )
+
+    selected["inventory_id"] = selected["inventory_id"].apply(_text)
+    selected["collectr_row_id"] = selected["collectr_row_id"].apply(_text)
+
+    duplicate_inventory_ids = set(
+        selected.loc[
+            selected["inventory_id"].duplicated(keep=False), "inventory_id"
+        ].astype(str).str.strip().tolist()
+    )
+    duplicate_collectr_ids = set(
+        selected.loc[
+            selected["collectr_row_id"].duplicated(keep=False), "collectr_row_id"
+        ].astype(str).str.strip().tolist()
+    )
+
+    validation_rows: list[dict[str, Any]] = []
+    rows_to_add: list[dict] = []
+
+    for _, row in selected.iterrows():
+        errors: list[str] = []
+        inventory_id = _text(row.get("inventory_id"))
+        collectr_row_id = _text(row.get("collectr_row_id"))
+        card_name = _text(row.get("card_name"))
+        purchased_from = _text(row.get("purchased_from"))
+        purchase_price_raw = row.get("purchase_price")
+        purchase_date_value = pd.to_datetime(row.get("purchase_date"), errors="coerce")
+
+        if not inventory_id:
+            errors.append("Missing inventory_id")
+        elif inventory_id in existing_inventory_ids:
+            errors.append("inventory_id already exists in inventory")
+        if inventory_id in duplicate_inventory_ids:
+            errors.append("Duplicate inventory_id in uploaded form")
+
+        if not collectr_row_id:
+            errors.append("Missing collectr_row_id")
+        elif collectr_row_id not in current_new_collectr_ids:
+            errors.append(
+                "Collectr row is no longer in New in Collectr; refresh/reconcile before adding"
+            )
+        if collectr_row_id in duplicate_collectr_ids:
+            errors.append("Duplicate collectr_row_id in uploaded form")
+
+        if not card_name:
+            errors.append("Missing card_name")
+        if pd.isna(purchase_date_value):
+            errors.append("Invalid purchase_date")
+        if not purchased_from:
+            errors.append("Purchased From is required")
+        if not _has_value(purchase_price_raw):
+            errors.append("Purchase Price is required")
+        elif _money_input_bad(purchase_price_raw):
+            errors.append("Purchase Price is not a valid dollar amount")
+
+        inventory_type = _normalize_inventory_type_value(row.get("inventory_type"))
+        if not inventory_type:
+            inventory_type = "Show Inventory"
+        if inventory_type not in INVENTORY_TYPE_OPTIONS:
+            errors.append(f"Invalid inventory_type: {inventory_type}")
+
+        product_type = _normalize_product_type_value(row.get("product_type"))
+        if not product_type:
+            product_type = (
+                "Graded Card"
+                if _text(row.get("grading_company")) or _text(row.get("grade"))
+                else "Card"
+            )
+        if product_type not in PRODUCT_TYPE_OPTIONS:
+            errors.append(f"Invalid product_type: {product_type}")
+
+        validation_rows.append(
+            {
+                "inventory_id": inventory_id,
+                "collectr_row_id": collectr_row_id,
+                "card_name": card_name,
+                "purchase_date": _text(row.get("purchase_date")),
+                "purchased_from": purchased_from,
+                "purchase_price": to_money(purchase_price_raw),
+                "status": "READY" if not errors else "ERROR",
+                "errors": "; ".join(errors),
+            }
+        )
+
+        if errors:
+            continue
+
+        new_inventory_row = _make_inventory_row(
+            inventory_type=inventory_type,
+            product_type=product_type,
+            card_type=_text(row.get("card_type")) or "Pokemon",
+            brand_or_league=_text(row.get("brand_or_league")) or "Pokemon TCG",
+            set_name=_text(row.get("set_name")),
+            year=_text(row.get("year")),
+            card_name=card_name,
+            card_number=_text(row.get("card_number")),
+            variant=_text(row.get("variant")),
+            card_subtype=_text(row.get("card_subtype")),
+            grading_company=_text(row.get("grading_company")),
+            grade=_text(row.get("grade")),
+            reference_link=_text(row.get("reference_link")),
+            purchase_date_value=str(purchase_date_value.date()),
+            purchased_from=purchased_from,
+            purchase_price=to_money(purchase_price_raw),
+            shipping=to_money(row.get("shipping")),
+            tax=to_money(row.get("tax")),
+            sticker_price=to_money(row.get("sticker_price")),
+            condition=_text(row.get("condition")) or (
+                "Graded"
+                if _text(row.get("grading_company")) or _text(row.get("grade"))
+                else "Near Mint"
+            ),
+            grading_fee=to_money(row.get("grading_fee")),
+            market_value=to_money(row.get("market_value")),
+            notes=_text(row.get("notes")) or "Added from Collectr Bulk Add purchase form",
+        )
+        # Preserve the inventory ID from the exported purchase form. This provides
+        # a second layer of protection against accidentally uploading the same form twice.
+        new_inventory_row["inventory_id"] = inventory_id
+        rows_to_add.append(new_inventory_row)
+
+    validation = pd.DataFrame(validation_rows)
+    return selected, validation, rows_to_add
+
+
 # =========================================================
 # Top actions
 # =========================================================
@@ -3356,6 +3600,260 @@ with tab_bulk:
                             default_inventory_type=bulk_default_inventory_type,
                             prefill_collectr_cost=bulk_prefill_collectr_cost,
                         )
+
+                        # ---------------------------------------------------------
+                        # Download / complete / reupload purchase form workflow
+                        # ---------------------------------------------------------
+                        st.markdown("### Export / reupload purchase details")
+                        st.caption(
+                            "Prefer entering purchase details in Excel? Download only the "
+                            "cards currently identified as New in Collectr, fill in the purchase "
+                            "fields, then reupload the completed file below. Set process_row to "
+                            "NO for any row you do not want to add."
+                        )
+
+                        collectr_purchase_form = _build_collectr_purchase_export_form(
+                            bulk_new_cards,
+                            default_purchase_date=bulk_default_purchase_date,
+                            default_purchased_from=bulk_default_purchased_from,
+                            default_inventory_type=bulk_default_inventory_type,
+                            prefill_collectr_cost=bulk_prefill_collectr_cost,
+                        )
+
+                        st.download_button(
+                            "Download New in Collectr purchase form",
+                            data=collectr_purchase_form.to_csv(index=False).encode("utf-8-sig"),
+                            file_name="new_in_collectr_purchase_form.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key=f"download_collectr_purchase_form_{bulk_fingerprint}",
+                        )
+                        st.caption(
+                            "Required before reupload: Purchase Date, Purchased From, and "
+                            "Purchase Price. You can also update Shipping, Tax, Grading Fee, "
+                            "Reference Link, Sticker Price, Inventory Type, Product Type, and Notes."
+                        )
+
+                        completed_collectr_purchase_file = st.file_uploader(
+                            "Reupload completed New in Collectr purchase form",
+                            type=["csv", "xlsx", "xls"],
+                            key=f"completed_collectr_purchase_form_{bulk_fingerprint}",
+                        )
+
+                        if completed_collectr_purchase_file is not None:
+                            try:
+                                completed_purchase_upload = _read_csv_or_excel(
+                                    completed_collectr_purchase_file
+                                )
+                                current_new_collectr_ids = set(
+                                    bulk_new_cards["collectr_row_id"]
+                                    .astype(str)
+                                    .str.strip()
+                                    .tolist()
+                                )
+
+                                (
+                                    completed_selected_rows,
+                                    completed_purchase_validation,
+                                    completed_rows_to_add,
+                                ) = _validate_collectr_purchase_form_upload(
+                                    completed_purchase_upload,
+                                    inv,
+                                    current_new_collectr_ids,
+                                )
+
+                                completed_error_count = (
+                                    int(
+                                        completed_purchase_validation["status"]
+                                        .eq("ERROR")
+                                        .sum()
+                                    )
+                                    if not completed_purchase_validation.empty
+                                    else 0
+                                )
+                                completed_total_cost = sum(
+                                    to_money(row.get("total_cost"))
+                                    for row in completed_rows_to_add
+                                )
+                                completed_total_market = sum(
+                                    to_money(row.get("market_value"))
+                                    for row in completed_rows_to_add
+                                )
+
+                                completed_metrics = st.columns(4)
+                                completed_metrics[0].metric(
+                                    "Rows marked YES", f"{len(completed_selected_rows):,}"
+                                )
+                                completed_metrics[1].metric(
+                                    "Validation errors", f"{completed_error_count:,}"
+                                )
+                                completed_metrics[2].metric(
+                                    "Total cost to add", money_fmt(completed_total_cost)
+                                )
+                                completed_metrics[3].metric(
+                                    "Collectr market value", money_fmt(completed_total_market)
+                                )
+
+                                if not completed_purchase_validation.empty:
+                                    st.markdown("#### Completed form validation")
+                                    st.dataframe(
+                                        completed_purchase_validation,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            "purchase_price": st.column_config.NumberColumn(
+                                                "Purchase Price", format="$%.2f"
+                                            ),
+                                        },
+                                    )
+
+                                if completed_rows_to_add:
+                                    completed_preview = pd.DataFrame(
+                                        [
+                                            {
+                                                "inventory_id": row.get("inventory_id", ""),
+                                                "card_name": row.get("card_name", ""),
+                                                "card_number": row.get("card_number", ""),
+                                                "set_name": row.get("set_name", ""),
+                                                "purchase_date": row.get("purchase_date", ""),
+                                                "purchased_from": row.get("purchased_from", ""),
+                                                "purchase_price": to_money(row.get("purchase_price")),
+                                                "shipping": to_money(row.get("shipping")),
+                                                "tax": to_money(row.get("tax")),
+                                                "grading_fee": to_money(row.get("grading_fee")),
+                                                "total_cost": to_money(row.get("total_cost")),
+                                                "market_value": to_money(row.get("market_value")),
+                                            }
+                                            for row in completed_rows_to_add
+                                        ]
+                                    )
+                                    st.markdown("#### Inventory rows ready to add")
+                                    st.dataframe(
+                                        completed_preview,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            "purchase_price": st.column_config.NumberColumn(
+                                                "Purchase Price", format="$%.2f"
+                                            ),
+                                            "shipping": st.column_config.NumberColumn(
+                                                "Shipping", format="$%.2f"
+                                            ),
+                                            "tax": st.column_config.NumberColumn(
+                                                "Tax", format="$%.2f"
+                                            ),
+                                            "grading_fee": st.column_config.NumberColumn(
+                                                "Grading Fee", format="$%.2f"
+                                            ),
+                                            "total_cost": st.column_config.NumberColumn(
+                                                "Total Cost", format="$%.2f"
+                                            ),
+                                            "market_value": st.column_config.NumberColumn(
+                                                "Market Value", format="$%.2f"
+                                            ),
+                                        },
+                                    )
+
+                                confirm_completed_collectr_add = st.checkbox(
+                                    f"I reviewed the completed purchase form and want to add "
+                                    f"{len(completed_rows_to_add):,} inventory record(s).",
+                                    value=False,
+                                    disabled=(
+                                        not completed_rows_to_add
+                                        or completed_error_count > 0
+                                    ),
+                                    key=f"confirm_completed_collectr_add_{bulk_fingerprint}",
+                                )
+
+                                if st.button(
+                                    "Add completed purchase form to inventory",
+                                    type="primary",
+                                    use_container_width=True,
+                                    disabled=(
+                                        not confirm_completed_collectr_add
+                                        or not completed_rows_to_add
+                                        or completed_error_count > 0
+                                    ),
+                                    key=f"process_completed_collectr_add_{bulk_fingerprint}",
+                                ):
+                                    # Re-read current inventory and rerun matching immediately
+                                    # before writing. A Collectr row that became matched after the
+                                    # export is blocked rather than duplicated.
+                                    latest_data = load_data(force_refresh=True)
+                                    latest_inv = _safe_df(latest_data.inventory)
+                                    latest_existing, _ = _bulk_collectr_inventory_scope(
+                                        latest_inv
+                                    )
+                                    (
+                                        _latest_form_audit,
+                                        _latest_form_matched,
+                                        latest_form_new_cards,
+                                        _latest_form_missing,
+                                    ) = _reconcile_collectr(
+                                        collectr_cards,
+                                        latest_existing,
+                                        auto_match_threshold=float(
+                                            bulk_match_threshold
+                                        ),
+                                        duplicate_policy="Keep newest eligible inventory",
+                                    )
+
+                                    latest_form_new_ids = set(
+                                        latest_form_new_cards["collectr_row_id"]
+                                        .astype(str)
+                                        .str.strip()
+                                        .tolist()
+                                    )
+                                    (
+                                        final_completed_selected,
+                                        final_completed_validation,
+                                        final_completed_rows,
+                                    ) = _validate_collectr_purchase_form_upload(
+                                        completed_purchase_upload,
+                                        latest_inv,
+                                        latest_form_new_ids,
+                                    )
+                                    final_completed_errors = (
+                                        int(
+                                            final_completed_validation["status"]
+                                            .eq("ERROR")
+                                            .sum()
+                                        )
+                                        if not final_completed_validation.empty
+                                        else 0
+                                    )
+
+                                    if final_completed_errors:
+                                        st.error(
+                                            "Inventory or matching changed after the preview. "
+                                            "Nothing was added. Review the validation below, "
+                                            "then download a fresh New in Collectr form if needed."
+                                        )
+                                        st.dataframe(
+                                            final_completed_validation,
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                                    elif not final_completed_rows:
+                                        st.warning(
+                                            "There are no rows marked for processing in the "
+                                            "completed form."
+                                        )
+                                    else:
+                                        _append_inventory_rows(final_completed_rows)
+                                        refresh_database_cache()
+                                        st.success(
+                                            f"Added {len(final_completed_rows):,} new "
+                                            "inventory record(s) from the completed Collectr "
+                                            "purchase form."
+                                        )
+                                        st.rerun()
+
+                            except Exception as exc:
+                                st.exception(exc)
+
+                        st.divider()
+                        st.markdown("### Or enter purchase details directly here")
 
                         bulk_editor_key = (
                             f"inventory_collectr_bulk_editor_{bulk_fingerprint}_"
