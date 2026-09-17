@@ -302,6 +302,7 @@ def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict
         "received": 0,
         "outstanding": 0,
         "gem_10s": 0,
+        "graded_received": 0,
         "gem_rate": 0.0,
         "sold_graded_cards": 0,
         "roi_dollars": 0.0,
@@ -348,19 +349,59 @@ def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict
     received_count = int(len(received))
     outstanding_count = max(sent_count - received_count, 0)
 
-    # Coalesce again after filtering to keep the series aligned to received rows.
+    # Resolve the received grade from both grading history and inventory.
+    # Historical grading sheets have accumulated duplicate/legacy grade columns,
+    # while the return workflow also writes the final grade back to inventory.
+    # We therefore prefer a plausible grade from grading history and fall back
+    # to the inventory grade for the same inventory_id when needed.
     received_grade_text = (
         _coalesce_sheet_field(received, "received_grade")
         .fillna("")
         .astype(str)
         .str.strip()
     )
-    # This accepts plain values like 10 / 10.0 and also text like "PSA 10".
-    received_grade_numeric = pd.to_numeric(
+
+    grading_grade_numeric = pd.to_numeric(
         received_grade_text.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
         errors="coerce",
     )
-    gem_10s = int(received_grade_numeric.eq(10).sum())
+
+    # Only 1-10 are valid grading results. Anything else is treated as unusable
+    # and can be replaced by the grade stored on the matching inventory row.
+    grading_grade_numeric = grading_grade_numeric.where(
+        grading_grade_numeric.between(1, 10, inclusive="both")
+    )
+
+    inventory_grade_numeric = pd.Series(float("nan"), index=received.index, dtype="float64")
+
+    if not inv.empty and "inventory_id" in inv.columns and "grade" in inv.columns:
+        inv_grade = inv[["inventory_id", "grade"]].copy()
+        inv_grade["inventory_id"] = inv_grade["inventory_id"].astype(str).str.strip()
+        inv_grade["__grade_text"] = inv_grade["grade"].fillna("").astype(str).str.strip()
+        inv_grade["__grade_numeric"] = pd.to_numeric(
+            inv_grade["__grade_text"].str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
+            errors="coerce",
+        )
+        inv_grade["__valid_grade"] = inv_grade["__grade_numeric"].between(1, 10, inclusive="both")
+
+        # If duplicate inventory IDs ever exist, prefer the copy that actually
+        # contains a valid grade, then keep only one lookup row per ID.
+        inv_grade = inv_grade[inv_grade["inventory_id"].ne("")].copy()
+        inv_grade = inv_grade.sort_values("__valid_grade", ascending=False)
+        inv_grade = inv_grade.drop_duplicates(subset=["inventory_id"], keep="first")
+        inventory_grade_map = inv_grade.set_index("inventory_id")["__grade_numeric"].to_dict()
+
+        inventory_grade_numeric = pd.to_numeric(
+            received["inventory_id"].astype(str).str.strip().map(inventory_grade_map),
+            errors="coerce",
+        )
+        inventory_grade_numeric = inventory_grade_numeric.where(
+            inventory_grade_numeric.between(1, 10, inclusive="both")
+        )
+
+    resolved_grade_numeric = grading_grade_numeric.combine_first(inventory_grade_numeric)
+    gem_10s = int(resolved_grade_numeric.eq(10).sum())
+    graded_received_count = int(resolved_grade_numeric.notna().sum())
     gem_rate = (gem_10s / received_count * 100.0) if received_count else 0.0
 
     metrics = {
@@ -368,6 +409,7 @@ def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict
         "received": received_count,
         "outstanding": outstanding_count,
         "gem_10s": gem_10s,
+        "graded_received": graded_received_count,
         "gem_rate": gem_rate,
         "sold_graded_cards": 0,
         "roi_dollars": 0.0,
@@ -708,7 +750,8 @@ with metric_cols[3]:
         help=(
             "PSA 10s divided by all cards that have been received back from grading. "
             f"Current: {grading_metrics['gem_10s']:,} gem mint 10(s) out of "
-            f"{grading_metrics['received']:,} received card(s)."
+            f"{grading_metrics['received']:,} received card(s). "
+            f"A usable grade was resolved for {grading_metrics['graded_received']:,} received card(s)."
         ),
     )
 
