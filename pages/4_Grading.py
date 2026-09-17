@@ -332,101 +332,204 @@ def _resolve_valid_received_grade(df: pd.DataFrame) -> pd.Series:
     return resolved
 
 
+def _grading_valid_rows(grading: pd.DataFrame) -> pd.DataFrame:
+    """Return real grading-card rows, excluding repair/cancelled records and blanks."""
+    if grading.empty:
+        return pd.DataFrame()
+
+    g = grading.copy()
+    g["inventory_id"] = g["inventory_id"].astype(str).str.strip()
+    g["status"] = g["status"].astype(str).str.upper().str.strip()
+
+    excluded_statuses = {
+        "DUPLICATE_CLEARED",
+        "CANCELLED",
+        "CANCELED",
+    }
+
+    g = g[~g["status"].isin(excluded_statuses)].copy()
+    g = g[
+        g["grading_row_id"].astype(str).str.strip().ne("")
+        | g["inventory_id"].astype(str).str.strip().ne("")
+    ].copy()
+
+    return g
+
+
+def _grading_received_rows(grading: pd.DataFrame) -> pd.DataFrame:
+    """Return grading rows that have actually come back from the grader."""
+    valid = _grading_valid_rows(grading)
+    if valid.empty:
+        return pd.DataFrame()
+
+    status_received = valid["status"].isin({"RETURNED", "COMPLETE", "COMPLETED"})
+    returned_date_text = valid["returned_date"].fillna("").astype(str).str.strip()
+    returned_date_present = returned_date_text.ne("") & ~returned_date_text.str.lower().isin(
+        {"nan", "none", "<na>"}
+    )
+
+    return valid[status_received | returned_date_present].copy()
+
+
+def _numeric_grade_series(series: pd.Series) -> pd.Series:
+    """Parse grades such as 10, 10.0, 'PSA 10', etc. and keep only 1-10."""
+    if series is None:
+        return pd.Series(dtype="float64")
+
+    text = series.fillna("").astype(str).str.strip()
+    numeric = pd.to_numeric(
+        text.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
+        errors="coerce",
+    )
+    return numeric.where(numeric.between(1, 10, inclusive="both"))
+
+
+def _grading_grade_audit(inv: pd.DataFrame, grading: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build one audit row per received grading row.
+
+    Inventory is the preferred final-grade source because the return workflow
+    writes the received grade back to inventory. Grading history remains a
+    fallback/source-of-record check. A card is treated as a gem if either valid
+    source records a 10; any source disagreement is explicitly surfaced.
+    """
+    received = _grading_received_rows(grading)
+    if received.empty:
+        return pd.DataFrame()
+
+    audit = received.copy()
+    audit["grading_grade"] = _resolve_valid_received_grade(audit)
+
+    inventory_grade_map: dict[str, float] = {}
+    if not inv.empty and "inventory_id" in inv.columns and "grade" in inv.columns:
+        inv_grade = inv[["inventory_id", "grade"]].copy()
+        inv_grade["inventory_id"] = inv_grade["inventory_id"].fillna("").astype(str).str.strip()
+        inv_grade["inventory_grade"] = _numeric_grade_series(inv_grade["grade"])
+        inv_grade = inv_grade[inv_grade["inventory_id"].ne("")].copy()
+        inv_grade["__has_grade"] = inv_grade["inventory_grade"].notna()
+        inv_grade = inv_grade.sort_values("__has_grade", ascending=False)
+        inv_grade = inv_grade.drop_duplicates(subset=["inventory_id"], keep="first")
+        inventory_grade_map = inv_grade.set_index("inventory_id")["inventory_grade"].to_dict()
+
+    audit["inventory_grade"] = pd.to_numeric(
+        audit["inventory_id"].fillna("").astype(str).str.strip().map(inventory_grade_map),
+        errors="coerce",
+    )
+    audit["inventory_grade"] = audit["inventory_grade"].where(
+        audit["inventory_grade"].between(1, 10, inclusive="both")
+    )
+
+    audit["resolved_grade"] = audit["inventory_grade"].combine_first(audit["grading_grade"])
+
+    both_present = audit["inventory_grade"].notna() & audit["grading_grade"].notna()
+    audit["grade_conflict"] = both_present & (
+        audit["inventory_grade"].round(3) != audit["grading_grade"].round(3)
+    )
+
+    audit["is_gem_10"] = audit["inventory_grade"].eq(10) | audit["grading_grade"].eq(10)
+
+    return audit
+
+
+def _grading_roi_detail(inv: pd.DataFrame, grading: pd.DataFrame) -> pd.DataFrame:
+    """
+    Realized grading ROI comes directly from INVENTORY.
+
+    Include an inventory row only when:
+      1) its inventory_id appears in legitimate grading history, and
+      2) inventory_status is SOLD.
+
+    Dollars come from INVENTORY.profit. Cost comes from INVENTORY.total_cost.
+    No sale proceeds or fees are reconstructed here.
+    """
+    if inv.empty or grading.empty:
+        return pd.DataFrame()
+
+    valid_grading = _grading_valid_rows(grading)
+    if valid_grading.empty:
+        return pd.DataFrame()
+
+    grading_ids = set(
+        valid_grading["inventory_id"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .tolist()
+    )
+    if not grading_ids:
+        return pd.DataFrame()
+
+    sold = inv.copy()
+    sold["inventory_id"] = sold["inventory_id"].fillna("").astype(str).str.strip()
+    sold["inventory_status"] = sold["inventory_status"].fillna("").astype(str).str.upper().str.strip()
+
+    sold = sold[
+        sold["inventory_status"].eq("SOLD")
+        & sold["inventory_id"].isin(grading_ids)
+    ].copy()
+
+    if sold.empty:
+        return pd.DataFrame()
+
+    sold = sold.drop_duplicates(subset=["inventory_id"], keep="first").copy()
+
+    sold["roi_total_cost"] = pd.to_numeric(sold["total_cost"], errors="coerce")
+    sold["roi_profit"] = pd.to_numeric(sold["profit"], errors="coerce")
+    sold["included_in_roi"] = sold["roi_total_cost"].notna() & sold["roi_profit"].notna()
+
+    sold["roi_pct"] = float("nan")
+    pct_mask = sold["included_in_roi"] & sold["roi_total_cost"].gt(0)
+    sold.loc[pct_mask, "roi_pct"] = (
+        sold.loc[pct_mask, "roi_profit"] / sold.loc[pct_mask, "roi_total_cost"] * 100.0
+    )
+
+    sold["roi_note"] = "Included"
+    sold.loc[sold["roi_total_cost"].isna(), "roi_note"] = "Missing total_cost"
+    sold.loc[sold["roi_profit"].isna(), "roi_note"] = "Missing profit"
+    sold.loc[
+        sold["roi_total_cost"].notna() & sold["roi_total_cost"].le(0),
+        "roi_note",
+    ] = "Cost is zero/non-positive; included in ROI $ but not % denominator"
+
+    return sold
+
+
 def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict[str, float | int]:
-    """Build top-level grading KPIs from grading history + realized inventory sales."""
+    """Build top-level grading KPIs from grading history + inventory sales."""
     empty_metrics = {
         "sent": 0,
         "received": 0,
         "outstanding": 0,
         "gem_10s": 0,
         "graded_received": 0,
+        "grade_conflicts": 0,
         "gem_rate": 0.0,
         "sold_graded_cards": 0,
+        "roi_missing_rows": 0,
         "roi_dollars": 0.0,
-        "avg_roi_pct": 0.0,
+        "roi_pct": 0.0,
     }
 
-    if grading.empty:
-        return empty_metrics
-
-    g = grading.copy()
-    g["inventory_id"] = g["inventory_id"].astype(str).str.strip()
-    g["status"] = g["status"].astype(str).str.upper().str.strip()
-
-    # These are administrative/repair rows, not cards we want to count as submitted.
-    excluded_statuses = {
-        "DUPLICATE_CLEARED",
-        "CANCELLED",
-        "CANCELED",
-    }
-    valid = g[~g["status"].isin(excluded_statuses)].copy()
-
-    # Ignore completely blank historical rows if they ever exist in the worksheet.
-    valid = valid[
-        valid["grading_row_id"].astype(str).str.strip().ne("")
-        | valid["inventory_id"].astype(str).str.strip().ne("")
-    ].copy()
-
+    valid = _grading_valid_rows(grading)
     if valid.empty:
         return empty_metrics
 
-    # Some historical grading worksheets contain duplicate received_grade
-    # headers. read_sheet() renames those extras with __dupN suffixes.
-    # Coalesce them so a populated grade is never missed by the KPI logic.
-    valid_received_grade = _coalesce_sheet_field(valid, "received_grade")
-
-    status_received = valid["status"].isin({"RETURNED", "COMPLETE", "COMPLETED"})
-    returned_date_present = valid["returned_date"].astype(str).str.strip().replace("nan", "").ne("")
-    grade_text = valid_received_grade.fillna("").astype(str).str.strip()
-    grade_present = grade_text.ne("") & ~grade_text.str.lower().isin({"nan", "none", "<na>"})
-    received_mask = status_received | returned_date_present | grade_present
-    received = valid[received_mask].copy()
+    received = _grading_received_rows(grading)
+    grade_audit = _grading_grade_audit(inv, grading)
 
     sent_count = int(len(valid))
     received_count = int(len(received))
     outstanding_count = max(sent_count - received_count, 0)
 
-    # Resolve the received grade from both grading history and inventory.
-    # Historical grading sheets have accumulated duplicate/legacy grade columns,
-    # while the return workflow also writes the final grade back to inventory.
-    # We therefore prefer a plausible grade from grading history and fall back
-    # to the inventory grade for the same inventory_id when needed.
-    # Resolve a valid grade across every received_grade copy. Older rows can
-    # contain non-grade junk in one duplicate column, so we must keep scanning
-    # until an actual 1-10 grade is found instead of stopping at the first
-    # merely nonblank value.
-    grading_grade_numeric = _resolve_valid_received_grade(received)
-
-    inventory_grade_numeric = pd.Series(float("nan"), index=received.index, dtype="float64")
-
-    if not inv.empty and "inventory_id" in inv.columns and "grade" in inv.columns:
-        inv_grade = inv[["inventory_id", "grade"]].copy()
-        inv_grade["inventory_id"] = inv_grade["inventory_id"].astype(str).str.strip()
-        inv_grade["__grade_text"] = inv_grade["grade"].fillna("").astype(str).str.strip()
-        inv_grade["__grade_numeric"] = pd.to_numeric(
-            inv_grade["__grade_text"].str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
-            errors="coerce",
-        )
-        inv_grade["__valid_grade"] = inv_grade["__grade_numeric"].between(1, 10, inclusive="both")
-
-        # If duplicate inventory IDs ever exist, prefer the copy that actually
-        # contains a valid grade, then keep only one lookup row per ID.
-        inv_grade = inv_grade[inv_grade["inventory_id"].ne("")].copy()
-        inv_grade = inv_grade.sort_values("__valid_grade", ascending=False)
-        inv_grade = inv_grade.drop_duplicates(subset=["inventory_id"], keep="first")
-        inventory_grade_map = inv_grade.set_index("inventory_id")["__grade_numeric"].to_dict()
-
-        inventory_grade_numeric = pd.to_numeric(
-            received["inventory_id"].astype(str).str.strip().map(inventory_grade_map),
-            errors="coerce",
-        )
-        inventory_grade_numeric = inventory_grade_numeric.where(
-            inventory_grade_numeric.between(1, 10, inclusive="both")
-        )
-
-    resolved_grade_numeric = grading_grade_numeric.combine_first(inventory_grade_numeric)
-    gem_10s = int(resolved_grade_numeric.eq(10).sum())
-    graded_received_count = int(resolved_grade_numeric.notna().sum())
+    gem_10s = int(grade_audit["is_gem_10"].sum()) if not grade_audit.empty else 0
+    graded_received_count = (
+        int(grade_audit[["inventory_grade", "grading_grade"]].notna().any(axis=1).sum())
+        if not grade_audit.empty
+        else 0
+    )
+    grade_conflicts = int(grade_audit["grade_conflict"].sum()) if not grade_audit.empty else 0
     gem_rate = (gem_10s / received_count * 100.0) if received_count else 0.0
 
     metrics = {
@@ -435,71 +538,31 @@ def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict
         "outstanding": outstanding_count,
         "gem_10s": gem_10s,
         "graded_received": graded_received_count,
+        "grade_conflicts": grade_conflicts,
         "gem_rate": gem_rate,
         "sold_graded_cards": 0,
+        "roi_missing_rows": 0,
         "roi_dollars": 0.0,
-        "avg_roi_pct": 0.0,
+        "roi_pct": 0.0,
     }
 
-    if inv.empty or received.empty:
+    roi_detail = _grading_roi_detail(inv, grading)
+    if roi_detail.empty:
         return metrics
 
-    # A sold inventory card should contribute to realized grading ROI only once,
-    # even if grading history contains more than one historical row for that ID.
-    received_ids = set(
-        received["inventory_id"]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .replace("", pd.NA)
-        .dropna()
-        .tolist()
-    )
+    included = roi_detail[roi_detail["included_in_roi"]].copy()
+    metrics["sold_graded_cards"] = int(len(roi_detail))
+    metrics["roi_missing_rows"] = int((~roi_detail["included_in_roi"]).sum())
 
-    if not received_ids:
+    if included.empty:
         return metrics
 
-    sold = inv.copy()
-    sold["inventory_id"] = sold["inventory_id"].astype(str).str.strip()
-    sold["inventory_status"] = sold["inventory_status"].astype(str).str.upper().str.strip()
+    metrics["roi_dollars"] = float(included["roi_profit"].sum())
 
-    sold_date_present = sold["sold_date"].astype(str).str.strip().replace("nan", "").ne("")
-    sold_mask = sold["inventory_status"].eq("SOLD") | sold_date_present
-    sold = sold[sold_mask & sold["inventory_id"].isin(received_ids)].copy()
-
-    if sold.empty:
-        return metrics
-
-    sold = sold.drop_duplicates(subset=["inventory_id"], keep="first").copy()
-
-    sold["__cost"] = pd.to_numeric(sold["total_cost"], errors="coerce")
-    sold["__net"] = pd.to_numeric(sold["net_proceeds"], errors="coerce")
-    sold["__sold_price"] = pd.to_numeric(sold["sold_price"], errors="coerce")
-    sold["__fees"] = pd.to_numeric(sold["fees_total"], errors="coerce")
-    sold["__stored_profit"] = pd.to_numeric(sold["profit"], errors="coerce")
-
-    # Prefer actual net proceeds. If an older sold row lacks that field, fall back
-    # to sold price less recorded fees. Profit is only used as a final fallback.
-    fallback_net = sold["__sold_price"] - sold["__fees"].fillna(0.0)
-    sold["__realized_net"] = sold["__net"].where(sold["__net"].notna(), fallback_net)
-    sold["__profit_calc"] = sold["__realized_net"] - sold["__cost"]
-    sold["__profit_calc"] = sold["__profit_calc"].where(
-        sold["__profit_calc"].notna(),
-        sold["__stored_profit"],
-    )
-
-    roi_rows = sold[sold["__cost"].notna() & sold["__profit_calc"].notna()].copy()
-
-    if roi_rows.empty:
-        return metrics
-
-    metrics["sold_graded_cards"] = int(len(roi_rows))
-    metrics["roi_dollars"] = float(roi_rows["__profit_calc"].sum())
-
-    pct_rows = roi_rows[roi_rows["__cost"] > 0].copy()
-    if not pct_rows.empty:
-        pct_rows["__roi_pct"] = pct_rows["__profit_calc"] / pct_rows["__cost"] * 100.0
-        metrics["avg_roi_pct"] = float(pct_rows["__roi_pct"].mean())
+    pct_rows = included[included["roi_total_cost"] > 0].copy()
+    total_cost = float(pct_rows["roi_total_cost"].sum()) if not pct_rows.empty else 0.0
+    total_profit_for_pct = float(pct_rows["roi_profit"].sum()) if not pct_rows.empty else 0.0
+    metrics["roi_pct"] = (total_profit_for_pct / total_cost * 100.0) if total_cost > 0 else 0.0
 
     return metrics
 
@@ -773,10 +836,12 @@ with metric_cols[3]:
         "Gem Rate",
         f"{grading_metrics['gem_rate']:.1f}%",
         help=(
-            "PSA 10s divided by all cards that have been received back from grading. "
+            "PSA 10s divided by all cards received back from grading. "
+            "The final Inventory grade is preferred and Grading history is used as a fallback/check. "
             f"Current: {grading_metrics['gem_10s']:,} gem mint 10(s) out of "
             f"{grading_metrics['received']:,} received card(s). "
-            f"A usable grade was resolved for {grading_metrics['graded_received']:,} received card(s)."
+            f"A usable grade exists for {grading_metrics['graded_received']:,} received card(s). "
+            f"Grade-source conflicts: {grading_metrics['grade_conflicts']:,}."
         ),
     )
 
@@ -785,26 +850,102 @@ with metric_cols[4]:
         "Realized ROI $",
         money_fmt(grading_metrics["roi_dollars"]),
         help=(
-            "Total realized profit on cards that were sent for grading, received back, and sold. "
-            "Uses inventory net proceeds minus total cost, where total cost includes grading cost."
+            "Sum of INVENTORY.profit for inventory IDs that appear in grading history and are currently marked SOLD. "
+            "The app does not reconstruct profit from proceeds or fees for this KPI."
         ),
     )
 
 with metric_cols[5]:
     st.metric(
-        "Avg ROI %",
-        f"{grading_metrics['avg_roi_pct']:.1f}%",
+        "Realized ROI %",
+        f"{grading_metrics['roi_pct']:.1f}%",
         help=(
-            "Average per-card ROI for graded cards that were received and sold: "
-            "(net proceeds - total cost) / total cost. "
-            f"Based on {grading_metrics['sold_graded_cards']:,} sold graded card(s) with usable cost/proceeds data."
+            "Aggregate realized grading ROI: SUM(INVENTORY.profit) / SUM(INVENTORY.total_cost) × 100 "
+            "for graded inventory IDs marked SOLD. "
+            f"Matched {grading_metrics['sold_graded_cards']:,} sold graded card(s); "
+            f"{grading_metrics['roi_missing_rows']:,} are missing usable profit or total_cost and are excluded."
         ),
     )
 
 st.caption(
-    "ROI metrics include only realized sales from cards that appear in grading history as received. "
-    "Cards still held in inventory are not included in ROI."
+    "ROI uses the Inventory sheet only: inventory_id must appear in grading history, inventory_status must be SOLD, "
+    "ROI $ is the stored profit, and ROI % is total profit divided by total cost."
 )
+
+grade_audit = _grading_grade_audit(inv, grading)
+if not grade_audit.empty:
+    with st.expander("Gem rate audit", expanded=False):
+        st.caption(
+            "Use this to verify every received card contributing to Gem Rate. "
+            "A card counts as a gem when either the Inventory final grade or Grading received grade is 10. "
+            "Any disagreement between those sources is flagged."
+        )
+        grade_show = grade_audit.copy()
+        grade_show["gem_10"] = grade_show["is_gem_10"].map({True: "YES", False: ""})
+        grade_show["grade_conflict"] = grade_show["grade_conflict"].map({True: "REVIEW", False: ""})
+        grade_cols = [
+            "inventory_id",
+            "card_name",
+            "card_number",
+            "status",
+            "returned_date",
+            "grading_grade",
+            "inventory_grade",
+            "resolved_grade",
+            "gem_10",
+            "grade_conflict",
+        ]
+        st.dataframe(
+            grade_show[[c for c in grade_cols if c in grade_show.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+roi_detail = _grading_roi_detail(inv, grading)
+if not roi_detail.empty:
+    with st.expander("Realized grading ROI detail", expanded=False):
+        st.caption(
+            "These are the exact Inventory rows used for grading ROI. "
+            "ROI $ = sum of Profit. ROI % = sum of Profit ÷ sum of Total Cost. "
+            "Rows missing Profit or Total Cost are shown but excluded from the KPI."
+        )
+        roi_show = roi_detail.copy()
+        roi_show["included"] = roi_show["included_in_roi"].map({True: "YES", False: "NO"})
+        roi_cols = [
+            "inventory_id",
+            "card_name",
+            "grade",
+            "sold_date",
+            "sale_channel",
+            "roi_total_cost",
+            "roi_profit",
+            "roi_pct",
+            "included",
+            "roi_note",
+        ]
+        st.dataframe(
+            roi_show[[c for c in roi_cols if c in roi_show.columns]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "roi_total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f"),
+                "roi_profit": st.column_config.NumberColumn("Profit", format="$%.2f"),
+                "roi_pct": st.column_config.NumberColumn("Card ROI %", format="%.1f%%"),
+            },
+        )
+
+        included_roi = roi_detail[roi_detail["included_in_roi"]].copy()
+        if not included_roi.empty:
+            pct_roi = included_roi[included_roi["roi_total_cost"] > 0].copy()
+            total_cost_roi = float(pct_roi["roi_total_cost"].sum()) if not pct_roi.empty else 0.0
+            total_profit_roi = float(included_roi["roi_profit"].sum())
+            total_profit_pct_roi = float(pct_roi["roi_profit"].sum()) if not pct_roi.empty else 0.0
+            aggregate_roi_pct = (total_profit_pct_roi / total_cost_roi * 100.0) if total_cost_roi > 0 else 0.0
+            st.caption(
+                f"Included totals — Total Cost: {money_fmt(total_cost_roi)} | "
+                f"Profit: {money_fmt(total_profit_roi)} | "
+                f"Realized ROI: {aggregate_roi_pct:.1f}%"
+            )
 
 duplicate_inventory_id_rows = _duplicate_inventory_id_rows(inv)
 duplicate_open_grading_rows = _build_duplicate_open_grading_rows(grading)
