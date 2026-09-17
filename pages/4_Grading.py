@@ -295,6 +295,43 @@ def _coalesce_sheet_field(df: pd.DataFrame, base_name: str) -> pd.Series:
     return result
 
 
+def _resolve_valid_received_grade(df: pd.DataFrame) -> pd.Series:
+    """
+    Resolve a numeric received grade (1-10) across the canonical
+    received_grade column and any duplicate-header copies.
+
+    Unlike _coalesce_sheet_field(), this intentionally ignores non-grade
+    junk values and keeps searching later duplicate columns until it finds
+    a valid numeric grade. That matters for older grading rows where shifted
+    legacy values can occupy one duplicate received_grade column.
+    """
+    if df.empty:
+        return pd.Series(dtype="float64", index=df.index)
+
+    resolved = pd.Series(float("nan"), index=df.index, dtype="float64")
+
+    for col_pos, col_name in enumerate(df.columns):
+        name = str(col_name or "").strip()
+        base_name = name
+        if "__dup" in base_name:
+            base_name = base_name.split("__dup", 1)[0]
+
+        if base_name != "received_grade":
+            continue
+
+        values = df.iloc[:, col_pos].fillna("").astype(str).str.strip()
+        numeric = pd.to_numeric(
+            values.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
+            errors="coerce",
+        )
+        numeric = numeric.where(numeric.between(1, 10, inclusive="both"))
+
+        take = resolved.isna() & numeric.notna()
+        resolved.loc[take] = numeric.loc[take]
+
+    return resolved
+
+
 def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict[str, float | int]:
     """Build top-level grading KPIs from grading history + realized inventory sales."""
     empty_metrics = {
@@ -354,23 +391,11 @@ def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict
     # while the return workflow also writes the final grade back to inventory.
     # We therefore prefer a plausible grade from grading history and fall back
     # to the inventory grade for the same inventory_id when needed.
-    received_grade_text = (
-        _coalesce_sheet_field(received, "received_grade")
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    grading_grade_numeric = pd.to_numeric(
-        received_grade_text.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
-        errors="coerce",
-    )
-
-    # Only 1-10 are valid grading results. Anything else is treated as unusable
-    # and can be replaced by the grade stored on the matching inventory row.
-    grading_grade_numeric = grading_grade_numeric.where(
-        grading_grade_numeric.between(1, 10, inclusive="both")
-    )
+    # Resolve a valid grade across every received_grade copy. Older rows can
+    # contain non-grade junk in one duplicate column, so we must keep scanning
+    # until an actual 1-10 grade is found instead of stopping at the first
+    # merely nonblank value.
+    grading_grade_numeric = _resolve_valid_received_grade(received)
 
     inventory_grade_numeric = pd.Series(float("nan"), index=received.index, dtype="float64")
 
