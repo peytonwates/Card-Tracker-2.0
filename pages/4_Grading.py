@@ -77,6 +77,12 @@ def _normalize_inventory(inv: pd.DataFrame) -> pd.DataFrame:
             "grading_fee",
             "grade",
             "condition",
+            "sold_date",
+            "sold_price",
+            "fees_total",
+            "net_proceeds",
+            "profit",
+            "sale_channel",
             "notes",
         ],
     )
@@ -254,6 +260,131 @@ def _ordered_rows_by_inventory_id(df: pd.DataFrame, inventory_ids: list[str]) ->
         return pd.DataFrame()
 
     return safe.loc[present_ids].reset_index(drop=True)
+
+
+def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict[str, float | int]:
+    """Build top-level grading KPIs from grading history + realized inventory sales."""
+    empty_metrics = {
+        "sent": 0,
+        "received": 0,
+        "outstanding": 0,
+        "gem_10s": 0,
+        "gem_rate": 0.0,
+        "sold_graded_cards": 0,
+        "roi_dollars": 0.0,
+        "avg_roi_pct": 0.0,
+    }
+
+    if grading.empty:
+        return empty_metrics
+
+    g = grading.copy()
+    g["inventory_id"] = g["inventory_id"].astype(str).str.strip()
+    g["status"] = g["status"].astype(str).str.upper().str.strip()
+
+    # These are administrative/repair rows, not cards we want to count as submitted.
+    excluded_statuses = {
+        "DUPLICATE_CLEARED",
+        "CANCELLED",
+        "CANCELED",
+    }
+    valid = g[~g["status"].isin(excluded_statuses)].copy()
+
+    # Ignore completely blank historical rows if they ever exist in the worksheet.
+    valid = valid[
+        valid["grading_row_id"].astype(str).str.strip().ne("")
+        | valid["inventory_id"].astype(str).str.strip().ne("")
+    ].copy()
+
+    if valid.empty:
+        return empty_metrics
+
+    status_received = valid["status"].isin({"RETURNED", "COMPLETE", "COMPLETED"})
+    returned_date_present = valid["returned_date"].astype(str).str.strip().replace("nan", "").ne("")
+    grade_present = valid["received_grade"].astype(str).str.strip().replace("nan", "").ne("")
+    received_mask = status_received | returned_date_present | grade_present
+    received = valid[received_mask].copy()
+
+    sent_count = int(len(valid))
+    received_count = int(len(received))
+    outstanding_count = max(sent_count - received_count, 0)
+
+    received_grade_numeric = pd.to_numeric(received["received_grade"], errors="coerce")
+    gem_10s = int(received_grade_numeric.eq(10).sum())
+    gem_rate = (gem_10s / received_count * 100.0) if received_count else 0.0
+
+    metrics = {
+        "sent": sent_count,
+        "received": received_count,
+        "outstanding": outstanding_count,
+        "gem_10s": gem_10s,
+        "gem_rate": gem_rate,
+        "sold_graded_cards": 0,
+        "roi_dollars": 0.0,
+        "avg_roi_pct": 0.0,
+    }
+
+    if inv.empty or received.empty:
+        return metrics
+
+    # A sold inventory card should contribute to realized grading ROI only once,
+    # even if grading history contains more than one historical row for that ID.
+    received_ids = set(
+        received["inventory_id"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .tolist()
+    )
+
+    if not received_ids:
+        return metrics
+
+    sold = inv.copy()
+    sold["inventory_id"] = sold["inventory_id"].astype(str).str.strip()
+    sold["inventory_status"] = sold["inventory_status"].astype(str).str.upper().str.strip()
+
+    sold_date_present = sold["sold_date"].astype(str).str.strip().replace("nan", "").ne("")
+    sold_mask = sold["inventory_status"].eq("SOLD") | sold_date_present
+    sold = sold[sold_mask & sold["inventory_id"].isin(received_ids)].copy()
+
+    if sold.empty:
+        return metrics
+
+    sold = sold.drop_duplicates(subset=["inventory_id"], keep="first").copy()
+
+    sold["__cost"] = pd.to_numeric(sold["total_cost"], errors="coerce")
+    sold["__net"] = pd.to_numeric(sold["net_proceeds"], errors="coerce")
+    sold["__sold_price"] = pd.to_numeric(sold["sold_price"], errors="coerce")
+    sold["__fees"] = pd.to_numeric(sold["fees_total"], errors="coerce")
+    sold["__stored_profit"] = pd.to_numeric(sold["profit"], errors="coerce")
+
+    # Prefer actual net proceeds. If an older sold row lacks that field, fall back
+    # to sold price less recorded fees. Profit is only used as a final fallback.
+    fallback_net = sold["__sold_price"] - sold["__fees"].fillna(0.0)
+    sold["__realized_net"] = sold["__net"].where(sold["__net"].notna(), fallback_net)
+    sold["__profit_calc"] = sold["__realized_net"] - sold["__cost"]
+    sold["__profit_calc"] = sold["__profit_calc"].where(
+        sold["__profit_calc"].notna(),
+        sold["__stored_profit"],
+    )
+
+    roi_rows = sold[sold["__cost"].notna() & sold["__profit_calc"].notna()].copy()
+
+    if roi_rows.empty:
+        return metrics
+
+    metrics["sold_graded_cards"] = int(len(roi_rows))
+    metrics["roi_dollars"] = float(roi_rows["__profit_calc"].sum())
+
+    pct_rows = roi_rows[roi_rows["__cost"] > 0].copy()
+    if not pct_rows.empty:
+        pct_rows["__roi_pct"] = pct_rows["__profit_calc"] / pct_rows["__cost"] * 100.0
+        metrics["avg_roi_pct"] = float(pct_rows["__roi_pct"].mean())
+
+    return metrics
 
 
 # =========================================================
@@ -501,6 +632,61 @@ if st.button("🔄 Refresh database"):
 data = load_data()
 inv = _normalize_inventory(data.inventory)
 grading = _normalize_grading(data.grading)
+
+# =========================================================
+# Grading performance KPIs
+# =========================================================
+
+grading_metrics = _grading_dashboard_metrics(inv, grading)
+
+st.subheader("Grading Performance")
+metric_cols = st.columns(6)
+
+with metric_cols[0]:
+    st.metric("Cards Sent", f"{grading_metrics['sent']:,}")
+
+with metric_cols[1]:
+    st.metric("Cards Received", f"{grading_metrics['received']:,}")
+
+with metric_cols[2]:
+    st.metric("Outstanding", f"{grading_metrics['outstanding']:,}")
+
+with metric_cols[3]:
+    st.metric(
+        "Gem Rate",
+        f"{grading_metrics['gem_rate']:.1f}%",
+        help=(
+            "PSA 10s divided by all cards that have been received back from grading. "
+            f"Current: {grading_metrics['gem_10s']:,} gem mint 10(s) out of "
+            f"{grading_metrics['received']:,} received card(s)."
+        ),
+    )
+
+with metric_cols[4]:
+    st.metric(
+        "Realized ROI $",
+        money_fmt(grading_metrics["roi_dollars"]),
+        help=(
+            "Total realized profit on cards that were sent for grading, received back, and sold. "
+            "Uses inventory net proceeds minus total cost, where total cost includes grading cost."
+        ),
+    )
+
+with metric_cols[5]:
+    st.metric(
+        "Avg ROI %",
+        f"{grading_metrics['avg_roi_pct']:.1f}%",
+        help=(
+            "Average per-card ROI for graded cards that were received and sold: "
+            "(net proceeds - total cost) / total cost. "
+            f"Based on {grading_metrics['sold_graded_cards']:,} sold graded card(s) with usable cost/proceeds data."
+        ),
+    )
+
+st.caption(
+    "ROI metrics include only realized sales from cards that appear in grading history as received. "
+    "Cards still held in inventory are not included in ROI."
+)
 
 duplicate_inventory_id_rows = _duplicate_inventory_id_rows(inv)
 duplicate_open_grading_rows = _build_duplicate_open_grading_rows(grading)
