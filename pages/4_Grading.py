@@ -262,6 +262,39 @@ def _ordered_rows_by_inventory_id(df: pd.DataFrame, inventory_ids: list[str]) ->
     return safe.loc[present_ids].reset_index(drop=True)
 
 
+def _coalesce_sheet_field(df: pd.DataFrame, base_name: str) -> pd.Series:
+    """
+    Return the first nonblank value across a worksheet field and any deduped
+    copies such as received_grade__dup2.
+
+    Older grading sheets accumulated duplicate headers. core.sheets safely
+    renames those duplicate columns when reading them, so KPI calculations
+    should coalesce the populated value instead of assuming the first copy is
+    always the one containing data.
+    """
+    if df.empty:
+        return pd.Series(dtype="object", index=df.index)
+
+    result = pd.Series("", index=df.index, dtype="object")
+    prefix = f"{base_name}__dup"
+
+    for col_pos, col_name in enumerate(df.columns):
+        name = str(col_name or "").strip()
+        if name != base_name and not name.startswith(prefix):
+            continue
+
+        values = df.iloc[:, col_pos]
+        text = values.fillna("").astype(str).str.strip()
+        usable = text.ne("") & ~text.str.lower().isin({"nan", "none", "<na>"})
+
+        current_text = result.fillna("").astype(str).str.strip()
+        current_blank = current_text.eq("") | current_text.str.lower().isin({"nan", "none", "<na>"})
+        take = current_blank & usable
+        result.loc[take] = values.loc[take]
+
+    return result
+
+
 def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict[str, float | int]:
     """Build top-level grading KPIs from grading history + realized inventory sales."""
     empty_metrics = {
@@ -299,9 +332,15 @@ def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict
     if valid.empty:
         return empty_metrics
 
+    # Some historical grading worksheets contain duplicate received_grade
+    # headers. read_sheet() renames those extras with __dupN suffixes.
+    # Coalesce them so a populated grade is never missed by the KPI logic.
+    valid_received_grade = _coalesce_sheet_field(valid, "received_grade")
+
     status_received = valid["status"].isin({"RETURNED", "COMPLETE", "COMPLETED"})
     returned_date_present = valid["returned_date"].astype(str).str.strip().replace("nan", "").ne("")
-    grade_present = valid["received_grade"].astype(str).str.strip().replace("nan", "").ne("")
+    grade_text = valid_received_grade.fillna("").astype(str).str.strip()
+    grade_present = grade_text.ne("") & ~grade_text.str.lower().isin({"nan", "none", "<na>"})
     received_mask = status_received | returned_date_present | grade_present
     received = valid[received_mask].copy()
 
@@ -309,7 +348,18 @@ def _grading_dashboard_metrics(inv: pd.DataFrame, grading: pd.DataFrame) -> dict
     received_count = int(len(received))
     outstanding_count = max(sent_count - received_count, 0)
 
-    received_grade_numeric = pd.to_numeric(received["received_grade"], errors="coerce")
+    # Coalesce again after filtering to keep the series aligned to received rows.
+    received_grade_text = (
+        _coalesce_sheet_field(received, "received_grade")
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    # This accepts plain values like 10 / 10.0 and also text like "PSA 10".
+    received_grade_numeric = pd.to_numeric(
+        received_grade_text.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
+        errors="coerce",
+    )
     gem_10s = int(received_grade_numeric.eq(10).sum())
     gem_rate = (gem_10s / received_count * 100.0) if received_count else 0.0
 
