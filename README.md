@@ -10,6 +10,11 @@ This is a fresh Streamlit rebuild that keeps your existing Google Sheets databas
 4. Grading
 5. Expenses
 6. Shows
+7. Consignment
+8. TCGplayer
+9. Grading Prospects
+
+Grading Prospects looks up one sport or Pokemon set at a time. It uses the GemRate API for the PSA gem rate and eBay sold listings for the PSA 10 and raw prices. A card stays on the list when eBay still shows at least 20 matching PSA 10 sales and 5 matching raw sales. The table shows at most 50 cards.
 
 I treated Shows as its own page because the old app already had it as a page and you asked to keep it mostly the same while removing pricing-for-shows. If you truly want exactly five pages, move Shows into Expenses as a tab.
 
@@ -23,6 +28,17 @@ streamlit run app.py
 ## Secrets
 
 Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` locally, then fill in the values.
+
+Grading Prospects needs a GemRate key and the Apify token already used for TCGplayer. The sold-listings actor is stored separately from the TCGplayer actor:
+
+```toml
+[gemrate]
+api_key = "YOUR_GEMRATE_API_KEY"
+
+[apify]
+api_token = "YOUR_APIFY_API_TOKEN"
+ebay_sold_actor_id = "memo23/apify-ebay-search-cheerio"
+```
 
 ## eBay setup
 
