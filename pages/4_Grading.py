@@ -18,6 +18,11 @@ from core.config import (
 )
 from core.sheets import get_ws_name, append_rows, update_rows_by_key
 from core.market import fetch_market_prices
+from core.prospects import (
+    build_prospect_tables,
+    received_psa9_percent,
+    sort_prospects,
+)
 
 
 st.set_page_config(page_title="Grading", layout="wide")
@@ -1014,7 +1019,7 @@ if not duplicate_open_grading_rows.empty or not orphan_grading_inventory_rows.em
             st.rerun()
 
 
-t1, t2, t3 = st.tabs(["Create Submission", "Update Returns", "Submission History"])
+t1, t2, t3, t4 = st.tabs(["Create Submission", "Update Returns", "Submission History", "Prospects"])
 
 
 # =========================================================
@@ -1462,3 +1467,192 @@ with t3:
             use_container_width=True,
             hide_index=True,
         )
+
+
+# =========================================================
+# Tab 4: Prospects
+# =========================================================
+
+with t4:
+    st.subheader("Grading Prospects")
+    st.caption(
+        "Ranks active raw cards already in your inventory. "
+        "Raw, PSA 9, and PSA 10 prices are the current PriceCharting or SportsCardsPro guide "
+        "(their blended sold-listing price), not 30-day or 90-day sale averages. "
+        "Population, sale counts, and a closed ranking score are not part of this tab. "
+        "The public COIN site describes a paid grading screener; its dashboard redirects to a login page, "
+        "so these numbers come from your sheets and those guide pages."
+    )
+
+    grade_audit = _grading_grade_audit(inv, grading)
+    received_count = int(grading_metrics["received"])
+    psa9_history = (
+        received_psa9_percent(grade_audit["resolved_grade"].tolist(), received_count)
+        if not grade_audit.empty
+        else 0.0
+    )
+    gem_history = float(grading_metrics["gem_rate"])
+
+    if "prospect_fee" not in st.session_state:
+        st.session_state["prospect_fee"] = float(st.secrets.get("default_grading_fee_per_card", 22.0))
+    if "prospect_gem_pct" not in st.session_state:
+        st.session_state["prospect_gem_pct"] = int(round(gem_history))
+    if "prospect_psa9_pct" not in st.session_state:
+        st.session_state["prospect_psa9_pct"] = int(round(psa9_history))
+
+    gem_cap = 100
+    st.session_state["prospect_gem_pct"] = min(max(int(st.session_state["prospect_gem_pct"]), 0), gem_cap)
+    psa9_cap = 100 - int(st.session_state["prospect_gem_pct"])
+    st.session_state["prospect_psa9_pct"] = min(max(int(st.session_state["prospect_psa9_pct"]), 0), psa9_cap)
+
+    control_cols = st.columns(4)
+    with control_cols[0]:
+        fee_per_card = st.number_input(
+            "Grading fee per card",
+            min_value=0.0,
+            step=1.0,
+            format="%.2f",
+            key="prospect_fee",
+        )
+    with control_cols[1]:
+        gem_pct = st.slider(
+            "Gem rate assumption",
+            min_value=0,
+            max_value=gem_cap,
+            step=1,
+            key="prospect_gem_pct",
+            help="Defaults to your received gem rate on this page. The rest of the card is assumed to come back raw unless you set a PSA 9 rate.",
+        )
+    with control_cols[2]:
+        psa9_pct = st.slider(
+            "PSA 9 rate assumption",
+            min_value=0,
+            max_value=int(psa9_cap),
+            step=1,
+            key="prospect_psa9_pct",
+            help="Share of submissions assumed to return PSA 9. Capped so gem rate plus PSA 9 rate cannot exceed 100%.",
+        )
+    with control_cols[3]:
+        sort_choice = st.selectbox(
+            "Sort by",
+            options=[
+                ("PSA 10 margin", "psa10_margin"),
+                ("PSA 10 multiple", "psa10_multiple"),
+                ("Expected net", "expected_net"),
+            ],
+            format_func=lambda item: item[0],
+        )
+
+    history_note = (
+        f"Gem-rate default matches the KPI above ({gem_history:.1f}%). "
+        f"PSA 9 default is {psa9_history:.1f}% of received cards."
+        if received_count
+        else "No received grades yet, so both rate assumptions start at 0%. Move the sliders to try a gem rate."
+    )
+    st.caption(history_note)
+
+    prospects = _active_gradeable_cards(inv, grading)
+    if prospects.empty:
+        st.info("No active raw cards are available. Sealed products, cards already in an open submission, and rows with a blank or duplicated inventory id are excluded.")
+    else:
+        if st.button("Pull prospect prices", type="primary"):
+            pulled: dict[str, dict] = {}
+            link_rows = prospects[
+                prospects["reference_link"].astype(str).str.contains(
+                    "pricecharting.com|sportscardspro.com",
+                    case=False,
+                    regex=True,
+                    na=False,
+                )
+            ]
+            progress = st.progress(0.0, text="Pulling guide prices")
+            total = max(len(link_rows), 1)
+            for index, (_, row) in enumerate(link_rows.iterrows(), start=1):
+                inv_id = clean_text(row.get("inventory_id"))
+                pulled[inv_id] = fetch_market_prices(row.get("reference_link"))
+                progress.progress(index / total, text=f"Pulling guide prices ({index:,} of {len(link_rows):,})")
+            progress.empty()
+            st.session_state["prospect_prices"] = pulled
+            st.session_state["prospect_prices_at"] = now_iso()
+
+        stored_prices = st.session_state.get("prospect_prices")
+        tables = build_prospect_tables(
+            prospects,
+            stored_prices,
+            float(fee_per_card),
+            gem_pct / 100.0,
+            psa9_pct / 100.0,
+        )
+        ranked = sort_prospects(tables["ranked"], sort_choice[1])
+
+        pulled_at = clean_text(st.session_state.get("prospect_prices_at"))
+        if stored_prices is None:
+            st.info("Pull prospect prices to rank cards that have a PriceCharting or SportsCardsPro link. Slider changes reuse the last pull.")
+        elif pulled_at:
+            st.caption(f"Guide prices last pulled {pulled_at}. Slider and fee changes reuse that pull.")
+
+        if not ranked.empty:
+            show_cols = [
+                "rank",
+                "card_name",
+                "set_name",
+                "card_number",
+                "variant",
+                "cost_basis",
+                "raw_price",
+                "psa9_price",
+                "psa10_price",
+                "grading_fee",
+                "psa10_margin",
+                "psa10_multiple",
+                "psa9_margin",
+                "expected_net",
+                "reference_link",
+            ]
+            st.dataframe(
+                ranked[[c for c in show_cols if c in ranked.columns]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "rank": st.column_config.NumberColumn("Rank"),
+                    "cost_basis": st.column_config.NumberColumn("Cost basis", format="$%.2f"),
+                    "raw_price": st.column_config.NumberColumn("Raw guide", format="$%.2f"),
+                    "psa9_price": st.column_config.NumberColumn("PSA 9 guide", format="$%.2f"),
+                    "psa10_price": st.column_config.NumberColumn("PSA 10 guide", format="$%.2f"),
+                    "grading_fee": st.column_config.NumberColumn("Grading fee", format="$%.2f"),
+                    "psa10_margin": st.column_config.NumberColumn("PSA 10 margin", format="$%.2f"),
+                    "psa10_multiple": st.column_config.NumberColumn("PSA 10 multiple", format="%.2f"),
+                    "psa9_margin": st.column_config.NumberColumn("PSA 9 margin", format="$%.2f"),
+                    "expected_net": st.column_config.NumberColumn("Expected net", format="$%.2f"),
+                    "reference_link": st.column_config.LinkColumn("Guide"),
+                },
+            )
+            st.caption(
+                "PSA 10 margin is the PSA 10 guide price minus cost basis and fee. "
+                "PSA 10 multiple is the PSA 10 guide price divided by that same outlay. "
+                "PSA 9 margin is the downside if the card comes back a 9. "
+                "Expected net is your gem rate times the PSA 10 price, plus your PSA 9 rate times the PSA 9 price, "
+                "plus the remainder times the raw price, minus cost and fee."
+            )
+        elif stored_prices is not None:
+            st.warning("No cards had a PSA 10 guide price in the last pull.")
+
+        waiting = tables["waiting"]
+        if not waiting.empty:
+            st.markdown("#### Waiting for a price pull")
+            st.dataframe(
+                waiting[["inventory_id", "set_name", "card_name", "card_number", "variant", "reference_link"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={"reference_link": st.column_config.LinkColumn("Guide")},
+            )
+
+        skipped = tables["skipped"]
+        if not skipped.empty:
+            st.markdown("#### Skipped")
+            st.dataframe(
+                skipped[["inventory_id", "set_name", "card_name", "card_number", "variant", "reason", "reference_link"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={"reference_link": st.column_config.LinkColumn("Guide")},
+            )
